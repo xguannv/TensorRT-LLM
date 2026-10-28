@@ -1275,6 +1275,9 @@ def k3_ctm_gemv_wide_kernel(
     pub_flags: Optional[cutlass.Int64],
     pub_addend: Optional[cutlass.Int64],
     pub_col0: Optional[cutlass.Int32],
+    # Column publish: load the addend right after the grid wait (overlapping the activation load and the MMA)
+    # instead of after the split-K reduce; the same values, so the same bits.
+    pub_addend_early: cutlass.Constexpr[bool],
 ):
     """One 128-row tile per cluster of `split` CTAs; a weight ring filled before the grid wait, an x ring after it."""
     k_tiles = num_k_tiles(k_in)
@@ -1544,6 +1547,36 @@ def k3_ctm_gemv_wide_kernel(
             # The push reads the Lamport rotation state, which the previous grids leave final; the publish reads the
             # addend, which the previous grids wrote.
             prims.griddepcontrol(prims.GridDepAction.WAIT)
+        # The column publish's addend vectors of this lane (the publish loop's indices below), loaded here with
+        # pub_addend_early so the loads overlap the activation TMA and the MMA instead of following the split-K
+        # reduce. A vector the lane does not publish reads a clamped in-bounds address (token 0, the slice's first
+        # column) and is not used.
+        early_adds = []
+        if cutlass.const_expr(pub_hidden > 0 and pub_addend_early):
+            # Names of their own: the DSL joins a name across the later dynamic branches that assign it.
+            e_base = m_offset
+            e_rows = cutlass.Int32(n_out) - m_offset
+            if cutlass.const_expr(row_tiles > 0):
+                e_base = w_tile * cutlass.Int32(tile_rows)
+                e_rows = cutlass.Int32(tile_rows)
+            e_t0 = rank * cutlass.Int32(owned)
+            e_vecs = owned * (LONG_ROWS_PER_WARP // VEC)
+            for ep in cutlass.range_constexpr((e_vecs + 31) // 32):
+                e_vj = lane + cutlass.Int32(ep * 32)
+                e_tok = e_t0 + (e_vj >> cutlass.Int32(2))
+                e_r0 = w * cutlass.Int32(LONG_ROWS_PER_WARP) + (
+                    e_vj & cutlass.Int32(3)
+                ) * cutlass.Int32(VEC)
+                e_tok_c = cutlass.Int32(
+                    cutlass.select_(e_tok < num_tokens, e_tok, cutlass.Int32(0))
+                )
+                e_col_c = cutlass.Int32(
+                    cutlass.select_(e_r0 < e_rows, pub_col0 + e_base + e_r0, pub_col0)
+                )
+                e_off = (
+                    cutlass.Int64(e_tok_c) * cutlass.Int64(pub_hidden) + cutlass.Int64(e_col_c)
+                ) * cutlass.Int64(ELEM_BYTES)
+                early_adds.append(_lamport.ld_v4(pub_addend + e_off))
         if cutlass.const_expr(pub_hidden > 0):
             # This call's rotation state (the previous call on the workspace has completed). Once every epilogue
             # thread of the CTA has read it, the CTA counts itself; the last CTA writes the next call's state.
@@ -1702,7 +1735,10 @@ def k3_ctm_gemv_wide_kernel(
                                     cutlass.Int64(tok) * cutlass.Int64(pub_hidden)
                                     + cutlass.Int64(pub_col0 + n_base + r0)
                                 ) * cutlass.Int64(ELEM_BYTES)
-                                add = _lamport.ld_v4(pub_addend + off)
+                                if cutlass.const_expr(pub_addend_early):
+                                    add = early_adds[p]
+                                else:
+                                    add = _lamport.ld_v4(pub_addend + off)
                                 words = []
                                 for q in cutlass.range_constexpr(4):
                                     s_lo, s_hi = _lamport.acc_bf16x2(
@@ -1853,7 +1889,7 @@ def k3_ctm_gemv_wide(
     clusters = row_tiles if row_tiles > 0 else (n_out + CTA_M - 1) // CTA_M
     k3_ctm_gemv_wide_kernel(
         tma_desc_w, tma_desc_x, tma_desc_y, tma_desc_y_tail, y, num_tokens, sig_row0, n_out, k_in, split, ring, x_ring,
-        n_tile, out_fp32, trigger_early, row_tiles, 0, None, None, None, None, 0, None, None, None, None, None,
+        n_tile, out_fp32, trigger_early, row_tiles, 0, None, None, None, None, 0, None, None, None, None, None, False,
     ).launch(
         grid=(clusters * split, 1, 1),
         block=(THREADS, 1, 1),
@@ -1891,7 +1927,7 @@ def k3_ctm_gemv_wide_ar_push(
     k3_ctm_gemv_wide_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x, tma_desc_x, x_flat, num_tokens, cutlass.Int32(n_out), n_out, k_in, split,
         ring, x_ring, n_tile, False, False, 0, ar_world, peer_ptrs, mc_base, flags, rank, 0, None, None, None, None,
-        None,
+        None, False,
     ).launch(
         grid=((n_out // CTA_M) * split, 1, 1),
         block=(THREADS, 1, 1),
@@ -1921,13 +1957,14 @@ def k3_ctm_gemv_wide_col_publish(
     row_tiles: cutlass.Constexpr[int],
     hidden: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
+    addend_early: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     """``x @ w^T`` (fp32 sums as ``k3_ctm_gemv_wide``'s) plus the bf16 ``addend [M, hidden]``'s columns
     [col0, col0 + N), rounded once to bf16 and published as those columns of the ``[M, hidden]`` result of the next
     Lamport call on a workspace (broadcast stage of its current buffer, every rank), advancing the workspace's rotation
     (see the column publish section comment). ``row_tiles`` as in ``k3_ctm_gemv_wide`` (tiles of a multiple of 8
-    rows)."""
+    rows). ``addend_early``: the kernel's ``pub_addend_early``."""
     if cutlass.const_expr(row_tiles > 0):
         tma_desc_w = _weight_tensor_map_row_tiles(w, n_out, k_in, row_tiles)
     else:
@@ -1937,7 +1974,7 @@ def k3_ctm_gemv_wide_col_publish(
     k3_ctm_gemv_wide_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x, tma_desc_x, x_flat, num_tokens, cutlass.Int32(n_out), n_out, k_in, split,
         ring, x_ring, n_tile, False, False, row_tiles, 0, None, None, None, None, hidden, uc_local, mc_base, flags,
-        addend, col0,
+        addend, col0, addend_early,
     ).launch(
         grid=(clusters * split, 1, 1),
         block=(THREADS, 1, 1),

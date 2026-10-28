@@ -330,6 +330,70 @@ def test_lar_clear_split_default_follows_the_capability(monkeypatch):
     col._lar_clear_split_by_default.cache_clear()
 
 
+def test_addend_early_switch_default_off_and_documented():
+    value, default, doc = _mod("flags").flags()["TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY"]
+    assert default == 0 and "addend" in doc and "Bitwise" in doc
+    assert _mod("flags").accepted_values()["TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY"] == (0, 1)
+
+
+def test_addend_early_resolution(monkeypatch):
+    """-1 resolves by ``ADDEND_EARLY_CAPABILITIES`` (SM103 only); 1 / 0 force it either way."""
+    col = _mod("moe_tail_col")
+    flags = _mod("flags")
+    dev = torch.device("cuda", 0)
+    for cap, want in (((10, 3), True), ((10, 0), False), ((10, 7), False)):
+        col._addend_early_by_default.cache_clear()
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index=None, c=cap: c)
+        monkeypatch.setattr(flags, "TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY", -1)
+        assert col.addend_early_on(dev) is want, cap
+        for forced in (0, 1):
+            monkeypatch.setattr(flags, "TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY", forced)
+            assert col.addend_early_on(dev) is bool(forced)
+    col._addend_early_by_default.cache_clear()
+
+
+def test_warm_up_compiles_both_publish_builds(monkeypatch):
+    """``warm_up`` compiles the publish with and without the early addend load at both token tiles
+    (``TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY`` is read at forward time), whatever the switch says."""
+    col = _mod("moe_tail_col")
+    flags = _mod("flags")
+    compiled = []
+    kernel = SimpleNamespace(ROW_CLEAR_CTAS=32, run_k3_latent_ar_norm_row=lambda *a, **kw: None)
+    monkeypatch.setattr(col, "_latent_ar", lambda: kernel)
+    monkeypatch.setattr(col._tail_lu, "shared_all_reduce", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        col,
+        "_ctm_op",
+        lambda: SimpleNamespace(
+            compile_wide_col_publish=lambda w,
+            rows,
+            tiles,
+            hidden,
+            addend_early=False: compiled.append((rows, addend_early)) or True
+        ),
+    )
+    # The probe publishes are collective calls: stand-ins that hand on no tail (so no consumer build runs).
+    monkeypatch.setattr(col, "publish", lambda *a, **kw: None)
+    monkeypatch.setattr(col, "_ctm_kernel", lambda: SimpleNamespace(wide_tile=lambda rows: rows))
+    gemvs = SimpleNamespace(compile_push=lambda *a, **kw: [16, 32], project=lambda *a, **kw: None)
+    dev = torch.device("cuda", 0)
+    view = SimpleNamespace(uc_local=0, mc_base=0, flags=None, rank=0, world=16)
+    base = SimpleNamespace(latent=view, push=SimpleNamespace(world=16))
+    state = SimpleNamespace(base=base)
+    layer = SimpleNamespace(
+        up_slice=torch.zeros(448, 3584, dtype=torch.bfloat16, device=dev),
+        col0=0,
+        tiles=(),
+        shared_down=torch.zeros(7168, 384, dtype=torch.bfloat16, device=dev),
+    )
+    for value in (0, 1):
+        compiled.clear()
+        monkeypatch.setattr(flags, "TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY", value)
+        col.warm_up(state, layer, gemvs, max_candidates=4)
+        assert compiled == [(16, False), (16, True), (32, False), (32, True)], (value, compiled)
+        assert state.tiles == frozenset({16, 32}) and state.ready
+
+
 def test_warm_up_compiles_both_latent_ar_builds(monkeypatch):
     """``warm_up`` runs the latent all-reduce with and without the re-arm CTAs (``TRTLLM_K3LL_LAR_CLEAR_SPLIT`` is read
     at forward time, so neither build may first compile under capture), whatever the switch says."""

@@ -688,16 +688,25 @@ def col_publish_config(
     return None if config is None else (*config, n_tile)
 
 
-def _col_publish_key(n_out, k_in, config, row_tiles, hidden, use_pdl) -> tuple:
-    return ("k3_ctm_gemv_wide_col_publish", n_out, k_in, *config, row_tiles, hidden, use_pdl)
+def _col_publish_key(n_out, k_in, config, row_tiles, hidden, use_pdl, addend_early) -> tuple:
+    return (
+        "k3_ctm_gemv_wide_col_publish",
+        n_out,
+        k_in,
+        *config,
+        row_tiles,
+        hidden,
+        use_pdl,
+        addend_early,
+    )
 
 
 def compile_wide_col_publish(
-    weight: torch.Tensor, num_tokens: int, row_tiles: int, hidden: int
+    weight: torch.Tensor, num_tokens: int, row_tiles: int, hidden: int, addend_early: bool = False
 ) -> bool:
-    """Compile ``run_k3_ctm_gemv_wide_col_publish``'s kernel for ``weight``'s shape at ``num_tokens``'s token tile
-    without launching it (a publish is a collective call); False where it does not take the shape. Eager, before any
-    CUDA-graph capture."""
+    """Compile ``run_k3_ctm_gemv_wide_col_publish``'s kernel (its ``addend_early`` build) for ``weight``'s shape at
+    ``num_tokens``'s token tile without launching it (a publish is a collective call); False where it does not take
+    the shape. Eager, before any CUDA-graph capture."""
     if weight.dtype != torch.bfloat16 or weight.dim() != 2 or not weight.is_cuda:
         return False
     n_out, k_in = weight.shape
@@ -713,21 +722,30 @@ def compile_wide_col_publish(
     use_pdl = _use_pdl()
     addr = Int64(1 << 20)
     _compile(
-        _col_publish_key(n_out, k_in, config, row_tiles, hidden, use_pdl),
+        _col_publish_key(n_out, k_in, config, row_tiles, hidden, use_pdl, addend_early),
         kernel.k3_ctm_gemv_wide_col_publish, _arg(weight), _arg(x), _arg(x.view(-1)), num_tokens, addr, addr, addr,
-        addr, Int32(0), n_out, k_in, split, ring, x_ring, n_tile, row_tiles, hidden, use_pdl, _stream(x),
+        addr, Int32(0), n_out, k_in, split, ring, x_ring, n_tile, row_tiles, hidden, use_pdl, addend_early,
+        _stream(x),
     )  # fmt: skip
     return True
 
 
 def wide_col_publish_compiled(
-    n_out: int, k_in: int, num_tokens: int, row_tiles: int, hidden: int, device
+    n_out: int,
+    k_in: int,
+    num_tokens: int,
+    row_tiles: int,
+    hidden: int,
+    device,
+    addend_early: bool = False,
 ) -> bool:
-    """Whether ``compile_wide_col_publish`` (or an eager call) compiled the publish for this shape and token tile."""
+    """Whether ``compile_wide_col_publish`` (or an eager call) compiled the publish for this shape, token tile and
+    ``addend_early``."""
     config = col_publish_config(n_out, k_in, num_tokens, _num_sms(device), row_tiles, hidden)
     return (
         config is not None
-        and _col_publish_key(n_out, k_in, config, row_tiles, hidden, _use_pdl()) in _compiled
+        and _col_publish_key(n_out, k_in, config, row_tiles, hidden, _use_pdl(), addend_early)
+        in _compiled
     )
 
 
@@ -738,14 +756,16 @@ def run_k3_ctm_gemv_wide_col_publish(
     col0: int,
     ws,
     row_tiles: int,
+    addend_early: bool = False,
 ) -> None:
     """``bf16(x @ weight.T + addend[:, col0:col0 + N])`` (fp32 sums as ``k3_ctm_gemv_wide``'s, one rounding) published
     as columns ``[col0, col0 + N)`` of the ``[M, H]`` result of the next Lamport call on ``ws`` (a
     ``k3_lamport_ar.LamportWorkspace``; ``addend`` bf16 ``[M, H]``): stored (``-0`` as ``+0``) into the broadcast stage
     of the workspace's current buffer on every rank, the rotation advanced as ``k3_lamport_ar``'s finish advances it.
     Once every rank has published its columns, the next kernel reads the rows with ``k3_lamport_ar.poll_result_v4``.
-    Releases its dependent only after its own grid-dependency wait. Compiles on its first call for the shape (refused
-    under capture)."""
+    Releases its dependent only after its own grid-dependency wait. ``addend_early``: the epilogue loads its addend
+    vectors right after the grid wait instead of after the split-K reduce (the same bits; a build of its own).
+    Compiles on its first call for the shape (refused under capture)."""
     from cutlass import Int32, Int64
 
     from ..blackwell import k3_lamport_ar
@@ -796,9 +816,9 @@ def run_k3_ctm_gemv_wide_col_publish(
     )
     stream = _stream(x)
     fn = _compile(
-        _col_publish_key(n_out, k_in, config, row_tiles, hidden, use_pdl),
+        _col_publish_key(n_out, k_in, config, row_tiles, hidden, use_pdl, bool(addend_early)),
         kernel.k3_ctm_gemv_wide_col_publish, *args, num_tokens, *lamport, n_out, k_in, split, ring, x_ring, n_tile,
-        row_tiles, hidden, use_pdl, stream,
+        row_tiles, hidden, use_pdl, bool(addend_early), stream,
     )  # fmt: skip
     fn(*args, num_tokens, *lamport, stream)
 

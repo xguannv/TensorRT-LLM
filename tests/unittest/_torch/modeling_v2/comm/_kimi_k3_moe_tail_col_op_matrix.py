@@ -48,6 +48,10 @@ Checks:
     precedes the push of the other), one rank late on every other replay: every output bit for bit the plain eager
     chain; the dispatch census counts the switch once per captured call; and the two-layer step graphs (16 / 32 rows)
     captured with the switch on, replayed between the plain eager steps: bit for bit.
+  * publish addend early (``TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY`` off and on): ``run``'s published rows bit for bit
+    at every row count, the dispatch census counted once per engaged call; the two-layer step graphs (16 / 24 / 32
+    rows) captured with the switch on and replayed with new inputs, one rank late on every other replay: bit for bit
+    the plain eager step.
 """
 
 import contextlib
@@ -682,7 +686,73 @@ def check_lar_variants():
         )
 
 
-CHECKS = [check_takes, check_pieces, check_decoder, check_graphs, check_lar_variants]
+@contextlib.contextmanager
+def _early(value: int):
+    old = FLAGS.TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY
+    FLAGS.TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY = int(value)
+    try:
+        yield
+    finally:
+        FLAGS.TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY = old
+
+
+def check_addend_early():
+    st, layer, gemvs = BUILT.state, BUILT.layer, BUILT.gemvs
+    # Eager, every row count: the publish with its addend loaded after the grid wait publishes the same rows.
+    for rows in ROWS:
+        call = _Call(1400 + rows, rows)
+        outs = {}
+        for v in (0, 1):
+            before = _census("dispatch:tail_col_addend_early", "eager")
+            with _switch(1), _early(v):
+                outs[v] = COL.run(st, layer, gemvs, call.act, lambda c=call: c.routed).materialize()
+            counted = _census("dispatch:tail_col_addend_early", "eager") - before
+            assert counted == v, f"addend early {rows} rows switch {v}: census {counted}"
+        _expect_same(f"addend early {rows} rows eager", outs[1], outs[0], replicated=True)
+    # The two-layer step (other users of the decode workspace between the layers, shared expert on the side stream)
+    # captured with the switch on: bit for bit the plain eager step.
+    for rows in (16, 24, 32):
+        step = _Step(rows, 1500 + rows)
+        with _early(1):
+            step.run()
+        torch.cuda.synchronize()
+        R.barrier()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with _early(1), MSU.with_multi_stream(True), torch.cuda.graph(graph, stream=stream):
+            out = step.run()
+        R.barrier()
+        for i in range(4):
+            step.draw(1600 + 11 * i)
+            R.barrier()
+            R.late(i % R.world if i % 2 else None)
+            graph.replay()
+            torch.cuda.synchronize()
+            got = _cloned(out)
+            with _early(0):
+                eager = _cloned(step.run())
+            for name, value in got.items():
+                _expect_same(
+                    f"step {rows} rows replay {i} addend early: {name}",
+                    value,
+                    eager[name],
+                    replicated=True,
+                )
+        del graph
+    torch.cuda.synchronize()
+    if R.rank == 0:
+        print("[rank 0] publish addend early: eager rows and step graphs = plain", flush=True)
+
+
+CHECKS = [
+    check_takes,
+    check_pieces,
+    check_decoder,
+    check_graphs,
+    check_lar_variants,
+    check_addend_early,
+]
 
 
 def _run_one_rank(args) -> int:

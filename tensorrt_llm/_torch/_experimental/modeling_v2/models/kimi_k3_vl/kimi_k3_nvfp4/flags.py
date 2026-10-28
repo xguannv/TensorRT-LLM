@@ -472,6 +472,16 @@ TRTLLM_K3LL_LAR_CLEAR_SPLIT = _flag(
     "-0.038 ms, oak-1038)",
     accepted=ON_OFF,
 )
+TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY = _flag(
+    "TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY",
+    0,
+    "TRTLLM_K3LL_MOE_TAIL_COL's column publish (k3_ctm_gemv_wide): each epilogue lane loads its vectors of the shared "
+    "output's columns (the addend) right after the grid wait, overlapping the latent's load and the MMA, instead of "
+    "after the split-K reduce, on the publish's critical path. Bitwise (the same values, the same adds). Read at "
+    "forward time, a build per value. 1 on, 0 (default) off, -1 on where the device is in "
+    "moe_tail_col.ADDEND_EARLY_CAPABILITIES",
+    accepted=ON_OFF,
+)
 TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE = _flag(
     "TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE",
     -1,

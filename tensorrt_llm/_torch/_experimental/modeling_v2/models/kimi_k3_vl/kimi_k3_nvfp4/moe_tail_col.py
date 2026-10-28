@@ -157,6 +157,25 @@ def _lar_clear_split_on(device: torch.device) -> bool:
     return _lar_clear_split_by_default(index)
 
 
+#: ``TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY`` at -1 turns it on only on these compute capabilities.
+ADDEND_EARLY_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _addend_early_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in ADDEND_EARLY_CAPABILITIES
+
+
+def addend_early_on(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY`` on ``device``: 1 on, 0 (default) off, -1 on where the device is in
+    ``ADDEND_EARLY_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY)
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _addend_early_by_default(index)
+
+
 def slice_width(world: int) -> int:
     """Output columns per rank."""
     return HIDDEN // world
@@ -318,8 +337,11 @@ def publish(
     """``bf16(latent @ up_slice.T + shared[:, col0:col0 + W])`` published as this rank's columns of the next call on
     the decode workspace (every rank must make the call); returns the `ColTail` naming the assembled rows."""
     workspace = state.base.push
+    early = addend_early_on(latent.device)
+    if early:
+        _census.count(f"dispatch:tail_col_addend_early:{_census.mode()}")
     _ctm_op().run_k3_ctm_gemv_wide_col_publish(
-        latent, layer.up_slice, shared, layer.col0, workspace, layer.tiles
+        latent, layer.up_slice, shared, layer.col0, workspace, layer.tiles, addend_early=early
     )
     return ColTail(
         workspace, latent.shape[0], state.attn_res_candidates, state.attn_res_mx_candidates
@@ -394,7 +416,13 @@ def warm_up(
     ran = []
     tail = None
     for rows in (16, 32):
-        if not _ctm_op().compile_wide_col_publish(layer.up_slice, rows, layer.tiles, HIDDEN):
+        # Both builds of the publish (TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY is read at forward time).
+        if not all(
+            _ctm_op().compile_wide_col_publish(
+                layer.up_slice, rows, layer.tiles, HIDDEN, addend_early=early
+            )
+            for early in (False, True)
+        ):
             continue
         tail = publish(
             state, probe, torch.zeros(rows, LATENT, **zeros), torch.zeros(rows, HIDDEN, **zeros)
