@@ -4820,8 +4820,8 @@ def test_v2_kda_admission_slot_updates_without_sync():
     mgr.mamba_ssm_rand_seed = None
     mgr.local_num_mamba_layers = num_layers
     mgr.prev_num_accepted_tokens = torch.arange(1, num_slots + 1, dtype=torch.int32, device="cuda")
-    mgr.cuda_state_indices = torch.tensor(
-        [5, 1, 0, 0, 0, 0, 0, 0], dtype=torch.int32, device="cuda"
+    mgr._state_indices_buffer = DeviceCopyBuffer(
+        torch.tensor([5, 1, 0, 0, 0, 0, 0, 0], dtype=torch.int32, device="cuda")
     )
     mgr._request_id_to_state_index = {10: 4, 11: 2}
     mgr.conv_state_shape = [3 * dim, window]
