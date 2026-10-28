@@ -2,16 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """``TRTLLM_K3LL_DRAFTER_PROMPT_CTX``: its spelling, its default and where it is resolved (CPU only).
 
-* Registry: -1 (the default), 0, 1 and a window W >= 2 are accepted; -2 is rejected.
+* Registry: 0 (the default, off), -1, 1 and a window W >= 2 are accepted; -2 is rejected.
 * One resolver (``k3ll_flags.resolve_drafter_prompt_window``): -1 is W = 16384 on SM103 only (off on SM100 / SM107),
   1 is 16384 on any arch, W is W, 0 is 0.
 * Serving (``serve._carry_disagg_role_to_model_ranks``): only a server with a disaggregated role and a DSpark
-  ``speculative_config`` is touched. On (the default on SM103): the role reaches the model ranks. Off (explicit 0,
+  ``speculative_config`` is touched. On (-1 on SM103, 1, W): the role reaches the model ranks. Off (0, the default,
   or -1 off SM103) on a context server: the DSpark ``speculative_config`` is dropped, so the context server's
   ``llm_args`` are exactly those of one without it -- no drafter, no draft KV cache manager, the same KV cache
   manager arguments. A context server without a DSpark ``speculative_config`` is untouched at any value.
 * Transceiver wiring (``_util._drafter_prompt_window_transfer_kwargs``): off, no draft argument, so the transceiver
-  is built as without the switch; at the default a deployment that cannot take part stays off rather than raising.
+  is built as without the switch; at -1 a deployment that cannot take part stays off rather than raising.
 * Context draft pool (``KvCacheCreator._drafter_prompt_tail_window``): tail-only (a W + 1 sliding window) exactly
   where the capture-only drafter runs on a joint-reuse KVCacheManagerV2 pair.
 """
@@ -63,10 +63,10 @@ def _switch(monkeypatch, value):
 def test_registry_takes_minus_one_zero_one_and_a_window(monkeypatch):
     flags = _flags()
     _, default, doc = flags.flags()[NAME]
-    assert default == -1
+    assert default == 0
     assert flags.accepted_values()[NAME] == flags.Range(-1)
-    assert "-1 (default): W = 16384 on SM103 only" in doc and "0: off" in doc
-    assert getattr(_load_flags_copy(monkeypatch, None), NAME) == -1
+    assert "-1: W = 16384 on SM103 only" in doc and "0 (default): off" in doc
+    assert getattr(_load_flags_copy(monkeypatch, None), NAME) == 0
     for value in (-1, 0, 1, 2, 16384, 1048576):
         flags.check_value(NAME, value)
         assert getattr(_load_flags_copy(monkeypatch, value), NAME) == value
@@ -128,7 +128,7 @@ def _serve(monkeypatch, role, value, args, capability):
 @pytest.mark.parametrize(
     "value,capability",
     [(-1, SM103), (1, SM107), (16384, SM100)],
-    ids=["default-SM103", "1-SM107", "W-SM100"],
+    ids=["minus1-SM103", "1-SM107", "W-SM100"],
 )
 def test_serve_on_carries_the_role_and_keeps_the_spec(monkeypatch, value, capability):
     for role in ("context", "generation"):
@@ -154,10 +154,10 @@ def test_serve_on_carries_the_role_and_keeps_the_spec(monkeypatch, value, capabi
 @pytest.mark.parametrize(
     "value,capability",
     [(0, SM103), (0, SM107), (-1, SM100), (-1, SM107)],
-    ids=["0-SM103", "0-SM107", "default-SM100", "default-SM107"],
+    ids=["0-SM103", "0-SM107", "minus1-SM100", "minus1-SM107"],
 )
 def test_serve_off_context_equals_a_context_without_the_spec(monkeypatch, value, capability):
-    """Explicit 0 (or the default off SM103) with a DSpark spec on a context server: the server's llm_args equal
+    """0 (the default; or -1 off SM103) with a DSpark spec on a context server: the server's llm_args equal
     those of a context server without the spec config and the switch unset -- what KvCacheCreator, the drafter
     build and the transceiver wiring then see is the same (no drafter, no draft KV cache manager, the same KV
     cache manager arguments)."""
@@ -175,7 +175,7 @@ def test_serve_off_generation_keeps_its_drafter(monkeypatch):
 
 
 def test_serve_without_a_dspark_spec_or_role_is_untouched(monkeypatch):
-    """A context server without a DSpark speculative_config is today's context at any value, the default
+    """A context server without a DSpark speculative_config is today's context at any value, 0 (the default)
     included; so is a server without a disaggregated role (aggregated serving)."""
     eagle = {"decoding_type": "Eagle3", "max_draft_len": 3}
     for value in (-1, 0, 1, 16384):
@@ -245,7 +245,7 @@ def test_wiring_on(monkeypatch, value):
 
 
 def test_wiring_default_stays_off_where_it_cannot_take_part(monkeypatch):
-    """At the default, a drafter that is not the MLA DSpark drafter, a non-V2 draft manager, the C++ transceiver
+    """At -1, a drafter that is not the MLA DSpark drafter, a non-V2 draft manager, the C++ transceiver
     or PP > 1 keep the switch off (other speculative models on SM103 are unchanged); set explicitly, the missing
     context_renumber raises."""
     mla = SimpleNamespace(context_renumber=_Renumber)

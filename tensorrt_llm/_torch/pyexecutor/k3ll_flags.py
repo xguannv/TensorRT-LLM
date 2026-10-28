@@ -23,7 +23,7 @@ K3LL_CENSUS_MODULE = K3LL_FLAGS_MODULE.rsplit(".", 1)[0] + ".census"
 DRAFTER_PROMPT_CTX = "TRTLLM_K3LL_DRAFTER_PROMPT_CTX"
 #: The window in tokens that ``TRTLLM_K3LL_DRAFTER_PROMPT_CTX`` = 1, and -1 where it is on, select.
 DRAFTER_PROMPT_CTX_WINDOW = 16384
-#: Where -1 (the default) turns the switch on: SM103 (GB300). SM100 / SM107 stay off.
+#: Where -1 turns the switch on: SM103 (GB300). SM100 / SM107 stay off.
 DRAFTER_PROMPT_CTX_CAPABILITIES = ((10, 3),)
 
 
@@ -45,7 +45,7 @@ def resolve_drafter_prompt_window(value: int, capability: Optional[Tuple[int, in
     """The drafter prompt window in tokens that ``TRTLLM_K3LL_DRAFTER_PROMPT_CTX`` = ``value`` selects on a device of
     compute ``capability`` (``(major, minor)``, None when unknown); 0 is off.
 
-    -1 (the default): ``DRAFTER_PROMPT_CTX_WINDOW`` on ``DRAFTER_PROMPT_CTX_CAPABILITIES``, else 0; 0: 0 (off);
+    -1: ``DRAFTER_PROMPT_CTX_WINDOW`` on ``DRAFTER_PROMPT_CTX_CAPABILITIES``, else 0; 0 (the default): 0 (off);
     1: ``DRAFTER_PROMPT_CTX_WINDOW`` on any device; W >= 2: W.
     """
     if value < -1:

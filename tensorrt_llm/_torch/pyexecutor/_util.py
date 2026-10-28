@@ -4092,9 +4092,8 @@ def _drafter_prompt_window_transfer_kwargs(draft_kv_cache_manager,
         if getattr(mapping, "pp_size", 1) != 1:
             blockers.append(f"pp_size {mapping.pp_size}")
         if blockers:
-            logger.info(
-                "TRTLLM_K3LL_DRAFTER_PROMPT_CTX at its default stays off here: "
-                + "; ".join(blockers))
+            logger.info("TRTLLM_K3LL_DRAFTER_PROMPT_CTX=-1 stays off here: " +
+                        "; ".join(blockers))
             return {}
     if context_renumber is None:
         # The drafter's own position shift, which a generation rank applies to
