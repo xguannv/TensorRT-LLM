@@ -52,6 +52,11 @@ Checks:
     at every row count, the dispatch census counted once per engaged call; the two-layer step graphs (16 / 24 / 32
     rows) captured with the switch on and replayed with new inputs, one rank late on every other replay: bit for bit
     the plain eager step.
+  * consumer pre-wait poll (``TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT`` off and on): at every row count, eager, one rank
+    late, the published rows and the consumer's ``normed`` / ``updated`` bit for bit, the dispatch census counted
+    once per engaged publish; the two-layer step graphs (16 / 24 / 32 rows; the second layer's rows copied out
+    between its publish and its consumer) captured with the switch on and replayed with new inputs, one rank late on
+    every other replay: bit for bit the plain eager step.
 """
 
 import contextlib
@@ -745,6 +750,76 @@ def check_addend_early():
         print("[rank 0] publish addend early: eager rows and step graphs = plain", flush=True)
 
 
+@contextlib.contextmanager
+def _prewait(value: int):
+    old = FLAGS.TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT
+    FLAGS.TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT = int(value)
+    try:
+        yield
+    finally:
+        FLAGS.TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT = old
+
+
+def check_tar_prewait():
+    st, layer, gemvs = BUILT.state, BUILT.layer, BUILT.gemvs
+    # Eager, every row count, one rank late: the consumer polling the published rows before its grid wait reads the
+    # same rows, so the same outputs.
+    for i, rows in enumerate(ROWS):
+        call = _Call(1700 + rows, rows)
+        outs = {}
+        for v in (0, 1):
+            before = _census("dispatch:tail_col_tar_prewait", "eager")
+            R.barrier()
+            R.late((i + v) % R.world)
+            with _switch(1), _prewait(v):
+                tail = COL.run(st, layer, gemvs, call.act, lambda c=call: c.routed)
+                assert tail.published is bool(v), (
+                    f"tar prewait {rows} rows switch {v}: tail.published"
+                )
+                normed, updated = _consumer(tail, call)
+            torch.cuda.synchronize()
+            outs[v] = (normed.clone(), updated.clone())
+            counted = _census("dispatch:tail_col_tar_prewait", "eager") - before
+            assert counted == v, f"tar prewait {rows} rows switch {v}: census {counted}"
+        for k, name in enumerate(("normed", "updated")):
+            _expect_same(
+                f"tar prewait {rows} rows eager {name}", outs[1][k], outs[0][k], replicated=True
+            )
+    # The two-layer step captured with the switch on: bit for bit the plain eager step.
+    for rows in (16, 24, 32):
+        step = _Step(rows, 1800 + rows)
+        with _prewait(1):
+            step.run()
+        torch.cuda.synchronize()
+        R.barrier()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with _prewait(1), MSU.with_multi_stream(True), torch.cuda.graph(graph, stream=stream):
+            out = step.run()
+        R.barrier()
+        for i in range(4):
+            step.draw(1900 + 11 * i)
+            R.barrier()
+            R.late(i % R.world if i % 2 else None)
+            graph.replay()
+            torch.cuda.synchronize()
+            got = _cloned(out)
+            with _prewait(0):
+                eager = _cloned(step.run())
+            for name, value in got.items():
+                _expect_same(
+                    f"step {rows} rows replay {i} tar prewait: {name}",
+                    value,
+                    eager[name],
+                    replicated=True,
+                )
+        del graph
+    torch.cuda.synchronize()
+    if R.rank == 0:
+        print("[rank 0] consumer pre-wait poll: eager rows and step graphs = plain", flush=True)
+
+
 CHECKS = [
     check_takes,
     check_pieces,
@@ -752,6 +827,7 @@ CHECKS = [
     check_graphs,
     check_lar_variants,
     check_addend_early,
+    check_tar_prewait,
 ]
 
 

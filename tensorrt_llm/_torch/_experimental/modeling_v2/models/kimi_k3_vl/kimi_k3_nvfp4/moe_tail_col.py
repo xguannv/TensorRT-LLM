@@ -176,6 +176,25 @@ def addend_early_on(device: torch.device) -> bool:
     return _addend_early_by_default(index)
 
 
+#: ``TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT`` at -1 turns it on only on these compute capabilities.
+TAR_PREWAIT_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _tar_prewait_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in TAR_PREWAIT_CAPABILITIES
+
+
+def tar_prewait_on(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT`` on ``device``: 1 on, 0 (default) off, -1 on where the device is in
+    ``TAR_PREWAIT_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT)
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _tar_prewait_by_default(index)
+
+
 def slice_width(world: int) -> int:
     """Output columns per rank."""
     return HIDDEN // world
@@ -192,12 +211,14 @@ class ColTail(NamedTuple):
     LamportWorkspace``), the same on every rank. It lives until the next call on that workspace: the consumer reads it
     (``attn_res``) or copies it out (``materialize``) before anything else uses the workspace. ``candidates`` /
     ``mx_candidates``: the candidate counts (snapshots + 1) the Lamport attn_res kernel ran for at load, without / with
-    the MXFP8 side output."""
+    the MXFP8 side output. ``published``: the publish stored its rotation state with release semantics
+    (``TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT``), so ``attn_res`` polls the rows before its grid wait."""
 
     lamport: object
     rows: int
     candidates: frozenset = frozenset()
     mx_candidates: frozenset = frozenset()
+    published: bool = False
 
     @property
     def lamport_addend(self) -> Tuple[int, int]:
@@ -340,11 +361,21 @@ def publish(
     early = addend_early_on(latent.device)
     if early:
         _census.count(f"dispatch:tail_col_addend_early:{_census.mode()}")
+    release = tar_prewait_on(latent.device)
+    if release:
+        _census.count(f"dispatch:tail_col_tar_prewait:{_census.mode()}")
     _ctm_op().run_k3_ctm_gemv_wide_col_publish(
-        latent, layer.up_slice, shared, layer.col0, workspace, layer.tiles, addend_early=early
+        latent,
+        layer.up_slice,
+        shared,
+        layer.col0,
+        workspace,
+        layer.tiles,
+        addend_early=early,
+        release=release,
     )
     return ColTail(
-        workspace, latent.shape[0], state.attn_res_candidates, state.attn_res_mx_candidates
+        workspace, latent.shape[0], state.attn_res_candidates, state.attn_res_mx_candidates, release
     )
 
 
@@ -416,12 +447,14 @@ def warm_up(
     ran = []
     tail = None
     for rows in (16, 32):
-        # Both builds of the publish (TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY is read at forward time).
+        # Every build of the publish (TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY and _TAR_PREWAIT are read at forward
+        # time).
         if not all(
             _ctm_op().compile_wide_col_publish(
-                layer.up_slice, rows, layer.tiles, HIDDEN, addend_early=early
+                layer.up_slice, rows, layer.tiles, HIDDEN, addend_early=early, release=release
             )
             for early in (False, True)
+            for release in (False, True)
         ):
             continue
         tail = publish(
@@ -443,6 +476,10 @@ def warm_up(
                 lamport_addend=tail.lamport_addend, early_trigger=True, mnnvl_order=True,
             )  # fmt: skip
             candidates.append(n)
+            # The pre-wait builds (TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT): compiled, the same kernel otherwise.
+            for t in (False, True) if tap else (False,):
+                for mx in (False, True) if mxfp8 else (False,):
+                    _attn_res().compile_lamport_mnnvl(n, mxfp8=mx, tap=t, prewait_poll=True)
             taps = [torch.empty_like(row)] if tap else []
             for t in taps:
                 _attn_res().run_k3_attn_res(
@@ -522,7 +559,7 @@ def attn_res(
     _attn_res().run_k3_attn_res(
         prefix, (), block_residual, res_proj.weight.reshape(-1), res_norm.weight, out_norm.weight, _eps(res_norm),
         _eps(out_norm), normed, updated, exact=False, lamport_addend=tail.lamport_addend, early_trigger=True,
-        mnnvl_order=True, mxfp8_out=mxfp8_out, tap=tap,
+        mnnvl_order=True, mxfp8_out=mxfp8_out, tap=tap, lamport_published=tail.published,
     )  # fmt: skip
     return normed, updated
 

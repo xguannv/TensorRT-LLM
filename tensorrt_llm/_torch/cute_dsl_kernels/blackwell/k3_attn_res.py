@@ -1175,6 +1175,7 @@ class K3AttnResFastKernel:
         early_trigger: bool = _EARLY_TRIGGER,
         mnnvl_order: bool = False,
         tap: bool = False,
+        prewait_poll: bool = False,
     ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
@@ -1183,6 +1184,11 @@ class K3AttnResFastKernel:
             raise ValueError(f"add_mode={add_mode} cluster={cluster} mnnvl_order={mnnvl_order}")
         if lamport and add_mode != ADD_PREFIX:
             raise ValueError("the Lamport addend is an ADD_PREFIX variant")
+        if prewait_poll and not lamport:
+            raise ValueError("prewait_poll polls a Lamport addend")
+        # The Lamport addend is a column publish's rows, polled before griddepcontrol.wait
+        # (k3_lamport_ar.poll_published_v4) instead of after it.
+        self.prewait_poll = prewait_poll
         self.mnnvl_order = mnnvl_order
         self.mxfp8 = mxfp8
         self.tap = tap
@@ -1420,6 +1426,17 @@ class K3AttnResFastKernel:
                 for e in cutlass.range_constexpr(8):
                     premix[e] = _fma(w_n, snap_f[n][e], premix[e])
 
+        # A column publish's rows need no grid edge: poll them before the wait (they arrive while the
+        # publish's grid drains).
+        pre_polled = []
+        if cutlass.const_expr(self.prewait_poll):
+            pre_off = _selp_b32(valid, Int32(rank * self.vecs + tidx) * 16, Int32(0))
+            pre_polled.extend(
+                _lamport_ops().poll_published_v4(
+                    add_addr, add2_addr, Int32(token), pre_off, HIDDEN_SIZE
+                )
+            )
+
         # ---- wait for the previous grid ----
         if cutlass.const_expr(self.use_pdl):
             _griddepcontrol_wait()
@@ -1433,10 +1450,13 @@ class K3AttnResFastKernel:
                 # without the gather: polled from the broadcast stage of the call's buffer (see
                 # k3_lamport_ar.poll_result_v4). Threads past the row poll the row's first vector
                 # and use zeros.
-                off = _selp_b32(valid, Int32(rank * self.vecs + tidx) * 16, Int32(0))
-                polled = _lamport_ops().poll_result_v4(
-                    add_addr, add2_addr, Int32(token), off, HIDDEN_SIZE
-                )
+                if cutlass.const_expr(self.prewait_poll):
+                    polled = pre_polled
+                else:
+                    off = _selp_b32(valid, Int32(rank * self.vecs + tidx) * 16, Int32(0))
+                    polled = _lamport_ops().poll_result_v4(
+                        add_addr, add2_addr, Int32(token), off, HIDDEN_SIZE
+                    )
                 addend = unpack([_selp_b32(valid, w, Int32(0)) for w in polled])
             else:
                 addend = unpack(load(add_addr + row + col, False))
@@ -1587,13 +1607,25 @@ def fast_cluster_size(num_tokens: int, num_candidates: int) -> int:
     return 8 if num_tokens <= 16 and num_candidates >= 4 else 4
 
 
-def compile_lamport_mnnvl(num_candidates: int, mxfp8: bool = False, tap: bool = False) -> None:
+def compile_lamport_mnnvl(
+    num_candidates: int, mxfp8: bool = False, tap: bool = False, prewait_poll: bool = False
+) -> None:
     """Compile (no launch) the build :func:`run_k3_attn_res` uses for a Lamport addend in the MNNVL order with the
     early trigger and the default PDL (``K3OprojPush.finish_attn_res``'s call), with or without the MXFP8 side output
-    and the tap, so a later CUDA-graph capture finds it. Rows do not enter the build (the MNNVL topology fixes the
-    cluster)."""
+    and the tap (``prewait_poll``: the build for a column publish's rows, see :func:`run_k3_attn_res`), so a later
+    CUDA-graph capture finds it. Rows do not enter the build (the MNNVL topology fixes the cluster)."""
     _compiled(
-        num_candidates, ADD_PREFIX, _USE_PDL, MNNVL_CLUSTER, False, mxfp8, True, True, True, tap
+        num_candidates,
+        ADD_PREFIX,
+        _USE_PDL,
+        MNNVL_CLUSTER,
+        False,
+        mxfp8,
+        True,
+        True,
+        True,
+        tap,
+        prewait_poll,
     )
 
 
@@ -1609,6 +1641,7 @@ def _compiled(
     early_trigger: bool = _EARLY_TRIGGER,
     mnnvl_order: bool = False,
     tap: bool = False,
+    prewait_poll: bool = False,
 ):
     if exact:
         kernel = K3AttnResKernel(num_candidates, add_mode, use_pdl, cluster)
@@ -1623,6 +1656,7 @@ def _compiled(
             early_trigger,
             mnnvl_order,
             tap,
+            prewait_poll,
         )
     addr = Int64(1 << 20)
     compiled = cute.compile(
@@ -1720,6 +1754,7 @@ def run_k3_attn_res(
     early_trigger: bool | None = None,
     mnnvl_order: bool = False,
     tap: torch.Tensor | None = None,
+    lamport_published: bool = False,
 ) -> None:
     """Launch on the current stream (inputs are not re-validated; see :func:`can_use_k3_attn_res`).
 
@@ -1761,6 +1796,11 @@ def run_k3_attn_res(
         tap: ``bf16 [M, 7168]`` view with unit column stride and a 16-byte aligned base and row
             stride (e.g. a speculative capture slot): also store the pre-norm mixture ``mixed``
             there (vectorized kernel only). The other outputs are unchanged.
+        lamport_published: The ``lamport_addend`` rows are a column publish's
+            (``run_k3_ctm_gemv_wide_col_publish`` with ``release``), polled before
+            ``griddepcontrol.wait`` (``k3_lamport_ar.poll_published_v4``); the same values, so the
+            same results. The kernel must be the publish's consumer, before any later call on the
+            workspace.
     """
     if exact is None:
         exact = _EXACT
@@ -1775,6 +1815,8 @@ def run_k3_attn_res(
     lamport = lamport_addend is not None
     if lamport and addends:
         raise ValueError("pass either addends or lamport_addend")
+    if lamport_published and not lamport:
+        raise ValueError("lamport_published needs lamport_addend")
     add_mode = ADD_PREFIX if lamport else len(addends)
     if cluster is None and not exact:
         cluster = fast_cluster_size(layer.shape[0], block.shape[0] + 1)
@@ -1792,6 +1834,7 @@ def run_k3_attn_res(
         early_trigger,
         mnnvl_order,
         tap is not None,
+        bool(lamport_published),
     )
     if lamport:
         add_addr, add2_addr = lamport_addend

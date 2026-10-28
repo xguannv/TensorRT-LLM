@@ -352,9 +352,73 @@ def test_addend_early_resolution(monkeypatch):
     col._addend_early_by_default.cache_clear()
 
 
+def test_tar_prewait_switch_default_off_and_documented():
+    value, default, doc = _mod("flags").flags()["TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT"]
+    assert default == 0 and "Bitwise" in doc and "TAR_PREWAIT_CAPABILITIES" in doc
+    assert _mod("flags").accepted_values()["TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT"] == (0, 1)
+
+
+def test_tar_prewait_resolution(monkeypatch):
+    """-1 resolves by ``TAR_PREWAIT_CAPABILITIES`` (SM103 only); 1 / 0 force it either way."""
+    col = _mod("moe_tail_col")
+    flags = _mod("flags")
+    dev = torch.device("cuda", 0)
+    for cap, want in (((10, 3), True), ((10, 0), False), ((10, 7), False)):
+        col._tar_prewait_by_default.cache_clear()
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index=None, c=cap: c)
+        monkeypatch.setattr(flags, "TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT", -1)
+        assert col.tar_prewait_on(dev) is want, cap
+        for forced in (0, 1):
+            monkeypatch.setattr(flags, "TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT", forced)
+            assert col.tar_prewait_on(dev) is bool(forced)
+    col._tar_prewait_by_default.cache_clear()
+
+
+@pytest.mark.parametrize("value", [0, 1])
+def test_tar_prewait_publish_hands_the_value_to_its_consumer(monkeypatch, value):
+    """The publish reads ``TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT`` once: its build stores the rotation with release
+    semantics exactly when the tail it returns says ``published``, and ``attn_res`` polls before its wait exactly
+    then."""
+    col = _mod("moe_tail_col")
+    flags = _mod("flags")
+    monkeypatch.setattr(flags, "TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT", value)
+    monkeypatch.setattr(flags, "TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY", 0)
+    published = []
+    monkeypatch.setattr(
+        col,
+        "_ctm_op",
+        lambda: SimpleNamespace(
+            run_k3_ctm_gemv_wide_col_publish=lambda *a, **kw: published.append(kw["release"])
+        ),
+    )
+    flags_t = torch.zeros(9, dtype=torch.int32)
+    ws = SimpleNamespace(uc_local=0x1000, flags=flags_t)
+    state = SimpleNamespace(
+        base=SimpleNamespace(push=ws),
+        attn_res_candidates=frozenset((2, 3, 4)),
+        attn_res_mx_candidates=frozenset(),
+    )
+    layer = SimpleNamespace(up_slice=None, col0=0, tiles=())
+    latent = torch.zeros(16, 3584, dtype=torch.bfloat16)
+    tail = col.publish(state, layer, latent, None)
+    assert published == [bool(value)] and tail.published is bool(value)
+    launched = []
+    monkeypatch.setattr(
+        col,
+        "_attn_res",
+        lambda: SimpleNamespace(
+            run_k3_attn_res=lambda *a, **kw: launched.append(kw["lamport_published"])
+        ),
+    )
+    w = SimpleNamespace(weight=torch.ones(7168, dtype=torch.bfloat16), eps=1e-6)
+    col.attn_res(tail, torch.zeros(16, 7168, dtype=torch.bfloat16), None, w, w, w)
+    assert launched == [bool(value)]
+
+
 def test_warm_up_compiles_both_publish_builds(monkeypatch):
-    """``warm_up`` compiles the publish with and without the early addend load at both token tiles
-    (``TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY`` is read at forward time), whatever the switch says."""
+    """``warm_up`` compiles the publish with and without the early addend load and the released rotation at both
+    token tiles (``TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY`` and ``_TAR_PREWAIT`` are read at forward time), whatever
+    the switches say."""
     col = _mod("moe_tail_col")
     flags = _mod("flags")
     compiled = []
@@ -369,7 +433,8 @@ def test_warm_up_compiles_both_publish_builds(monkeypatch):
             rows,
             tiles,
             hidden,
-            addend_early=False: compiled.append((rows, addend_early)) or True
+            addend_early=False,
+            release=False: (compiled.append((rows, addend_early, release)) or True)
         ),
     )
     # The probe publishes are collective calls: stand-ins that hand on no tail (so no consumer build runs).
@@ -389,8 +454,10 @@ def test_warm_up_compiles_both_publish_builds(monkeypatch):
     for value in (0, 1):
         compiled.clear()
         monkeypatch.setattr(flags, "TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY", value)
+        monkeypatch.setattr(flags, "TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT", value)
         col.warm_up(state, layer, gemvs, max_candidates=4)
-        assert compiled == [(16, False), (16, True), (32, False), (32, True)], (value, compiled)
+        want = [(rows, e, r) for rows in (16, 32) for e in (False, True) for r in (False, True)]
+        assert compiled == want, (value, compiled)
         assert state.tiles == frozenset({16, 32}) and state.ready
 
 
@@ -431,13 +498,17 @@ def test_warm_up_compiles_both_latent_ar_builds(monkeypatch):
 def test_warm_up_runs_the_tap_and_mxfp8_attn_res_builds(monkeypatch, tap, mxfp8):
     """``warm_up`` runs the Lamport attn_res kernel for every candidate count, with the drafter tap where ``tap``
     (``TRTLLM_K3LL_ATTN_RES_TAP`` is read at forward time) and with the MXFP8 side output where ``mxfp8``, each tap
-    build also with the MXFP8 output; records the counts it ran (the forward asks for MXFP8 only for those)."""
+    build also with the MXFP8 output, and compiles each of those builds' pre-wait form
+    (``TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT``); records the counts it ran (the forward asks for MXFP8 only for
+    those)."""
     col = _mod("moe_tail_col")
-    runs = []
+    runs, prewait = [], []
     attn_res = SimpleNamespace(
         MIN_CANDIDATES=2, MAX_CANDIDATES=12,
         run_k3_attn_res=lambda row, adds, block, *a, **kw: runs.append(
             (block.shape[0] + 1, kw.get("tap") is not None, kw.get("mxfp8_out") is not None)),
+        compile_lamport_mnnvl=lambda n, mxfp8=False, tap=False, prewait_poll=False: prewait.append(
+            (n, tap, mxfp8)) if prewait_poll else None,
     )  # fmt: skip
     monkeypatch.setattr(col, "_attn_res", lambda: attn_res)
     monkeypatch.setattr(
@@ -465,6 +536,7 @@ def test_warm_up_runs_the_tap_and_mxfp8_attn_res_builds(monkeypatch, tap, mxfp8)
     col.warm_up(state, layer, gemvs, max_candidates=4, mxfp8=mxfp8, tap=tap)
     want = {(n, t, m) for n in (2, 3, 4) for t in {False, tap} for m in {False, mxfp8}}
     assert set(runs) == want, sorted(runs)
+    assert sorted(prewait) == sorted(want), sorted(prewait)
     assert state.attn_res_candidates == frozenset({2, 3, 4})
     assert state.attn_res_mx_candidates == (frozenset({2, 3, 4}) if mxfp8 else frozenset())
 

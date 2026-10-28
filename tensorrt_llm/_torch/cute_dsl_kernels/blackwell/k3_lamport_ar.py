@@ -314,6 +314,24 @@ def st_u32(addr, value, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def st_volatile_v4(addr, v0, v1, v2, v3, *, loc=None, ip=None):
+    """16-byte strong (``volatile``, i.e. relaxed system-scope) store; after a fence it releases."""
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip)] + [_iv(v, loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
+        "st.volatile.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def fence_acq_rel_gpu(*, loc=None, ip=None):
+    _asm(None, [], "fence.acq_rel.gpu;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
 def griddepcontrol_wait(*, loc=None, ip=None):
     _asm(None, [], "griddepcontrol.wait;", "", loc=loc, ip=ip)
 
@@ -703,6 +721,27 @@ def poll_result_v4(uc_local: Int64, flags: Int64, tok: Int32, byte_off: Int32, h
     the finish kernel has then advanced the rotation, so the call's buffer is the state's dirty
     one; the next all-reduce on the workspace clears it, so only a consumer ordered before that
     call may read it."""
+    f = ld_volatile_v4(flags)
+    row = stage_addr(uc_local, f[1], Int32(1), 2, f[2]) + Int64(tok * hidden) * 2
+    w = ld_volatile_v4(row + Int64(byte_off))
+    while clean4(*w) == 0:
+        w = ld_volatile_v4(row + Int64(byte_off))
+    return w
+
+
+@cute.jit
+def poll_published_v4(uc_local: Int64, flags: Int64, tok: Int32, byte_off: Int32, hidden: int):
+    """:func:`poll_result_v4` for the rows of a column publish (``k3_ctm_gemv_wide_col_publish`` with its rotation
+    released), callable before the consumer's ``griddepcontrol.wait``.
+
+    Before the wait the rotation state may still be the previous call's (a finish kernel's, which always writes a
+    non-zero stage-0 clear) or already the publish's (stage-0 clear 0, stored after the rest of the state behind a
+    gpu-scope fence). Spin until stage-0 clear reads 0 with acquire semantics; the state is then the publish's and its
+    dirty buffer is the one the publish fills. Only the publish's consumer may call it, before any later call on the
+    workspace (which writes the state again)."""
+    c0 = ld_acquire_u32(flags + Int64(16))
+    while c0 != Int32(0):
+        c0 = ld_acquire_u32(flags + Int64(16))
     f = ld_volatile_v4(flags)
     row = stage_addr(uc_local, f[1], Int32(1), 2, f[2]) + Int64(tok * hidden) * 2
     w = ld_volatile_v4(row + Int64(byte_off))

@@ -1175,7 +1175,9 @@ def k3_ctm_gemv_long(
 # has read it, one thread counts the CTA (atom.acq_rel); the last CTA to count writes the next call's state (current
 # +1, dirty = this buffer, two stages, M rows of stage 1 to clear) and resets the counter; every CTA's epilogue re-arms
 # its share of the previous call's buffer after its stores. Dependents are released from the activation warp after its
-# wait, as for the push.
+# wait, as for the push. With pub_release the last CTA stores the clear sizes (stage 0: 0, which no finish kernel
+# writes) after the rest of the state behind a gpu-scope fence, so a consumer can tell the publish's state from the
+# previous call's before its own wait and poll the rows then (k3_lamport_ar.poll_published_v4).
 # =============================================================================
 WIDE_TILES = (16, 32, 64)
 WIDE_SMEM_BYTES = 220 * 1024  # the ring, the x stages and the mailbox; the barriers fit in the rest
@@ -1278,6 +1280,10 @@ def k3_ctm_gemv_wide_kernel(
     # Column publish: load the addend right after the grid wait (overlapping the activation load and the MMA)
     # instead of after the split-K reduce; the same values, so the same bits.
     pub_addend_early: cutlass.Constexpr[bool],
+    # Column publish: store the next call's state with release semantics (the rest of the state, a gpu-scope fence,
+    # then the clear sizes) so a consumer may find the published buffer before its own grid wait
+    # (k3_lamport_ar.poll_published_v4).
+    pub_release: cutlass.Constexpr[bool],
 ):
     """One 128-row tile per cluster of `split` CTAs; a weight ring filled before the grid wait, an x ring after it."""
     k_tiles = num_k_tiles(k_in)
@@ -1593,10 +1599,17 @@ def k3_ctm_gemv_wide_kernel(
                     _lamport.st_v4(
                         pub_flags, (pub_cur + 1) % _lamport.NUM_BUFFERS, pub_cur, pub_nbytes, cutlass.Int32(2)
                     )  # fmt: skip
-                    _lamport.st_v4(
-                        pub_flags + cutlass.Int64(16), cutlass.Int32(0),
-                        num_tokens * cutlass.Int32(pub_hidden * ELEM_BYTES), cutlass.Int32(0), cutlass.Int32(0),
-                    )  # fmt: skip
+                    if cutlass.const_expr(pub_release):
+                        _lamport.fence_acq_rel_gpu()
+                        _lamport.st_volatile_v4(
+                            pub_flags + cutlass.Int64(16), cutlass.Int32(0),
+                            num_tokens * cutlass.Int32(pub_hidden * ELEM_BYTES), cutlass.Int32(0), cutlass.Int32(0),
+                        )  # fmt: skip
+                    else:
+                        _lamport.st_v4(
+                            pub_flags + cutlass.Int64(16), cutlass.Int32(0),
+                            num_tokens * cutlass.Int32(pub_hidden * ELEM_BYTES), cutlass.Int32(0), cutlass.Int32(0),
+                        )  # fmt: skip
                     _lamport.st_u32(arrivals, cutlass.Int32(0))
         while not cute.arch.mbarrier_try_wait(acc_done.data_ptr(), 0):
             pass
@@ -1890,6 +1903,7 @@ def k3_ctm_gemv_wide(
     k3_ctm_gemv_wide_kernel(
         tma_desc_w, tma_desc_x, tma_desc_y, tma_desc_y_tail, y, num_tokens, sig_row0, n_out, k_in, split, ring, x_ring,
         n_tile, out_fp32, trigger_early, row_tiles, 0, None, None, None, None, 0, None, None, None, None, None, False,
+        False,
     ).launch(
         grid=(clusters * split, 1, 1),
         block=(THREADS, 1, 1),
@@ -1927,7 +1941,7 @@ def k3_ctm_gemv_wide_ar_push(
     k3_ctm_gemv_wide_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x, tma_desc_x, x_flat, num_tokens, cutlass.Int32(n_out), n_out, k_in, split,
         ring, x_ring, n_tile, False, False, 0, ar_world, peer_ptrs, mc_base, flags, rank, 0, None, None, None, None,
-        None, False,
+        None, False, False,
     ).launch(
         grid=((n_out // CTA_M) * split, 1, 1),
         block=(THREADS, 1, 1),
@@ -1958,13 +1972,14 @@ def k3_ctm_gemv_wide_col_publish(
     hidden: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
     addend_early: cutlass.Constexpr[bool],
+    release: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     """``x @ w^T`` (fp32 sums as ``k3_ctm_gemv_wide``'s) plus the bf16 ``addend [M, hidden]``'s columns
     [col0, col0 + N), rounded once to bf16 and published as those columns of the ``[M, hidden]`` result of the next
     Lamport call on a workspace (broadcast stage of its current buffer, every rank), advancing the workspace's rotation
     (see the column publish section comment). ``row_tiles`` as in ``k3_ctm_gemv_wide`` (tiles of a multiple of 8
-    rows). ``addend_early``: the kernel's ``pub_addend_early``."""
+    rows). ``addend_early``, ``release``: the kernel's ``pub_addend_early``, ``pub_release``."""
     if cutlass.const_expr(row_tiles > 0):
         tma_desc_w = _weight_tensor_map_row_tiles(w, n_out, k_in, row_tiles)
     else:
@@ -1974,7 +1989,7 @@ def k3_ctm_gemv_wide_col_publish(
     k3_ctm_gemv_wide_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x, tma_desc_x, x_flat, num_tokens, cutlass.Int32(n_out), n_out, k_in, split,
         ring, x_ring, n_tile, False, False, row_tiles, 0, None, None, None, None, hidden, uc_local, mc_base, flags,
-        addend, col0, addend_early,
+        addend, col0, addend_early, release,
     ).launch(
         grid=(clusters * split, 1, 1),
         block=(THREADS, 1, 1),

@@ -482,6 +482,17 @@ TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY = _flag(
     "moe_tail_col.ADDEND_EARLY_CAPABILITIES",
     accepted=ON_OFF,
 )
+TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT = _flag(
+    "TRTLLM_K3LL_MOE_TAIL_COL_TAR_PREWAIT",
+    0,
+    "TRTLLM_K3LL_MOE_TAIL_COL's consumer (the next layer's Lamport K3AttnResFast) polls the publish's rows before its "
+    "griddepcontrol.wait instead of after the publish's grid has drained (k3_lamport_ar.poll_published_v4); the "
+    "publish stores the next call's rotation state with release semantics so the consumer can find the buffer. "
+    "Bitwise (the same rows, the same arithmetic). Read at forward time by the publish, which hands the value to its "
+    "consumer; a build per value. 1 on, 0 (default) off, -1 on where the device is in "
+    "moe_tail_col.TAR_PREWAIT_CAPABILITIES",
+    accepted=ON_OFF,
+)
 TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE = _flag(
     "TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE",
     -1,
