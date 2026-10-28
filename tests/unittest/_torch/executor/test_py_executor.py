@@ -2360,6 +2360,7 @@ class _StubADPExecutor:
         enable_non_overlap_adp_forward_intent=None,
         peer_forward_intent=_ADPForwardIntent.GENERATION,
         exclude_retiring_requests=True,
+        tp_size=2,
     ):
         self.enable_attention_dp = enable_attention_dp
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -2389,7 +2390,9 @@ class _StubADPExecutor:
         self.model_engine = Mock(max_num_tokens=max_num_tokens, max_seq_len=max_seq_len)
 
         self.dist = Mock()
-        self.dist.tp_size = 1
+        # Peers are modeled through peer_forward_intent; tp_size only tells the
+        # executor whether attention DP has any peer at all.
+        self.dist.tp_size = tp_size
         self.dist.tp_allgather.side_effect = lambda value: [value]
         self.dist.tp_allreduce.side_effect = lambda value, op: max(value, int(peer_forward_intent))
         self.adp_router = Mock(exclude_retiring_requests=exclude_retiring_requests)
@@ -2536,6 +2539,17 @@ def test_disabled_adp_dummy_fix_gate_preserves_pp_behavior(state):
 
     assert stub.add_dummy_calls == []
     assert len(stub.active_requests) == 1
+
+
+def test_pad_dummy_skipped_for_single_rank_attention_dp():
+    # tp1 attention DP (e.g. DWDP ctx workers) has no peer to keep in step.
+    stub = _StubADPExecutor(tp_size=1)
+    stub.expected_num_active_requests = 1
+
+    _run_pad(stub)
+
+    assert stub.add_dummy_calls == []
+    assert stub.active_requests == []
 
 
 def test_pad_dummy_added_when_only_to_complete_requests_disagg():
@@ -3189,6 +3203,17 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch():
     # pick: this rank is empty precisely because it is short of KV cache.
     assert stub.add_dummy_calls[0]["is_gen"] is True
     assert stub.add_dummy_calls[0]["token_nums"] is None
+
+
+def test_pad_empty_batch_no_op_for_single_rank_attention_dp():
+    # tp1 attention DP (e.g. DWDP ctx workers): an empty batch vetoes no peer.
+    stub, scheduled_batch = _unfittable_rank(tp_size=1)
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert stub.add_dummy_calls == []
+    assert scheduled_batch.batch_size == 0
+    assert stub._pending_adp_dummy_request is None
 
 
 def test_pad_empty_batch_no_op_when_batch_is_not_empty():

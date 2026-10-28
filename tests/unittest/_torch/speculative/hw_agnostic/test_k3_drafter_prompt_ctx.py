@@ -341,6 +341,7 @@ def _starved_adp_rank(capture_only):
     dummy = SimpleNamespace(py_request_id=0, is_last_context_chunk=True)
     executor.__dict__.update(
         enable_attention_dp=True,
+        dist=SimpleNamespace(tp_size=2),
         active_requests=[SimpleNamespace(py_request_id=11)],
         expected_num_active_requests=1,
         max_num_active_requests=8,

@@ -7944,7 +7944,8 @@ class PyExecutor:
         """Pad an idle attention-DP rank with a role-matched dummy request."""
         if getattr(self, "_enable_remote_tail_adp", False):
             return
-        if not self.enable_attention_dp:
+        if not self.enable_attention_dp or self.dist.tp_size <= 1:
+            # A single-rank attention-DP group has no peer to keep in step.
             return
 
         expected_num_active_requests = self.expected_num_active_requests
@@ -8120,6 +8121,10 @@ class PyExecutor:
                 in self.model_engine.cuda_graph_runner.padding_dummy_requests)
             return
         if not self.active_requests or self.expected_num_active_requests <= 0:
+            return
+        # With a single attention-DP rank `_can_queue` reduces to this rank's
+        # own batch, so an empty batch vetoes no peer and needs no padding.
+        if self.dist.tp_size <= 1:
             return
         # Unlike the pre-schedule path, this one pads a rank that already holds
         # active requests, so it must respect the cap that
