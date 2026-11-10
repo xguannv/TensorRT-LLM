@@ -8,17 +8,22 @@ fits it raises ``NoTarget`` stating those facts. In ``auto`` the engine then
 uses the built-in Kimi K3 implementation; in ``require`` it raises that error.
 
 The checkpoint declares the vision-language wrapper, and the language model's
-shape lives in its ``text_config``, so that is what this tree reads. The
-targets are text-only: they load no vision tower and refuse image input.
+shape lives in its ``text_config``, so that is what this tree reads. The MXFP4
+targets on sm100 are text-only: they load no vision tower and refuse image input.
+
+The NVFP4 checkpoint on sm107 (Rubin) has one target, ``kimi_k3_nvfp4__sm_107__default``,
+which derives its sharding from the mapping and serves the disaggregated
+deployments listed in ``_sm107_parallel``.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._router_index import NoTarget, routes
+from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -93,6 +98,102 @@ def _parallel(m) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Kimi K3 NVFP4 on Rubin (sm107).
+# ---------------------------------------------------------------------------
+
+_SM107 = (10, 7)
+
+# (layers, hidden, routed experts, experts per token, attention heads, q_lora_rank,
+# kv_lora_rank, vocab), read from ``text_config``.
+_SM107_SHAPE = (93, 7168, 896, 16, 96, 1536, 512, 163840)
+_SM107_SHAPE_FIELDS = (
+    "num_hidden_layers",
+    "hidden_size",
+    "num_experts",
+    "num_experts_per_token",
+    "num_attention_heads",
+    "q_lora_rank",
+    "kv_lora_rank",
+    "vocab_size",
+)
+
+
+def _sm107_parallel(mapping) -> str:
+    """The deployment this mapping is, or a description of it when it is none of them.
+
+    The sm107 target serves one-rank DWDP context servers (``tp1``), generation over
+    Helix CP8 (``helix8``), over Helix CP16 with the experts split MoE TP4 x EP4
+    (``helix16_moetp4ep4``), and attention DP over 16 ranks (``dep16``).
+    """
+    helix = mapping.cp_size > 1 and mapping.has_cp_helix()
+    if mapping.pp_size != 1:
+        return f"pp{mapping.pp_size}"
+    if mapping.world_size == 1:
+        return "tp1"
+    if helix and not mapping.enable_attention_dp and mapping.tp_size == 1:
+        if mapping.cp_size == 8:
+            return "helix8"
+        if mapping.cp_size == 16 and (mapping.moe_tp_size, mapping.moe_ep_size) == (4, 4):
+            return "helix16_moetp4ep4"
+    if (
+        mapping.enable_attention_dp
+        and mapping.world_size == 16
+        and mapping.tp_size == 16
+        and mapping.cp_size == 1
+    ):
+        return "dep16"
+    return (
+        f"world_size={mapping.world_size} tp={mapping.tp_size} cp={mapping.cp_size} "
+        f"helix={helix} attention_dp={mapping.enable_attention_dp} "
+        f"moe_tp={mapping.moe_tp_size} moe_ep={mapping.moe_ep_size}"
+    )
+
+
+def _check_sm107(model_config: ModelConfig, llm_args: TorchLlmArgs) -> str:
+    """Return the sm107 deployment name, or raise ``NoTarget`` saying why the target does not fit."""
+    pretrained_config = model_config.pretrained_config
+    text = getattr(pretrained_config, "text_config", None)
+    if text is None:
+        raise NoTarget("the sm107 Kimi K3 target needs the composite checkpoint's text_config")
+    shape = tuple(getattr(text, name, None) for name in _SM107_SHAPE_FIELDS)
+    if shape != _SM107_SHAPE:
+        raise NoTarget(f"text_config shape {shape} is not Kimi K3's {_SM107_SHAPE}")
+    quant = getattr(pretrained_config, "quantization_config", None) or {}
+    experts = [
+        value
+        for name, value in (quant.get("quantized_layers", {}) or {}).items()
+        if name.endswith(".experts")
+    ]
+    if not experts or any(value.get("quant_algo") != "NVFP4" for value in experts):
+        raise NoTarget("the sm107 Kimi K3 target needs the NVFP4 checkpoint (NVFP4 routed experts)")
+    spec_config = model_config.spec_config
+    if spec_config is not None and not spec_config.spec_dec_mode.is_dspark():
+        raise NoTarget(
+            f"the sm107 Kimi K3 target runs DSpark or no speculative decoding, got "
+            f"{spec_config.spec_dec_mode.name}"
+        )
+    kv_algo = engine_kv_cache_quant_algo(model_config, llm_args)
+    if kv_algo not in (QuantAlgo.NVFP4, QuantAlgo.FP8):
+        raise NoTarget(f"the sm107 Kimi K3 target runs an NVFP4 or FP8 KV cache, got {kv_algo}")
+    mapping = model_config.mapping
+    parallel = _sm107_parallel(mapping)
+    if parallel not in ("tp1", "helix8", "helix16_moetp4ep4", "dep16"):
+        raise NoTarget(
+            f"{parallel}: the sm107 Kimi K3 target serves one rank per process (DWDP context "
+            "servers), Helix over 8 ranks, Helix over 16 ranks with MoE TP4 x EP4, or attention "
+            "DP over 16 ranks"
+        )
+    logger.info(
+        f"modeling_v2 kimi_k3_vl: parallel={parallel} world_size={mapping.world_size} "
+        f"rank={mapping.rank} tp={mapping.tp_size} cp={mapping.cp_size} "
+        f"attention_dp={mapping.enable_attention_dp} moe_tp={mapping.moe_tp_size} "
+        f"moe_ep={mapping.moe_ep_size} dwdp_size={getattr(mapping, 'dwdp_size', None)} "
+        f"kv={kv_algo} spec={spec_config.spec_dec_mode.name if spec_config else None}"
+    )
+    return parallel
+
+
 @routes("KimiK3ForConditionalGeneration")
 def route(
     model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
@@ -102,6 +203,16 @@ def route(
     Each target is imported where it is returned, so declining costs no import
     of modeling code.
     """
+    if compute_capability == _SM107:
+        parallel = _check_sm107(model_config, llm_args)
+        from .kimi_k3_nvfp4__sm_107__default import features
+
+        # The target's modules read the deployment's feature profile when imported.
+        features.select(parallel)
+        from .kimi_k3_nvfp4__sm_107__default.modeling import ModelingV2KimiK3Nvfp4Sm107Default
+
+        return ModelingV2KimiK3Nvfp4Sm107Default
+
     pretrained_config = model_config.pretrained_config
     mapping = model_config.mapping
     text_config = getattr(pretrained_config, "text_config", None)
