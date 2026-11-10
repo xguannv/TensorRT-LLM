@@ -73,6 +73,15 @@ worker_config:
       mamba_ssm_cache_dtype: bfloat16
       mamba_state_config:
         additional_snapshot_offsets_from_end: [0]
+      # The KV cache pool of the startup memory profiling is allocated before the DWDP
+      # setup, and the DWDP prefetch ring (the remote experts of 2 MoE layers, about
+      # 28 GiB over 12 ranks) has to fit next to it. Without a token cap the profiling
+      # pool is sized for the whole max_seq_len and leaves too little room for the
+      # ring; GSM8K needs far less KV. The profiling clamps max_seq_len to the cap, so
+      # the cap stays above the 147456-token prompt of the chunked MLA profiling; and
+      # it bounds the final KV cache, which needs about 233k tokens (16 GiB) with this
+      # pool_ratio for the 16 x 256-token Mamba hybrid warmup batch.
+      max_tokens: 393216
       # Layer-group order: ssm, fp4_mla, fp8_mla, mla_hp_tail.
       pool_ratio: [0.14, 0.635, 0.205, 0.02]
       tokens_per_block: 128
