@@ -42,6 +42,15 @@ PIP_TIMEOUT_RETRY = re.compile(
     r"\s*WARNING: Retrying \(Retry\([^)]*\)\) after connection broken by "
     r"'(?:Read|Connect)TimeoutError\(.*\)': \S+\s*"
 )
+# A multi-frontend server's secondary frontends forward the disaggregated
+# server's clock-offset POST to the launcher frontend. Before the launcher
+# listens, the forward is refused and the POST gets a 503; the disaggregated
+# server then leaves that server's perf-metric timestamps unadjusted.
+LAUNCHER_CLOCK_OFFSET_REFUSED = re.compile(
+    r".*\[W\] \[serve\] Forwarding POST /steady_clock_offset to the launcher frontend failed: "
+    r"\w*ClientConnectorError\(.*ConnectionRefusedError\(111, 'Connection refused'\)\)\s*"
+)
+LAUNCHER_CLOCK_OFFSET_KEYWORDS = ("ClientConnectorError", "ConnectionRefusedError")
 
 
 def is_benign_line(line: str) -> bool:
@@ -52,6 +61,12 @@ def is_benign_line(line: str) -> bool:
     # warning lines containing another error keyword must still fail the scan.
     if PIP_TIMEOUT_RETRY.fullmatch(line):
         return not any(keyword in line for keyword in ERROR_KEYWORDS if keyword != "TimeoutError")
+    if LAUNCHER_CLOCK_OFFSET_REFUSED.fullmatch(line):
+        return not any(
+            keyword in line
+            for keyword in ERROR_KEYWORDS
+            if keyword not in LAUNCHER_CLOCK_OFFSET_KEYWORDS
+        )
     return AUTOTUNER_MARKER in line and any(text in line for text in AUTOTUNER_BENIGN_TEXTS)
 
 

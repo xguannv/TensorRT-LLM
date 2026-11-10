@@ -221,6 +221,42 @@ def test_pip_retry_warning_does_not_hide_terminal_errors(tmp_path: Path, failure
     assert "Error line 1:" not in str(exc_info.value)
 
 
+LAUNCHER_CLOCK_OFFSET_REFUSED = (
+    "[11/10/2026-05:16:06] [TRT-LLM] [W] [serve] Forwarding POST /steady_clock_offset to the "
+    "launcher frontend failed: UnixClientConnectorError(ConnectionKey(host='launcher', port=80, "
+    "is_ssl=False, ssl=True, proxy=None, proxy_auth=None, proxy_headers_hash=None), "
+    "ConnectionRefusedError(111, 'Connection refused'))\n"
+)
+
+
+def test_refused_clock_offset_forward_does_not_fail_the_server_log_scan(tmp_path: Path) -> None:
+    log = _server_log(
+        tmp_path,
+        LAUNCHER_CLOCK_OFFSET_REFUSED
+        + 'INFO:     10.0.0.1:41044 - "POST /steady_clock_offset HTTP/1.1" 503 Service Unavailable\n',
+    )
+    assert check_error(log) == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        LAUNCHER_CLOCK_OFFSET_REFUSED.replace("/steady_clock_offset", "/v1/completions"),
+        LAUNCHER_CLOCK_OFFSET_REFUSED.replace(
+            "ConnectionRefusedError(111, 'Connection refused')", "TimeoutError()"
+        ),
+        LAUNCHER_CLOCK_OFFSET_REFUSED.rstrip() + " RuntimeError: launcher died\n",
+        "RuntimeError: launcher died\n",
+    ],
+    ids=["other-route", "timeout", "mixed-line", "terminal-error"],
+)
+def test_refused_clock_offset_forward_does_not_hide_other_failures(
+    tmp_path: Path, line: str
+) -> None:
+    log = _server_log(tmp_path, LAUNCHER_CLOCK_OFFSET_REFUSED + line)
+    assert check_error(log) == [(2, line.strip())]
+
+
 def test_check_error_skips_the_waits_own_retry_messages(tmp_path):
     """The readiness wait must not fail on its own progress output."""
     log = _server_log(
