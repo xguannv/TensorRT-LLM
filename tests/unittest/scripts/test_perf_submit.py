@@ -16,6 +16,7 @@
 
 import importlib.util
 import json
+import subprocess
 from pathlib import Path
 from types import ModuleType
 
@@ -563,6 +564,69 @@ def test_dwdp_ctx_worker_command_replaces_llmapi_launch(ci_submit_module: Module
         'export partialPytestCommandDWDPCtxWorker="LLM_ROOT=/src COLUMNS=300 '
         'bash /rank.sh pytest -vv --test-list=/w/list.txt"'
     )
+
+
+DWDP_CTX_RANK_PATH = (
+    REPO_ROOT / "jenkins" / "scripts" / "perf" / "disaggregated" / "dwdp_ctx_rank.sh"
+)
+
+
+def _run_dwdp_ctx_rank(env: dict) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", str(DWDP_CTX_RANK_PATH), "env"],
+        env={"PATH": "/usr/bin:/bin", **env},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("inherited", "local_id", "expected"),
+    (
+        (None, "0", "0"),
+        (None, "2", "2"),
+        ("", "3", "3"),
+        ("4,5,6,7", "2", "6"),
+        ("GPU-a,GPU-b", "1", "GPU-b"),
+    ),
+)
+def test_dwdp_ctx_rank_pins_each_task_to_its_gpu(inherited, local_id: str, expected: str):
+    # Every task of the ctx step sees the whole node unless the launcher pins
+    # it; an unpinned process that uses CUDA before choosing a device lands on
+    # GPU 0.
+    env = {"SLURM_LOCALID": local_id, "SLURM_PROCID": "6", "OMPI_COMM_WORLD_RANK": "6"}
+    if inherited is not None:
+        env["CUDA_VISIBLE_DEVICES"] = inherited
+    result = _run_dwdp_ctx_rank(env)
+    assert result.returncode == 0, result.stderr
+    child_env = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    assert child_env["CUDA_VISIBLE_DEVICES"] == expected
+    # The MPI/Slurm identity still reaches only the saved copies.
+    assert "SLURM_LOCALID" not in child_env
+    assert "OMPI_COMM_WORLD_RANK" not in child_env
+    assert child_env["TLLM_DWDP_SAVED_SLURM_LOCALID"] == local_id
+    assert child_env["TLLM_DWDP_SAVED_SLURM_PROCID"] == "6"
+    assert child_env["TLLM_DWDP_SAVED_OMPI_COMM_WORLD_RANK"] == "6"
+    # Pinning leaves the media-deps install to the node's first rank only.
+    if local_id == "0":
+        assert "TRTLLM_AUTO_INSTALL_MEDIA_DEPS" not in child_env
+    else:
+        assert child_env["TRTLLM_AUTO_INSTALL_MEDIA_DEPS"] == "0"
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    (
+        ({"SLURM_LOCALID": "2", "CUDA_VISIBLE_DEVICES": "0,1"}, "lists 2 GPUs"),
+        ({"CUDA_VISIBLE_DEVICES": "0,1,2,3"}, "must run as a task of the DWDP ctx srun step"),
+    ),
+)
+def test_dwdp_ctx_rank_refuses_without_a_gpu_for_the_task(env: dict, message: str):
+    result = _run_dwdp_ctx_rank(env)
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert "CUDA_VISIBLE_DEVICES=" not in result.stdout
 
 
 def _aggregated_hardware(module: ModuleType, config: dict, benchmark_mode: str) -> dict:

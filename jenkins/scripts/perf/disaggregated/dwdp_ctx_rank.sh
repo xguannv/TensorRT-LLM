@@ -18,12 +18,32 @@
 # concurrent installs into one site-packages fail with OSError, and the failed
 # rank takes the whole step down.
 #
+# The step starts one task per GPU without binding GPUs to tasks, so each task
+# is also pinned to its own GPU here: the SLURM_LOCALID-th entry of the
+# inherited CUDA_VISIBLE_DEVICES, or GPU SLURM_LOCALID if it is unset. Otherwise
+# every process of the task that uses CUDA before selecting its device (the
+# trtllm-serve proxy process, MPI initialization) creates its context on GPU 0,
+# in the memory of the ctx server running there.
+#
 # Usage: bash dwdp_ctx_rank.sh pytest <args>...
 
 set -euo pipefail
 
 if [[ "${SLURM_LOCALID:-0}" != "0" ]]; then
     export TRTLLM_AUTO_INSTALL_MEDIA_DEPS=0
+fi
+
+local_id=${SLURM_LOCALID:?dwdp_ctx_rank.sh must run as a task of the DWDP ctx srun step}
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    IFS=, read -r -a visible_devices <<< "$CUDA_VISIBLE_DEVICES"
+    if (( local_id >= ${#visible_devices[@]} )); then
+        echo "dwdp_ctx_rank.sh: SLURM_LOCALID=$local_id but CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" \
+            "lists ${#visible_devices[@]} GPUs" >&2
+        exit 1
+    fi
+    export CUDA_VISIBLE_DEVICES=${visible_devices[$local_id]}
+else
+    export CUDA_VISIBLE_DEVICES=$local_id
 fi
 
 mpi_prefixes=(OMPI_ PMIX_ PMI_ SLURM_ MPI_ I_MPI_ HYDRA_ MPICH_ MV2_ CRAY_)
