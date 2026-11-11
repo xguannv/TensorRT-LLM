@@ -11,11 +11,13 @@ scales drawn directly, weight global scales 1, so every weight is exact in FP32)
 * against an FP32 reference on the same NVFP4 input (the module's own quantization) with the
   FC1 output requantized to NVFP4 as the kernel does (``_fp4_moe_test_utils._q_nvfp4``);
 * with ``x`` written on another stream and joined through ``input_ready_event``, and chunked
-  (``max_chunk_tokens`` below the token count): the bits of the plain call.
+  (``max_chunk_tokens`` below the token count): the plain call's output up to the order of the
+  finalize's BF16 scatter-add (:data:`ORDER_ULP`).
 
 ``CUTEDSL_FC12`` (SM107 only; skipped elsewhere): the output with a pre-zeroed output and counters
-(``new_zeroed_output`` + ``zero_on_side_stream``) is the bits of the plain call, and the same with
-die-major weights and die-local claiming from 24 tokens where the GPU has two dies.
+(``new_zeroed_output`` + ``zero_on_side_stream``) is the plain call's up to the scatter-add order,
+and the same with die-major weights and die-local claiming from 24 tokens where the GPU has two
+dies.
 
     pytest -s test_modeling_v2_k3r_experts.py
 """
@@ -192,6 +194,13 @@ def test_cutedsl_against_fp32_reference(num_tokens):
     assert_within_ulp(got, want, 32, 4)
 
 
+#: The finalize GEMM scatter-adds each token's ``TOP_K`` weighted expert rows into the BF16
+#: output with atomics, in an order that varies run to run; each add rounds at the scale of its
+#: partial sum. Two runs of one input differ by that alone: on GB300, 3.1 bf16 ulp of the row's
+#: largest on 27 of 98304 elements (96 tokens, top-8). Gates: 8 element / 0.5 RMS.
+ORDER_ULP, ORDER_RMS_ULP = 8, 0.5
+
+
 def test_cutedsl_joins_input_stream_and_chunks():
     layer = _Layer(96, seed=7)
     module = _family()
@@ -209,13 +218,13 @@ def test_cutedsl_joins_input_stream_and_chunks():
         layer.x.copy_(x_src)
         ready.record()
     late = _forward(module, layer, input_ready_event=ready)
-    assert_within_ulp(late, plain, 2, 0.5)
+    assert_within_ulp(late, plain, ORDER_ULP, ORDER_RMS_ULP)
 
     chunked = _family(max_chunk_tokens=40)
     layer.load(chunked)
     out = _forward(chunked, layer)
     assert out.shape == plain.shape
-    assert_within_ulp(out, plain, 2, 0.5)
+    assert_within_ulp(out, plain, ORDER_ULP, ORDER_RMS_ULP)
 
 
 def test_construction_refuses_fc12_options_on_cutedsl():
@@ -245,7 +254,7 @@ def test_fc12_prezeroed_output(num_tokens):
         out = module(layer.x, logits, route=layer.route, zeroed_output=zeroed)
     torch.cuda.synchronize()
     assert out.data_ptr() == zeroed.output.data_ptr()
-    assert_within_ulp(out, plain, 2, 0.5)
+    assert_within_ulp(out, plain, ORDER_ULP, ORDER_RMS_ULP)
 
 
 @needs_fc12
@@ -267,4 +276,4 @@ def test_fc12_die_major(num_tokens):
     for name in ("w3_w1_weight", "w2_weight"):
         assert torch.equal(getattr(module.backend, name), getattr(flat.backend, name)), name
     got = _forward(module, layer)
-    assert_within_ulp(got, want, 2, 0.5)
+    assert_within_ulp(got, want, ORDER_ULP, ORDER_RMS_ULP)
