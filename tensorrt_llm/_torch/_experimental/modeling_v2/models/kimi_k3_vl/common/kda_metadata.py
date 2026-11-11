@@ -17,9 +17,11 @@ int64 offsets) with what the KDA layers read once per step instead of once per l
   - **mid-chunk snapshots**: ``kv_cache_manager.get_kda_midchunk_snapshots(request_ids)`` returns
     ``(context index, pool slot, offset)`` for each context request whose chunk holds a snapshot
     point; the prefill writes the state and convolution window after the first ``offset`` tokens
-    into that slot. A model asks for them by declaring ``KDA_MIDCHUNK_SNAPSHOT_ALIGNMENT`` (the
-    prefill kernel's chunk). Fetching the plan is the handshake: the manager commits a snapshot
-    page only when the plan was fetched this step.
+    into that slot. A model asks for them with
+    ``RuntimeHooks(hybrid_cache=HybridCachePolicy(kda_midchunk_snapshot_alignment=``
+    ``KDA_MIDCHUNK_SNAPSHOT_ALIGNMENT))`` (the prefill kernel's chunk). Fetching the plan is the
+    handshake: the manager commits a snapshot page only when the plan was fetched this step, and
+    turns mid-chunk planning off when a planned snapshot is never fetched.
   - **in-forward snapshots** (``MambaHybridCacheManagerV2`` with block reuse):
     ``Mamba2Metadata.prepare`` hands its plan to :meth:`K3MambaMetadata._prepare_inforward_split`;
     the live slots keep the state at the point and staging rows the chunk-end state.
@@ -51,8 +53,8 @@ __all__ = [
 
 # Granularity of the branch's mid-chunk snapshot offsets (the CuTe DSL prefill kernel's chunk).
 KDA_PREFILL_CHUNK_SIZE = 64
-#: What a target declares (``kda_midchunk_snapshot_alignment`` on its outer model class) to have
-#: the cache manager plan mid-chunk snapshots: offsets are multiples of the prefill chunk.
+#: The ``HybridCachePolicy.kda_midchunk_snapshot_alignment`` a target declares to have the cache
+#: manager plan mid-chunk snapshots: offsets are multiples of the prefill chunk.
 KDA_MIDCHUNK_SNAPSHOT_ALIGNMENT = KDA_PREFILL_CHUNK_SIZE
 
 
