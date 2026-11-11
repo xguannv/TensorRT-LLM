@@ -1986,6 +1986,13 @@ class SpecWorkerBase(nn.Module, ABC):
     def _forward_impl(self, *args, **kwargs):
         """Worker-specific forward logic, called by SpecWorkerBase.forward."""
 
+    def target_head_rows(self, hidden_states: torch.Tensor, attn_metadata,
+                         spec_metadata) -> torch.Tensor:
+        """The rows of the target's final ``hidden_states`` that the target
+        head reads (``spec_metadata.gather_ids``), handed to
+        ``target_logits``."""
+        return hidden_states[spec_metadata.gather_ids]
+
     def target_logits(self, hidden_states: torch.Tensor, lm_head,
                       logits_processor, attn_metadata, spec_metadata,
                       draft_model) -> torch.Tensor:
