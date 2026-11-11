@@ -14,8 +14,8 @@
 # limitations under the License.
 """RMSNorm + RoPE launchers of the Kimi K3 MLA DSpark drafter.
 
-* :func:`k3r_dspark_rmsnorm_rope`: main's ``trtllm::cute_dsl_dspark_rmsnorm_rope`` (same
-  kernel, same support check), compiled for
+* :func:`k3r_dspark_rmsnorm_rope`: main's ``trtllm::cute_dsl_dspark_rmsnorm_rope`` kernel and
+  support check (the family's copy, ``dspark/kernels/dspark_rmsnorm_rope.py``), compiled for
   regular row-strided input, so the drafter normalizes column slices of its fused GEMM outputs
   in place instead of staging them in a contiguous copy. Main's op is compiled for compact
   rows.
@@ -33,14 +33,12 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
-from tensorrt_llm._torch.attention.kernels.blackwell.dspark_rmsnorm_rope import (
-    DSparkRMSNormRoPEKernel,
-)
-from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
-    is_fused_dspark_rmsnorm_rope_supported,
-)
 from tensorrt_llm._utils import get_sm_version
 
+from ...dspark.kernels.dspark_rmsnorm_rope import (
+    DSparkRMSNormRoPEKernel,
+    is_fused_dspark_rmsnorm_rope_supported,
+)
 from ...kernels.k3r_spec.dspark_mla_rope import DSparkMlaBlockRoPEKernel, DSparkMlaCtxNormRoPEKernel
 
 

@@ -13,15 +13,15 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("needs a CUDA GPU", allow_module_level=True)
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.dspark.worker import (  # noqa: E402, E501
+    _PairExchange,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec import (  # noqa: E402, E501
     _reference,
     k3_markov_add_local_argmax,
     k3_markov_reduce_embed,
     k3_vocab_local_select,
     k3_vocab_reduce_pairs,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.dflash import (  # noqa: E402, E501
-    _PairExchange,
 )
 
 __extra_import_path__ = ["../../../.."]

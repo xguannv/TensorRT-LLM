@@ -252,13 +252,12 @@ def test_dspark_unified_draft_cache_probes_on_the_k3_hybrid_manager():
     The engine appends the drafter's layers to
     ``KimiK3HybridCacheManager`` only when the class opts in, and only when the loaded drafter
     says it reads the manager's pages (``reads_managed_ctx_pages`` /
-    ``reads_helix_sharded_ctx_pages``, which the private drafter must override). The private
+    ``reads_helix_sharded_ctx_pages``, which the family drafter declares). The family
     worker finds the layers through ``draft_layer_ids`` and ``get_buffers(..., kv_layout=...)``.
     Main's ``DFlashSpecMetadata.prepare`` hands a disaggregated generation request's new slot to
-    the worker's ``_seed_generation_slot``, and the private worker seeds the slot's context
+    the worker's ``_seed_generation_slot``, and the family worker seeds the slot's context
     length only when it reports ``_ctx_unified_cache``. The KDA bookkeeping after accept runs
     only when the manager is a ``MambaHybridCacheManager``."""
-    from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
     from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
@@ -274,13 +273,11 @@ def test_dspark_unified_draft_cache_probes_on_the_k3_hybrid_manager():
     for name in ("get_layer_kv_factor", "get_layer_page_index_scale", "get_draft_kv_cache_view"):
         assert callable(getattr(KVCacheManagerV2, name, None)), name
     assert "_seed_generation_slot" in inspect.getsource(DFlashSpecMetadata.prepare)
-    worker = _k3_module("sm107_parts.drafter").K3DSparkWorker
+    worker = _k3_module("dspark.worker").K3DSparkWorker
     assert "_ctx_unified_cache" in inspect.getsource(worker._seed_generation_slot)
-    drafter = _k3_module("sm107_parts.drafter").K3MLADSparkForCausalLM
-    assert drafter.reads_managed_ctx_pages is not DFlashForCausalLM.reads_managed_ctx_pages
-    assert (
-        drafter.reads_helix_sharded_ctx_pages is not DFlashForCausalLM.reads_helix_sharded_ctx_pages
-    )
+    drafter = _k3_module("dspark.drafter").K3DSparkDrafter
+    assert callable(drafter.reads_managed_ctx_pages)
+    assert _is_property(drafter, "reads_helix_sharded_ctx_pages")
 
 
 def test_kda_inforward_snapshot_plan_on_the_private_metadata():
@@ -333,40 +330,17 @@ def test_kda_inforward_snapshot_plan_on_the_private_metadata():
         metadata._prepare_inforward_split(attn_metadata, manager, misaligned, 3, 3)
 
 
-@pytest.mark.parametrize("takes_flag", [False, True])
-def test_dspark_helix_drafter_probes(takes_flag, monkeypatch):
-    """The DSpark drafter under Helix (generation): its Helix exchange keeps the NCCL reformats
-    eager only where main's ``_helix_post_process`` takes ``compile_nccl_reformat``, and calls it
-    without the keyword otherwise."""
-    drafter = _k3_module("sm107_parts.drafter")
-    fn, _ = drafter._helix_post_process_fn()
-    assert callable(fn)
-    calls = []
-
-    def fake(*args, **kwargs):
-        calls.append((args, kwargs))
-        return "out"
-
-    monkeypatch.setattr(drafter, "_helix_post_process_fn", lambda: (fake, takes_flag))
-    mask = object()
-    assert drafter._draft_helix_post_process(1, 2, 3, 4, 5, mask) == "out"
-    expected = {"zero_kv_mask": mask}
-    if takes_flag:
-        expected["compile_nccl_reformat"] = False
-    assert calls == [((1, 2, 3, 4, 5), expected)]
-
-
 def test_dspark_latent_cache_helix_mapping():
     """The DSpark drafter under Helix with ``TRTLLM_DISAGG_SHARED_DRAFT_KV=1`` (generation): main
     unifies the draft KV with a CP > 1 target only when the drafter reports
-    ``reads_helix_sharded_ctx_pages`` (``_dflash_unify_blocker``), which the private drafter does
+    ``reads_helix_sharded_ctx_pages`` (``_dflash_unify_blocker``), which the family drafter does
     when its latent cache is page-sharded. The sharding comes from the target's helix CP mapping:
     tp = 1 and cp over the repurposed TP group, on the target's CP ranks, with the NCCL all-to-all
     exchange."""
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
     from tensorrt_llm.mapping import CpType, Mapping
 
-    shard = _k3_module("sm107_parts.drafter")._latent_cache_helix_mapping
+    shard = _k3_module("dspark.drafter")._latent_cache_helix_mapping
     if hasattr(KvCacheCreator, "_unified_drafter_reads_helix_pages"):
         assert "_unified_drafter_reads_helix_pages()" in inspect.getsource(
             KvCacheCreator._dflash_unify_blocker
@@ -457,7 +431,7 @@ def test_dspark_split_plan_planner():
     piece cost as an argument, and the runner exposes what the geometry reads."""
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
 
-    drafter = _k3_module("sm107_parts.drafter")
+    drafter = _k3_module("dspark.drafter")
     plan = _k3_module("kernels.k3r_spec.mla_split_plan")
     params = inspect.signature(plan._mla_split_kv_plan_kernel.fn).parameters
     for name in ("PIECE_COST", "MAX_PIECES", "BLOCK", "KV_TILE", "MIN_TILES"):
@@ -479,12 +453,10 @@ def test_dspark_split_plan_planner():
 
 def test_dspark_drafter_declares_its_slot_convention():
     """DSpark's ``shift_label`` slot convention (generation): the engine sizes the unified draft
-    KV from ``draft_model.shift_label`` (``get_draft_block_width``, K slots instead of K + 1), which
-    main's ``DFlashForCausalLM`` initializes off and the drafter's DSpark heads set."""
-    from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
-
-    drafter = _k3_module("sm107_parts.drafter")
-    assert issubclass(drafter.K3MLADSparkForCausalLM, DFlashForCausalLM)
+    KV from ``draft_model.shift_label`` (``get_draft_block_width``, K slots instead of K + 1),
+    which the drafter's DSpark heads set."""
+    drafter = _k3_module("dspark.drafter")
+    assert issubclass(drafter.K3DSparkDrafter, drafter._DSparkHeadMixin)
     heads = drafter._DSparkHeadMixin.__new__(drafter._DSparkHeadMixin)
     heads._init_dspark_heads(SimpleNamespace())
     assert heads.shift_label is True
@@ -494,8 +466,8 @@ def test_dspark_drafter_declares_its_slot_convention():
 
 def test_dspark_worker_takes_the_shared_slot_calls():
     """Main's ``DFlashSpecMetadata.prepare()`` drives the drafter's context slots by calling
-    methods on the worker it is bound to, and on K3 that is the private ``K3DSparkWorker``: every
-    ``worker.<method>(...)`` call there binds to the private method of that name. A missing
+    methods on the worker it is bound to, and on K3 that is the family ``K3DSparkWorker``: every
+    ``worker.<method>(...)`` call there binds to the family method of that name. A missing
     method or a changed signature raises ``TypeError`` on the first step after the context
     buffers exist, so no DSpark run starts."""
     import ast
@@ -515,7 +487,7 @@ def test_dspark_worker_takes_the_shared_slot_calls():
     names = {call.func.attr for call in calls}
     assert {"_assign_slot", "_write_ctx_len"} <= names, names
 
-    worker = _k3_module("sm107_parts.drafter").K3DSparkWorker
+    worker = _k3_module("dspark.worker").K3DSparkWorker
     unbound = []
     for call in calls:
         method = getattr(worker, call.func.attr, None)

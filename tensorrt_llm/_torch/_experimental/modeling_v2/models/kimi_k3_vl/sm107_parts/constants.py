@@ -42,9 +42,12 @@ class K3Sm107Constants:
     mla_q_norm_pdl: bool
     fp4_mla_page_plan: bool
     fp4_mla_reduce_pdl: bool
-    # DSpark (drafter.py, dflash.py, kernels/k3r_spec/spec_tail_kernels.py).
+    # DSpark (dspark/, kernels/k3r_spec/spec_tail_kernels.py).
     spec_tail_fusion: bool
     dspark_tail_v2: bool
+    # The target is a disaggregated context server: its drafter only writes the context KV the
+    # generation servers' drafter reads (``context_kv_only`` of ``dspark/drafter.py``).
+    dspark_context_kv_only: bool
     # Device memory, in bytes, the engine leaves outside the PyTorch memory cap
     # (``RuntimeHooks.torch_mem_safety_margin``).
     torch_mem_safety_margin: int

@@ -37,8 +37,8 @@ the TP group and reduce on an auxiliary stream while the routed experts run on t
 stream; under attention DP they are replicated. ``lm_head`` is vocab-parallel with a gather,
 so every rank has the full logits.
 
-Speculative decoding: the one-engine DSpark / DFlash drafters of ``drafter.py`` / ``dflash.py``, and the suffix
-automaton; KDA and MLA verify several tokens per step and keep the accepted state. Chunked
+Speculative decoding: one-engine DSpark with the family's standalone MLA drafter and worker
+(``dspark/``); KDA and MLA verify several tokens per step and keep the accepted state. Chunked
 prefill continues a request's KDA state and attends over its cached MLA prefix. KV cache
 block reuse is opt-in (``kv_cache_config.enable_block_reuse``); periodic KDA state snapshots
 come from ``mamba_state_config.periodic_snapshot_interval``. Pipeline parallelism is not
@@ -74,13 +74,14 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
-from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, MetaInitException
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 
+from ..dspark.drafter import K3DSparkPath
+from ..dspark.shell import KimiK3SpecForCausalLM
 from ..kernels.k3r_spec.spec_decode_head import spec_decode_head
 from ..ops.attention import _fp4_mla_decode as fp4_mla_decode
 from .attn_res import (
@@ -97,7 +98,6 @@ from .attn_res import (
     _materialize_prefix_sum,
 )
 from .constants import K3Sm107Constants
-from .drafter import install_k3_dspark
 from .kda import K3KDALinearAttention, K3MambaMetadata
 from .layers import (
     EmbeddingTable,
@@ -662,27 +662,38 @@ class KimiK3DefaultModelingV2(DecoderModel):
 
 
 class KimiK3DefaultForCausalLM(
-    KimiK3DefaultTextWeights, SpecDecOneEngineForCausalLM[KimiK3DefaultModelingV2, Any]
+    KimiK3DefaultTextWeights, KimiK3SpecForCausalLM[KimiK3DefaultModelingV2, Any]
 ):
     """The Kimi K3 text model (KDA + MLA + MoE decoder layers) of ``KimiK3Sm107ForConditionalGeneration``.
 
     Registered under no architecture: the target class builds it as its ``llm``. Weight loading
     is the ``KimiK3DefaultTextWeights`` mixin's (``weights.py``).
 
-    Speculative decoding: ``SpecDecOneEngineForCausalLM`` builds the drafter and the worker;
-    :meth:`_install_private_spec` replaces them with the target's DSpark drafter and worker
-    (``drafter.py``, ``dflash.py``)."""
+    Speculative decoding: one-engine DSpark with a standalone MLA drafter, built by the family's
+    ``KimiK3SpecForCausalLM`` (``dspark/``) on the target's constants: the deployment path
+    (``spec_tail_fusion`` / ``dspark_tail_v2``), the context-KV-only drafter of a context server
+    (``dspark_context_kv_only``) and the decode step's head in one kernel (``spec_head_fusion``,
+    ``RuntimeHooks.decode_prologue``)."""
 
     mamba_metadata_cls = K3MambaMetadata
 
     @property
-    def runtime_hooks(self) -> Optional[RuntimeHooks]:
-        """The base hooks plus, with the target's ``spec_head_fusion``, the speculative decode
-        step's head in one kernel (``decode_prologue``)."""
-        hooks = super().runtime_hooks
-        if not self.k3_constants.spec_head_fusion:
-            return hooks
-        return replace(hooks or DEFAULT_RUNTIME_HOOKS, decode_prologue=spec_decode_head)
+    def dspark_path(self) -> K3DSparkPath:
+        """The DSpark deployment path of the target's ``spec_tail_fusion`` / ``dspark_tail_v2``."""
+        return K3DSparkPath(
+            spec_tail_fusion=self.k3_constants.spec_tail_fusion,
+            tail_v2=self.k3_constants.dspark_tail_v2,
+        )
+
+    @property
+    def dspark_context_kv_only(self) -> bool:
+        """Whether the target is a context server whose drafter only writes the context KV."""
+        return self.k3_constants.dspark_context_kv_only
+
+    @property
+    def spec_decode_prologue(self):
+        """The speculative decode step's head in one kernel, with the target's ``spec_head_fusion``."""
+        return spec_decode_head if self.k3_constants.spec_head_fusion else None
 
     def __init__(self, model_config: ModelConfig, *, constants: K3Sm107Constants):
         # The target's constants (``K3Sm107Constants``); every layer gets the same instance.
@@ -699,37 +710,17 @@ class KimiK3DefaultForCausalLM(
 
         # Helix: swap in the repurposed mapping; restored after super().__init__.
         self._setup_helix_mappings(model_config, cfg, spec_config)
-        # Supported spec-dec modes:
-        # - SA (suffix automaton): one-engine in-forward drafting, no draft
-        #   weights; the KDA/MLA verify paths below implement multi-token
-        #   verification for it.
-        # - DFlash: external-drafter parallel drafting; the drafter is a
-        #   separate dense checkpoint (K2.7-Code-DFlash schema) consumed by
-        #   the generic DFlashForCausalLM wrapper, and the target only has
-        #   to expose per-layer hidden states via maybe_capture_hidden_states
-        #   (see KimiK3DefaultModelingV2.forward).
-        # - DSpark: the same external-drafter flow with the Markov and
-        #   confidence heads enabled (RadixArk/Kimi-K3-DSpark and friends).
-        #   The target side is identical -- the capture in
-        #   KimiK3DefaultModelingV2.forward is unconditional -- so this gate is the
-        #   only place the mode has to be admitted.
-        # Modes needing draft heads (MTP/Eagle) are blocked until a
-        # draft-head checkpoint exists.
-        assert (
-            spec_config is None
-            or spec_config.spec_dec_mode.is_sa()
-            or spec_config.spec_dec_mode.is_dflash()
-            or spec_config.spec_dec_mode.is_dspark()
-        ), "Kimi K3 supports speculative decoding only with SA, DFlash or DSpark"
+        # Speculative decoding is one-engine DSpark with a standalone drafter checkpoint;
+        # KimiK3SpecForCausalLM rejects every other speculative config. The target side is the
+        # hidden-state capture in KimiK3DefaultModelingV2.forward.
         super().__init__(
             KimiK3DefaultModelingV2(model_config, constants=constants),
             model_config,
             hidden_size=cfg.hidden_size,
             vocab_size=cfg.vocab_size,
         )
-        # The drafter and worker of main's shell are built (under the repurposed helix mapping,
-        # which is still active here); the package's own replace them at this one point.
-        self._install_private_spec(model_config)
+        # The drafter and the worker are built under the repurposed helix mapping (still active
+        # here); the drafter gets the CP original as ``_helix_mapping_with_cp``.
 
         # Restore the CP original: executor-side helix bookkeeping keys off
         # has_cp_helix() at runtime.
@@ -737,30 +728,6 @@ class KimiK3DefaultForCausalLM(
             model_config._frozen = False
             model_config.mapping = self.mapping_with_cp
             model_config._frozen = True
-
-    def _install_private_spec(self, model_config: ModelConfig) -> None:
-        """Swap in the target's DSpark drafter and worker (``drafter.py``, ``dflash.py``).
-
-        Called once from ``__init__``, right after ``SpecDecOneEngineForCausalLM.__init__`` and
-        before the helix CP mapping is restored, i.e. with the same mapping main's drafter was
-        built under. At that point main's shell has set ``self.spec_config``,
-        ``self.draft_config``, ``self.draft_model`` (from the draft-builder registry, or None for a
-        separate draft engine), ``self.spec_worker`` (``mapping_for_full_rows()`` mapping,
-        ``set_target_model(self)`` done), ``self.use_separate_draft_kv_cache`` and ``self.epilogue``.
-
-        A private implementation must replace ``draft_model`` / ``spec_worker`` consistently:
-        swap them in ``self.epilogue`` (main appends both there), call ``set_target_model(self)`` on the
-        new worker, keep ``self.lm_head`` a stock ``LMHead`` and ``self.logits_processor`` exactly a
-        ``LogitsProcessor`` (main's vocab-parallel selection checks the type), and keep the
-        contract main's ``DFlashSpecMetadata.prepare()`` has with the worker (the attributes it
-        reads and the slot methods it calls, listed in ``drafter.py``).
-
-        One-engine DSpark with a standalone MLA drafter gets the package's drafter
-        (``drafter.py``) and worker (``drafter.py`` on ``dflash.py``)
-        through :func:`~.drafter.install_k3_dspark`, which keeps that contract; every other
-        configuration keeps main's.
-        """
-        install_k3_dspark(self, model_config, self.k3_constants)
 
     def _setup_helix_mappings(
         self,

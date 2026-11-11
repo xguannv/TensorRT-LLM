@@ -278,7 +278,7 @@ class KimiK3DefaultTextWeights:
     """Checkpoint loading of the text model: name plan, trunk, FP8 projections, expert slices.
 
     The first base of ``KimiK3DefaultForCausalLM``, so its ``load_weights`` resolves before
-    ``SpecDecOneEngineForCausalLM``'s.
+    ``KimiK3SpecForCausalLM``'s.
     """
 
     # ------------------------------------------------------------------
@@ -486,7 +486,7 @@ class KimiK3DefaultTextWeights:
 
     def _trunk_parameters(self) -> Dict[str, torch.nn.Parameter]:
         """Named parameters of the trunk only. Spec-dec draft modules
-        (e.g. the DFlash drafter attached by SpecDecOneEngineForCausalLM)
+        (the DSpark drafter attached by KimiK3SpecForCausalLM)
         live in a separate checkpoint loaded by
         ModelLoader.load_draft_weights, not in the target checkpoint. MLA
         K/V absorb Parameters are derived by the KV-B loader and are likewise

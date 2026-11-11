@@ -35,7 +35,7 @@ import pytest
 import torch
 
 __extra_import_path__ = ["."]
-import test_k3_dspark_drafter_parity as parity  # noqa: E402
+import _k3_dspark_drafter_inputs as parity  # noqa: E402
 
 NEW = parity.NEW
 BLOCK, PAGE = parity.BLOCK, parity.PAGE

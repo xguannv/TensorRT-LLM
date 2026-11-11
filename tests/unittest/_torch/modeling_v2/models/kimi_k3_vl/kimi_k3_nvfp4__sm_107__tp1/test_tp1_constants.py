@@ -39,6 +39,7 @@ _EXPECTED = {
     "fp4_mla_reduce_pdl": False,
     "spec_tail_fusion": False,
     "dspark_tail_v2": False,
+    "dspark_context_kv_only": True,
     "torch_mem_safety_margin": 4 * 1024**3,
 }
 

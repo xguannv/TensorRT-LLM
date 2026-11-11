@@ -28,5 +28,6 @@ CONSTANTS = K3Sm107Constants(
     fp4_mla_reduce_pdl=True,
     spec_tail_fusion=True,
     dspark_tail_v2=True,
+    dspark_context_kv_only=False,
     torch_mem_safety_margin=4 * 1024**3,
 )
