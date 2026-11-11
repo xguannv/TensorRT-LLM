@@ -51,6 +51,10 @@ except ImportError:
 # where a static grid runs a second wave.
 _DENSE_GEMM_SCHEDULER_ENV = "TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER"
 _dense_gemm_scheduler_announced = set()
+# TRTLLM_CUTEDSL_FP8_OUT_UNTUNED_TACTICS=0 makes untuned FP8-output Rubin dense
+# block-scaled GEMMs run the fallback 128x128 1-CTA tile instead of the
+# runner's untuned_fp8_output_tactics (default 1).
+_FP8_OUT_UNTUNED_TACTICS_ENV = "TRTLLM_CUTEDSL_FP8_OUT_UNTUNED_TACTICS"
 
 
 def _dense_gemm_scheduler_override() -> Optional[str]:
@@ -14165,6 +14169,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert packed_scale.shape == (expected_scale_numel, )
             assert packed_scale.is_contiguous()
 
+        @functools.lru_cache(maxsize=None)
+        def _rubin_untuned_tactic_can_run(runner_cls, entry, n: int,
+                                          real_k: int) -> bool:
+            """Whether ``runner_cls``'s FP8-output kernel implements an
+            ``untuned_fp8_output_tactics`` entry for N x K problems.
+
+            M enters ``can_implement`` only through the CTA count along M,
+            which the caller checks, so the probe uses the smallest such M.
+            """
+            (mma_tiler_mnk, mma_inst_shape, cluster_shape_mn, _, _,
+             epi_tile_n) = entry
+            cta_tile_m = mma_tiler_mnk[0] // (2 if mma_inst_shape[0] == 256 else
+                                              1)
+            if cta_tile_m < 128 or mma_tiler_mnk[1] % epi_tile_n != 0:
+                return False
+            probe_m = cta_tile_m * cluster_shape_mn[0]
+            return runner_cls.kernel_class.can_implement(
+                (probe_m, n, real_k, 1), runner_cls.a_dtype, runner_cls.b_dtype,
+                runner_cls.sf_dtype, cutlass.Float8E4M3FN, "k", "k", "n",
+                runner_cls.sf_vec_size, mma_tiler_mnk, mma_inst_shape,
+                cluster_shape_mn)
+
         class CuteDSLBlockScaledRubinLinear(TunableRunner):
             """Datatype-agnostic block-scaled Linear runner for SM107.
 
@@ -14194,6 +14220,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mixed_scheduler_mode_candidates: ClassVar[Tuple[str,
                                                             ...]] = ("static", )
             split_k_candidates: ClassVar[Tuple[int, ...]] = (1, 2, 4, 8)
+            # Tactics that replace the fallback 128x128 1-CTA tile for
+            # FP8-output GEMMs run without a tuned tactic (autotuner cache
+            # miss or tactic -1). Rows ``(min_m, {scheduler: (mma_tiler_mnk,
+            # mma_inst_shape, cluster_shape_mn, use_prefetch, raster_order,
+            # epi_tile_n)}, unpinned_scheduler)``, largest ``min_m`` first;
+            # the scheduler pinned by TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER
+            # selects the entry. M below the last row, a pinned scheduler
+            # without an entry, or a tile the problem cannot run keeps the
+            # fallback tile.
+            untuned_fp8_output_tactics: ClassVar[Tuple] = ()
             # Whether an output_tensor without partition_id is a plain in-place
             # GEMM. Otherwise a missing partition_id is rejected.
             allow_unpartitioned_output: ClassVar[bool] = False
@@ -14205,11 +14241,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          use_tvm_ffi: bool = True):
                 super().__init__()
 
-                if output_dtype != torch.bfloat16:
+                if output_dtype != torch.bfloat16 and not (
+                        self.gemm_name == "MXFP8"
+                        and output_dtype == torch.float8_e4m3fn):
                     raise ValueError(
-                        f"CuteDSL {self.gemm_name} only supports bfloat16 output, "
-                        f"got {output_dtype}")
+                        f"CuteDSL {self.gemm_name} does not support output dtype "
+                        f"{output_dtype}")
                 self.output_dtype = output_dtype
+                self.c_dtype = (cutlass.Float8E4M3FN if output_dtype
+                                == torch.float8_e4m3fn else cutlass.BFloat16)
                 self.to_userbuffers = to_userbuffers
                 self.use_tvm_ffi = use_tvm_ffi
 
@@ -14230,6 +14270,50 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if not isinstance(other, self.__class__):
                     return False
                 return self.unique_id() == other.unique_id()
+
+            def untuned_default_tactic(self, m: int, n: int,
+                                       k: int) -> Optional[tuple]:
+                """Base tactic for an untuned FP8-output [m, k] x [n, k] GEMM.
+
+                The tactic carries split_k 1 and a tenth element, the epilogue
+                subtile N.
+                None keeps the fallback 128x128 1-CTA tile. All tiles of this
+                kernel accumulate K in the same order and the epilogue applies
+                the same per-element conversion, so the output does not depend
+                on the tactic.
+                """
+                if (self.output_dtype != torch.float8_e4m3fn
+                        or not self.untuned_fp8_output_tactics
+                        or os.environ.get(_FP8_OUT_UNTUNED_TACTICS_ENV,
+                                          "1") == "0"):
+                    return None
+                for (min_m, by_scheduler,
+                     unpinned) in self.untuned_fp8_output_tactics:
+                    if m < min_m:
+                        continue
+                    scheduler = _dense_gemm_scheduler_override() or unpinned
+                    entry = by_scheduler.get(scheduler)
+                    if entry is None:
+                        return None
+                    (mma_tiler_mnk, mma_inst_shape, cluster_shape_mn,
+                     use_prefetch, raster_order, epi_tile_n) = entry
+                    use_2cta = mma_inst_shape[0] == 256
+                    cta_tile_m = mma_tiler_mnk[0] // (2 if use_2cta else 1)
+                    if ceil_div(m, cta_tile_m) < cluster_shape_mn[0]:
+                        return None
+                    if (scheduler == "clc_dynamic" and raster_order == "n"
+                            and not _clc_raster_n_has_launchable_grid(
+                                m, n, 1, mma_tiler_mnk[:2], use_2cta,
+                                cluster_shape_mn)):
+                        return None
+                    if not _rubin_untuned_tactic_can_run(
+                            self.__class__, entry, n,
+                            k * self.packed_k_multiplier):
+                        return None
+                    return ("base", mma_tiler_mnk, mma_inst_shape,
+                            cluster_shape_mn, False, use_prefetch, scheduler,
+                            raster_order, 1, epi_tile_n)
+                return None
 
             def get_valid_tactics(
                 self,
@@ -14269,11 +14353,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 # Both swap orientations use the original N as C's physical
                 # contiguous dimension and require 16-byte BF16 alignment.
-                output_aligned = (n % 8 == 0)
+                output_alignment = 16 if self.output_dtype == torch.float8_e4m3fn else 8
+                output_aligned = n % output_alignment == 0
                 if not output_aligned:
                     logger.debug(
                         f"CuteDSL: Output N={n} does not meet the 16-byte "
-                        f"alignment requirement (N%8={n%8}). Skipping all tactics."
+                        f"alignment requirement (N%{output_alignment}={n % output_alignment}). Skipping all tactics."
                     )
                     return []
 
@@ -14361,7 +14446,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 self.a_dtype,
                                 self.b_dtype,
                                 self.sf_dtype,
-                                cutlass.BFloat16,
+                                self.c_dtype,
                                 a_major,
                                 b_major,
                                 c_major,
@@ -14416,7 +14501,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             self.a_dtype,
                             self.b_dtype,
                             self.sf_dtype,
-                            cutlass.BFloat16,
+                            self.c_dtype,
                             a_major,
                             b_major,
                             c_major,
@@ -14488,7 +14573,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     tactic: Tiling and cluster strategy:
                         base: ("base", mma_tiler_mnk, mma_inst_shape,
                         cluster_shape, swap_ab, use_prefetch, scheduler_mode,
-                        raster_order, split_k)
+                        raster_order, split_k[, epi_tile_n]); a missing tactic
+                        (cache miss or -1) of an FP8-output GEMM takes
+                        ``untuned_default_tactic``.
                         mixed: ("mixed_clusters", mma_tiler_mnk,
                         mma_inst_shape, preferred_cluster_shape,
                         fallback_cluster_shape, swap_ab, use_prefetch,
@@ -14499,8 +14586,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 Returns:
                     torch.Tensor: Output tensor of shape (m, n), dtype: bf16.
                 """
+                if not (isinstance(tactic, tuple) and len(tactic) > 0):
+                    untuned = self.untuned_default_tactic(
+                        inputs[0].shape[0], inputs[1].shape[0],
+                        inputs[0].shape[1])
+                    if untuned is not None:
+                        tactic = untuned
                 sf_vec_size = self.sf_vec_size
                 split_k = 1
+                epi_tile_n = None
 
                 if (isinstance(tactic, tuple) and len(tactic) > 0
                         and isinstance(tactic[0], str)):
@@ -14529,11 +14623,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         else:
                             scheduler_mode, raster_order = tuning_options
                     else:
-                        if len(tactic) not in {6, 7, 8, 9}:
+                        if len(tactic) not in {6, 7, 8, 9, 10}:
                             raise ValueError(
                                 "CuteDSL SM107 base tactics must use Boolean "
-                                "use_prefetch with an optional scheduler mode "
-                                "and raster order, followed by split_k")
+                                "use_prefetch with an optional scheduler mode, "
+                                "raster order, split_k and epilogue subtile N")
                         (_, mma_tiler_mnk, mma_inst_shape, cluster_shape_mn,
                          swap_ab, use_prefetch, *tuning_options) = tactic
                         preferred_cluster_shape_mn = None
@@ -14543,8 +14637,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             scheduler_mode = tuning_options[0]
                         if len(tuning_options) >= 2:
                             raster_order = tuning_options[1]
-                        if len(tuning_options) == 3:
+                        if len(tuning_options) >= 3:
                             split_k = tuning_options[2]
+                        if len(tuning_options) == 4:
+                            epi_tile_n = tuning_options[3]
                 elif isinstance(tactic, tuple) and len(tactic) == 5:
                     kernel_variant = "base"
                     (mma_tiler_mnk, mma_inst_shape, cluster_shape_mn, swap_ab,
@@ -14690,7 +14786,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 b_sf_ptr = self.make_cute_dsl_global_pointer(
                     b_sf_tensor, self.sf_dtype, self.sf_assumed_align)
                 c_ptr = self.make_cute_dsl_global_pointer(
-                    c_tensor, cutlass.BFloat16, 16)
+                    c_tensor, self.c_dtype, 16)
 
                 # get stream
                 torch_stream = torch.cuda.current_stream()
@@ -14770,12 +14866,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_preferred_clusters = get_max_activate_clusters(
                         preferred_cluster_shape_mn[0] *
                         preferred_cluster_shape_mn[1])
-                cache_key = (kernel_variant, sf_vec_size, mma_tiler_mnk,
-                             mma_inst_shape, preferred_cluster_shape_mn,
-                             cluster_shape_mn, swap_ab, use_prefetch,
-                             raster_order, scheduler_mode, split_k,
-                             locality_domain_half_gemm, self.use_tvm_ffi,
-                             max_active_preferred_clusters, max_active_clusters)
+                cache_key = (self.output_dtype, kernel_variant, sf_vec_size,
+                             mma_tiler_mnk, mma_inst_shape,
+                             preferred_cluster_shape_mn, cluster_shape_mn,
+                             swap_ab, use_prefetch, raster_order,
+                             scheduler_mode, split_k, locality_domain_half_gemm,
+                             self.use_tvm_ffi, max_active_preferred_clusters,
+                             max_active_clusters, epi_tile_n)
                 alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
 
                 # get stream
@@ -14793,7 +14890,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         b_sf_ptr = self.make_cute_dsl_global_pointer(
                             b_sf_tensor, self.sf_dtype, self.sf_assumed_align)
                         c_ptr = self.make_cute_dsl_global_pointer(
-                            c_tensor, cutlass.BFloat16, 16)
+                            c_tensor, self.c_dtype, 16)
                         alpha_cute_tensor = cute.runtime.from_dlpack(
                             alpha_tensor)
                         # make faked stream
@@ -14841,6 +14938,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             raster_order=raster_order,
                             scheduler_type=scheduler_type,
                             split_k=split_k,
+                            epi_tile_n=epi_tile_n,
                         )
                     # Note: when tvm_ffi fake stream is used, at least one parameter should be tensor type,
                     # so we make alpha as the cute.Tensor type in the jit func.
@@ -14980,6 +15078,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             allow_unswapped_small_m_fallback = True
             raster_order_candidates = ("m", "n")
             mixed_scheduler_mode_candidates = ("static", "clc_dynamic")
+            # K3 MLA cached-prefix kv_b expansion (M x 512 -> 24576, FP8
+            # output): with K=512 the epilogue bounds the GEMM, and 2-CTA
+            # 256x256 tiles with 128x128 epilogue subtiles run 1.3-1.6x
+            # faster than the fallback tile for M >= 8192 on Rubin.
+            untuned_fp8_output_tactics = ((1024, {
+                "static":
+                ((256, 256, 128), (256, 256, 64), (2, 1), False, "m", 128),
+                "clc_dynamic":
+                ((256, 256, 128), (256, 256, 64), (2, 1), False, "m", 128),
+            }, "static"), )
             tuning_config = TuningConfig(
                 dynamic_tensor_specs=(DynamicTensorSpec(
                     0, 0, get_last_power_of_2_num_tokens_buckets,
@@ -15049,11 +15157,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """Run the SM107 dense MXFP8 GEMM with K32 R128c4 UE8M0 scales.
 
             ``fine_grained_m`` enables Kimi K3's 16-token low-M tuning buckets.
+            FP8 output keeps the BF16 rounding of the result and uses a unit
+            output scale, for the NVFP4 MLA context FMHA scratch.
             """
-            if output_dtype != torch.bfloat16:
+            if output_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
                 raise ValueError(
-                    f"CuteDSL MXFP8 only supports bfloat16 output, got "
-                    f"{output_dtype}")
+                    f"CuteDSL MXFP8 supports bfloat16 or float8_e4m3fn output, "
+                    f"got {output_dtype}")
             if (sm_version := get_sm_version()) != 107:
                 raise ValueError(
                     f"CuteDSL MXFP8 SM107 GEMM requires SM107, got SM{sm_version}."
@@ -15090,7 +15200,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ) -> torch.Tensor:
             shape = list(mat_a.shape)
             shape[-1] = mat_b.shape[-2]
-            return mat_a.new_empty(shape, dtype=torch.bfloat16)
+            return mat_a.new_empty(shape, dtype=output_dtype)
 
         @torch.library.custom_op(
             "trtllm::cute_dsl_mxfp8_gemm_inplace_rubin",
