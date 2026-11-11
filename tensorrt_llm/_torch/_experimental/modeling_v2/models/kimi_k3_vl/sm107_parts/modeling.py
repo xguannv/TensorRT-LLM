@@ -51,7 +51,6 @@ Checkpoint loading is in ``weights.py``.
 from __future__ import annotations
 
 import copy
-import dataclasses
 import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional, Tuple
@@ -946,15 +945,11 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
         return self.llm.vocab_size_padded
 
     @property
-    def runtime_hooks(self) -> Optional[RuntimeHooks]:
+    def runtime_hooks(self) -> RuntimeHooks:
         """The text model's step-loop hooks (the engine reads them off the outer model) and the
-        target's ``torch_mem_safety_margin``."""
-        hooks = self.llm.runtime_hooks
-        # TODO(runtime R03): drop this check once RuntimeHooks.torch_mem_safety_margin is on the branch
-        if "torch_mem_safety_margin" not in {f.name for f in dataclasses.fields(RuntimeHooks)}:
-            return hooks
+        target's ``torch_mem_safety_margin``. A target class adds its own declarations to these."""
         return replace(
-            hooks or DEFAULT_RUNTIME_HOOKS,
+            self.llm.runtime_hooks or DEFAULT_RUNTIME_HOOKS,
             torch_mem_safety_margin=self.llm.k3_constants.torch_mem_safety_margin,
         )
 

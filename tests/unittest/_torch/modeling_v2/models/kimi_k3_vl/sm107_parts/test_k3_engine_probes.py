@@ -65,19 +65,37 @@ _TARGET_CLASSES = {
 }
 
 
+def _declared_hooks(target):
+    """The ``RuntimeHooks`` fields the target class declares on top of the text model's hooks and
+    the margin, as the reference recipe's servers of that role run them (none read from an
+    environment variable or a recipe field)."""
+    from tensorrt_llm._torch.pyexecutor.runtime_hooks import HybridCachePolicy
+
+    if target == "tp1":
+        # Every recipe's context servers: KDA mid-chunk snapshots at the 64-token prefill chunk,
+        # recurrent pages of prompts under 16384 tokens at the lowest priority, exact demotion.
+        return dict(
+            hybrid_cache=HybridCachePolicy(
+                kda_midchunk_snapshot_alignment=64, low_priority_snapshot_prompt_len=16384
+            ),
+            exact_context_demotion=True,
+        )
+    if target.startswith("helix8"):
+        # c240 / c24 GEN: the state indices and dummy mask in one upload kernel.
+        return dict(hybrid_cache=HybridCachePolicy(state_index_upload_kernel=True))
+    # c383 GEN: the reference's KV-balanced admission planner.
+    planner = _k3_module(f"kimi_k3_nvfp4__sm_107__{target}.kv_balance").K3Dep16KvBalancedAdmission
+    return dict(kv_balanced_admission_planner=planner)
+
+
 @pytest.mark.parametrize("target", TARGETS)
 def test_runtime_hooks_reach_the_engine(target):
-    """The speculative decode step's head (``spec_head_fusion``, ``decode_prologue``) and the
-    PyTorch memory margin (``torch_mem_safety_margin``): the engine arms them only from the
-    ``RuntimeHooks`` it reads off the outermost model (``runtime_hooks_of``), the target's
-    registered class. It must hand on the text model's hooks plus the target's margin, and the
-    text model must declare exactly the hooks its target's constants turn on; everything else
-    stays at the default."""
-    from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
-        DEFAULT_RUNTIME_HOOKS,
-        RuntimeHooks,
-        runtime_hooks_of,
-    )
+    """The engine arms its hooks only from the ``RuntimeHooks`` it reads off the outermost model
+    (``runtime_hooks_of``), the target's registered class. That class hands on the text model's
+    hooks (the speculative decode step's head where ``spec_head_fusion`` is on), the 4 GiB left
+    outside the PyTorch cap, and exactly the hooks of its role (``_declared_hooks``); everything
+    else stays at the default."""
+    from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, runtime_hooks_of
 
     spec_decode_head = _k3_module("kernels.k3r_spec.spec_decode_head").spec_decode_head
     constants = _constants(target)
@@ -94,13 +112,67 @@ def test_runtime_hooks_reach_the_engine(target):
     text_hooks = runtime_hooks_of(text)
     assert (text_hooks.decode_prologue is spec_decode_head) == constants.spec_head_fusion
     assert dataclasses.replace(text_hooks, decode_prologue=None) == DEFAULT_RUNTIME_HOOKS
-    if "torch_mem_safety_margin" in {f.name for f in dataclasses.fields(RuntimeHooks)}:
-        assert hooks.torch_mem_safety_margin == constants.torch_mem_safety_margin == 4 * 1024**3
-        assert dataclasses.replace(hooks, torch_mem_safety_margin=None) == dataclasses.replace(
-            text_hooks, torch_mem_safety_margin=None
-        )
+    assert hooks.torch_mem_safety_margin == constants.torch_mem_safety_margin == 4 * 1024**3
+
+    declared = _declared_hooks(target)
+    planner_cls = declared.pop("kv_balanced_admission_planner", None)
+    if planner_cls is None:
+        assert hooks.kv_balanced_admission_planner is None
     else:
-        assert hooks == text_hooks
+        assert type(hooks.kv_balanced_admission_planner) is planner_cls
+    for name, value in declared.items():
+        assert getattr(hooks, name) == value, name
+    rest = dataclasses.replace(
+        hooks,
+        torch_mem_safety_margin=None,
+        kv_balanced_admission_planner=None,
+        **{name: getattr(DEFAULT_RUNTIME_HOOKS, name) for name in declared},
+    )
+    assert rest == text_hooks
+
+
+@pytest.mark.parametrize("target", TARGETS)
+def test_drafter_declarations_reach_the_engine(target):
+    """The KV cache creator reads the drafter's ``draft_kv_dtype`` (FP8 E4M3 draft layers) and
+    ``context_kv_only`` (the context server's reserve) off ``model.draft_model`` of the outermost
+    model. The target class forwards the text model's drafter, built with the target's
+    ``dspark_context_kv_only`` (only tp1, the context servers)."""
+    import torch
+
+    drafter_mod = _k3_module("dspark.drafter")
+    shell = _k3_module("dspark.shell")
+    assert drafter_mod.K3DSparkDrafter.draft_kv_dtype == torch.float8_e4m3fn
+    constants = _constants(target)
+    assert constants.dspark_context_kv_only is (target == "tp1")
+    text = _bare(_k3_module("sm107_parts.modeling").KimiK3DefaultForCausalLM)
+    text.k3_constants = constants
+    assert text.dspark_context_kv_only is constants.dspark_context_kv_only
+    drafter = SimpleNamespace(draft_kv_dtype=torch.float8_e4m3fn, context_kv_only=True)
+    text.__dict__["draft_model"] = drafter
+    outer = _bare(
+        getattr(_k3_module(f"kimi_k3_nvfp4__sm_107__{target}.modeling"), _TARGET_CLASSES[target])
+    )
+    outer.llm = text
+    assert outer.draft_model is drafter
+    # The shell hands the target's flag to the drafter it builds.
+    source = inspect.getsource(shell.KimiK3SpecForCausalLM._build_dspark)
+    assert "context_kv_only=self.dspark_context_kv_only" in source
+
+
+def test_loader_does_not_take_model_defaults_from_k3():
+    """The model loader takes model defaults from the class registered for the checkpoint's
+    architecture, before it routes a Modeling V2 target. For Kimi K3 that class declares none, so
+    every engine setting of a K3 deployment is the recipe's; the targets declare none either."""
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+
+    builtin = get_registered_model_class("KimiK3ForConditionalGeneration")
+    assert builtin is not None
+    assert not hasattr(builtin, "get_model_defaults")
+    for target in TARGETS:
+        cls = getattr(
+            _k3_module(f"kimi_k3_nvfp4__sm_107__{target}.modeling"), _TARGET_CLASSES[target]
+        )
+        assert not hasattr(cls, "get_model_defaults"), target
 
 
 def test_spec_decode_head_reads_main_names():

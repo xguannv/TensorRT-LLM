@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """kimi_k3_nvfp4__sm_107__helix8_moetp2ep4: its constants are 084745cde4's ``helix8`` profile, it reads no environment
-variable, and its model defaults are what its recipes run."""
+variable, and its class declares no model defaults (the recipe carries the engine settings)."""
 
 from __future__ import annotations
 
@@ -46,8 +46,6 @@ _EXPECTED = {
     "torch_mem_safety_margin": 4 * 1024**3,
 }
 
-_MODEL_DEFAULTS = {"kv_cache_config": {"enable_block_reuse": False, "tokens_per_block": 128}}
-
 
 def test_constants_are_the_reference_profile():
     import importlib
@@ -68,7 +66,7 @@ def test_target_reads_no_environment_variable():
     assert not hits, hits
 
 
-def test_target_class_declares_its_constants_and_model_defaults():
+def test_target_class_declares_its_constants_and_no_model_defaults():
     import importlib
 
     module = importlib.import_module(f"{_FAMILY}.{_TARGET}.modeling")
@@ -76,30 +74,7 @@ def test_target_class_declares_its_constants_and_model_defaults():
     cls = getattr(module, _CLASS)
     assert issubclass(cls, family.KimiK3Sm107ForConditionalGeneration)
     assert cls.K3_CONSTANTS is importlib.import_module(f"{_FAMILY}.{_TARGET}.constants").CONSTANTS
-    # The engine reads model defaults off the routed class; the text model declares none.
-    assert "get_model_defaults" in vars(cls)
-    assert "get_model_defaults" not in vars(family.KimiK3DefaultForCausalLM)
-    assert cls.get_model_defaults(None) == _MODEL_DEFAULTS
-
-
-def test_model_defaults_apply_under_the_user_config(tmp_path):
-    import importlib
-
-    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
-    from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
-
-    cls = getattr(importlib.import_module(f"{_FAMILY}.{_TARGET}.modeling"), _CLASS)
-    args = TorchLlmArgs(model=str(tmp_path))
-    applied = apply_model_defaults_to_llm_args(args, cls.get_model_defaults(args))
-    assert applied
-    assert args.kv_cache_config.tokens_per_block == 128
-    assert (
-        args.kv_cache_config.enable_block_reuse
-        is _MODEL_DEFAULTS["kv_cache_config"]["enable_block_reuse"]
-    )
-    # A value the recipe sets wins over the default.
-    user = not _MODEL_DEFAULTS["kv_cache_config"]["enable_block_reuse"]
-    args = TorchLlmArgs(model=str(tmp_path), kv_cache_config=KvCacheConfig(enable_block_reuse=user))
-    apply_model_defaults_to_llm_args(args, cls.get_model_defaults(args))
-    assert args.kv_cache_config.enable_block_reuse is user
-    assert args.kv_cache_config.tokens_per_block == 128
+    # The model loader applies the model defaults of the checkpoint's built-in class before it
+    # routes a Modeling V2 target, so a target's get_model_defaults would never run: the recipe
+    # carries the engine settings.
+    assert not hasattr(cls, "get_model_defaults")
