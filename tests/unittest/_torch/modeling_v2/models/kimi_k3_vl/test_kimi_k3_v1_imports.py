@@ -147,15 +147,6 @@ PENDING: Dict[str, Tuple[object, str]] = {
         "fam_moe",
     ),
     "tensorrt_llm._torch.moe.kernels.blackwell": ({"kimi_k3_routing"}, "fam_moe"),
-    # fam_spec: the drafter base class and its registry hack, the DSpark RoPE kernel class,
-    # LogitsProcessor by name.
-    "tensorrt_llm._torch.models.modeling_dflash": ({"DFlashForCausalLM"}, "fam_spec"),
-    "tensorrt_llm._torch.models.modeling_utils": ({"MODEL_CLASS_MAPPING"}, "fam_spec"),
-    "tensorrt_llm._torch.modules.logits_processor": ({"LogitsProcessor"}, "fam_spec"),
-    "tensorrt_llm._torch.attention.kernels.blackwell.dspark_rmsnorm_rope": (
-        {"DSparkRMSNormRoPEKernel"},
-        "fam_spec",
-    ),
 }
 
 
