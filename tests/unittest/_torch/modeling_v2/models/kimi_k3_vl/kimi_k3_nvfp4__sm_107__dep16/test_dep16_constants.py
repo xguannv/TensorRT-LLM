@@ -20,7 +20,7 @@ _CLASS = "ModelingV2KimiK3Nvfp4Sm107Dep16"
 _TARGET_DIR = Path(__file__).resolve().parents[6] / _FAMILY.replace(".", "/") / _TARGET
 
 _EXPECTED = {
-    "spec_head_fusion": True,
+    "spec_head_fusion": False,
     "fuse_moe_residual": True,
     "fp8w_lowm_gemm": True,
     "ld_fused": False,

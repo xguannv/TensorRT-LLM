@@ -2,14 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """What the dep16 target runs: the constants it hands to the family's SM107 code.
 
-Taken from 084745cde4's ``dep16`` profile (c383 977198, post arm), with the speculative decode head
-fusion on as on the other generation targets.
+Taken from 084745cde4's ``dep16`` profile (c383 977198, post arm). The c383 reference does not fuse
+the speculative decode head (``spec_head_fusion`` off, unlike the helix8 targets).
 """
 
 from ..sm107_parts.constants import K3Sm107Constants
 
 CONSTANTS = K3Sm107Constants(
-    spec_head_fusion=True,
+    spec_head_fusion=False,
     fuse_moe_residual=True,
     fp8w_lowm_gemm=True,
     ld_fused=False,
