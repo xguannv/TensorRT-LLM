@@ -121,51 +121,37 @@ from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..kimi_k3_nvfp4__sm_107__default.kernels.spec.dspark_markov_fused import fused_markov_supported
-from ..kimi_k3_nvfp4__sm_107__default.kernels.spec.spec_tail_kernels import (
+from ..kernels.k3r_spec.dspark_markov_fused import fused_markov_supported
+from ..kernels.k3r_spec.spec_tail_kernels import (
     BLOCK_TABLE_CHUNK,
     TAIL_V2_MAX_GENS,
     DraftBlockPlacement,
     vocab_shard_embedding_applies,
 )
-from ..kimi_k3_nvfp4__sm_107__default.kernels.spec.vocab_parallel_kernels import (
+from ..kernels.k3r_spec.vocab_parallel_kernels import (
     _CHAIN_MAX_REQS,
     _CHAIN_MAX_STEPS,
     _LOCAL_BLOCK_V,
     _MARKOV_BLOCK_V,
     _PairLayout,
 )
-from ..kimi_k3_nvfp4__sm_107__default.layers import TpAllReduce, mnnvl_serves, mnnvl_workspace_bytes
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_dflash_ctx_positions import (
-    k3_dflash_ctx_positions,
-)
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_dflash_gen_prepare import k3_dflash_gen_prepare
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_dflash_noise_embedding import (
-    k3_dflash_noise_embedding,
-)
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_dflash_paged_latent_prepare import (
-    k3_dflash_paged_latent_prepare,
-)
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_draft_block_table import k3_draft_block_table
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_fused_markov_chain_logits import (
-    k3_fused_markov_chain_logits,
-)
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_fused_select_accept import k3_fused_select_accept
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_fused_strict_accept import k3_fused_strict_accept
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_markov_add_local_argmax import (
-    k3_markov_add_local_argmax,
-)
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_markov_chain import k3_markov_chain
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_markov_reduce_embed import k3_markov_reduce_embed
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_next_new_tokens import k3_next_new_tokens
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_store_context_latents import (
-    k3_store_context_latents,
-)
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_vocab_local_select import k3_vocab_local_select
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_vocab_reduce_pairs import k3_vocab_reduce_pairs
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_vocab_shard_embedding import (
-    k3_vocab_shard_embedding,
-)
+from ..ops.spec.k3_dflash_ctx_positions import k3_dflash_ctx_positions
+from ..ops.spec.k3_dflash_gen_prepare import k3_dflash_gen_prepare
+from ..ops.spec.k3_dflash_noise_embedding import k3_dflash_noise_embedding
+from ..ops.spec.k3_dflash_paged_latent_prepare import k3_dflash_paged_latent_prepare
+from ..ops.spec.k3_draft_block_table import k3_draft_block_table
+from ..ops.spec.k3_fused_markov_chain_logits import k3_fused_markov_chain_logits
+from ..ops.spec.k3_fused_select_accept import k3_fused_select_accept
+from ..ops.spec.k3_fused_strict_accept import k3_fused_strict_accept
+from ..ops.spec.k3_markov_add_local_argmax import k3_markov_add_local_argmax
+from ..ops.spec.k3_markov_chain import k3_markov_chain
+from ..ops.spec.k3_markov_reduce_embed import k3_markov_reduce_embed
+from ..ops.spec.k3_next_new_tokens import k3_next_new_tokens
+from ..ops.spec.k3_store_context_latents import k3_store_context_latents
+from ..ops.spec.k3_vocab_local_select import k3_vocab_local_select
+from ..ops.spec.k3_vocab_reduce_pairs import k3_vocab_reduce_pairs
+from ..ops.spec.k3_vocab_shard_embedding import k3_vocab_shard_embedding
+from ..sm107_parts.layers import TpAllReduce, mnnvl_serves, mnnvl_workspace_bytes
 from .drafter import K3DSparkPath, _MLABlockFixup
 from .primitives import HelixDraftShard, draft_embed_site, to_draft_fp8
 
@@ -313,11 +299,7 @@ class _PairExchange:
             return cached[1:4]
         assert cached is None, "the Markov exchange is sized once per process"
         assert not torch.cuda.is_current_stream_capturing()
-        from ..kimi_k3_nvfp4__sm_107__default.kernels.dspark_markov_greedy import (
-            NUM_SETS,
-            STATE_WORDS,
-            set_bytes,
-        )
+        from ..kernels.k3r_spec.dspark_markov_greedy import NUM_SETS, STATE_WORDS, set_bytes
 
         words = NUM_SETS * set_bytes(entries) // 4
         state = torch.zeros((STATE_WORDS,), dtype=torch.int32, device=device)
@@ -599,10 +581,7 @@ class K3VocabParallelHead:
             or markov_w2.data_ptr() % 16
         ):
             return False
-        from ..kimi_k3_nvfp4__sm_107__default.kernels.dspark_markov_greedy import (
-            ctas_for,
-            smem_bytes,
-        )
+        from ..kernels.k3r_spec.dspark_markov_greedy import ctas_for, smem_bytes
 
         props = torch.cuda.get_device_properties(device)
         return (
@@ -629,10 +608,8 @@ class K3VocabParallelHead:
         :meth:`markov_tokens_chain` wherever both compute the same BF16 bias.
         The caller checks :meth:`markov_v3_supported`.
         """
-        from ..kimi_k3_nvfp4__sm_107__default.kernels.dspark_markov_greedy import ctas_for
-        from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_dspark_markov_greedy import (
-            k3_dspark_markov_greedy,
-        )
+        from ..kernels.k3r_spec.dspark_markov_greedy import ctas_for
+        from ..ops.spec.k3_dspark_markov_greedy import k3_dspark_markov_greedy
 
         num_reqs, block_size, shard = local_block.shape
         device = local_block.device

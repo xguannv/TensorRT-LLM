@@ -124,8 +124,8 @@ _PUSH_TACTICS = {
 def push_tactic(role: str, m: int, n: int, k: int, table=None):
     """The ``SplitKTactic`` of the push GEMM for ``role`` at ``m`` rows, or None. A table entry
     with zero stages takes the deepest pipeline that fits."""
-    from ..kimi_k3_nvfp4__sm_107__default.kernels.dspark_draft_gemm_push import validate_push_tactic
-    from ..kimi_k3_nvfp4__sm_107__default.kernels.low_m_bf16_splitk import SplitKTactic
+    from ..kernels.k3r_gemm.low_m_bf16_splitk import SplitKTactic
+    from ..kernels.k3r_spec.dspark_draft_gemm_push import validate_push_tactic
 
     entry = next((t for rows, t in (table or _PUSH_TACTICS).get(role, ()) if m <= rows), None)
     if entry is None:
@@ -160,10 +160,10 @@ class DraftArSites:
         does not apply (the caller then runs its own path)."""
         from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
-        from ..kimi_k3_nvfp4__sm_107__default.kernels.dspark_draft_ar import ar_norm_config
-        from ..kimi_k3_nvfp4__sm_107__default.layers import lamport_push_target
-        from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_draft_ar_norm import k3_draft_ar_norm
-        from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_draft_gemm_push import k3_draft_gemm_push
+        from ..kernels.k3r_spec.dspark_draft_ar import ar_norm_config
+        from ..ops.spec.k3_draft_ar_norm import k3_draft_ar_norm
+        from ..ops.spec.k3_draft_gemm_push import k3_draft_gemm_push
+        from ..sm107_parts.layers import lamport_push_target
 
         if (
             x.dim() != 2
@@ -216,9 +216,9 @@ def draft_embed_site(embedding, ids: torch.Tensor) -> Optional[torch.Tensor]:
         return None
     from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
-    from ..kimi_k3_nvfp4__sm_107__default.kernels.dspark_draft_ar import ELTS, EMBED_THREADS
-    from ..kimi_k3_nvfp4__sm_107__default.layers import mnnvl_lamport_push_target
-    from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_draft_embed import k3_draft_embed
+    from ..kernels.k3r_spec.dspark_draft_ar import ELTS, EMBED_THREADS
+    from ..ops.spec.k3_draft_embed import k3_draft_embed
+    from ..sm107_parts.layers import mnnvl_lamport_push_target
 
     if (
         weight.dtype != torch.bfloat16

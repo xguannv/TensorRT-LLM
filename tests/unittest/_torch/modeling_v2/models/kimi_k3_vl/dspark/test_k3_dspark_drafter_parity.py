@@ -12,14 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The family's MLA DSpark drafter (``dspark.drafter.K3DSparkDrafter``) against the SM107 target's
-drafter (``kimi_k3_nvfp4__sm_107__default.drafter.K3MLADSparkForCausalLM``) on the same weights and
+"""The family's MLA DSpark drafter (``dspark.drafter.K3DSparkDrafter``) against the SM107 targets'
+previous drafter (``sm107_parts.drafter.K3MLADSparkForCausalLM``) on the same weights and
 inputs, bit for bit, on a BF16 latent pool: two layers of the real drafter's shapes (64 heads, MLA
 576, hidden 7168), a small vocab and MLP, four requests with 517 / 1203 / 64 / 333 context tokens,
 block 7, page 32.
 
-Each case sets the old drafter's feature profile fields and the new drafter's ``K3DSparkPath`` to the
-same deployment path:
+Each case sets the old drafter's ``K3Sm107Constants`` (``spec_tail_fusion`` / ``dspark_tail_v2``)
+and the new drafter's ``K3DSparkPath`` to the same deployment path:
 
 * ``tp1``: one GPU, no fusion; the block placed by the worker (``block_placement``) and built by the
   drafter.
@@ -54,7 +54,7 @@ MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCO
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 _K3 = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
-OLD = f"{_K3}.kimi_k3_nvfp4__sm_107__default"
+OLD = f"{_K3}.sm107_parts"
 NEW = f"{_K3}.dspark"
 
 HIDDEN, INTER, LAYERS, HEADS, VOCAB, RANK = 7168, 2048, 2, 64, 4096, 16
@@ -63,7 +63,7 @@ TARGET_LAYERS = (0, 1)
 CTX_LENS = (517, 1203, 64, 333)
 BLOCK, PAGE, MAX_SEQ = 7, 32, 16384
 
-# case -> (world, attention DP, helix, old profile fields, path fields, variants)
+# case -> (world, attention DP, helix, old constants fields, path fields, variants)
 CASES = {
     "tp1": (1, False, False, {}, {}, ("build", "placement")),
     "dep16": (
@@ -218,8 +218,10 @@ def build_pair(case, rank):
     from tensorrt_llm._torch.model_config import ModelConfig
 
     world, adp, helix, profile, path_fields, _ = CASES[case]
-    features = importlib.import_module(f"{OLD}.features")
-    features._ACTIVE = dataclasses.replace(features.K3Features(), **profile)
+    tp1 = importlib.import_module(f"{_K3}.kimi_k3_nvfp4__sm_107__tp1.constants").CONSTANTS
+    constants = dataclasses.replace(
+        tp1, **{"spec_tail_fusion": False, "dspark_tail_v2": False, **profile}
+    )
     old_mod = importlib.import_module(f"{OLD}.drafter")
     new_mod = importlib.import_module(f"{NEW}.drafter")
     draft_map, helix_map = mappings(world, rank, adp, helix)
@@ -240,6 +242,7 @@ def build_pair(case, rank):
             config(),
             None,
             None,
+            constants,
         )
         new = new_mod.build_k3_dspark_drafter(
             config(), spec, path=new_mod.K3DSparkPath(**path_fields), helix_mapping=helix_map
@@ -344,7 +347,7 @@ def run_drafter(drafter, inp, variants, worker_cls, lm_w, graph=False):
     shard = None if inp.cp == 1 else shard_cls(inp.cp, inp.cp_rank, PAGE)
     fixup = fixup_fn(inp.ctx, inp.table.long(), BLOCK, PAGE, shard)
     placement = importlib.import_module(
-        f"{OLD}.kernels.spec.spec_tail_kernels"
+        f"{_K3}.kernels.k3r_spec.spec_tail_kernels"
     ).DraftBlockPlacement(fixup.pages, fixup.offsets, fixup.seq_lens_i32, fixup.kv_bounds_i32)
     blk_pages, blk_offsets = fixup.pages.reshape(-1), fixup.offsets.reshape(-1)
     stub = SimpleNamespace()

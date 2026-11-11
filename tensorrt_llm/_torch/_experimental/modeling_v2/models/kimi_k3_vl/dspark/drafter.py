@@ -79,8 +79,9 @@ from tensorrt_llm.functional import (
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 
-from ..kimi_k3_nvfp4__sm_107__default.kernels.spec.spec_tail_kernels import DraftBlockPlacement
-from ..kimi_k3_nvfp4__sm_107__default.layers import (
+from ..kernels.k3r_spec.spec_tail_kernels import DraftBlockPlacement
+from ..ops.spec.k3_scatter_rows_to_pool import k3_scatter_rows_to_pool
+from ..sm107_parts.layers import (
     Bf16Linear,
     EmbeddingTable,
     GatedMlp,
@@ -90,9 +91,6 @@ from ..kimi_k3_nvfp4__sm_107__default.layers import (
     bf16_linear,
     gated_activation,
     subgroup_mapping,
-)
-from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_scatter_rows_to_pool import (
-    k3_scatter_rows_to_pool,
 )
 from .primitives import DRAFT_FP8_KV_SCALE, DraftArSites, HelixDraftShard, to_draft_fp8
 
@@ -266,13 +264,9 @@ k3_dspark_mla_ctx_norm_rope = None
 if IS_CUTLASS_DSL_AVAILABLE:
     # The DSpark RMSNorm + RoPE kernel compiled for row-strided input, and the one-launch
     # context-latent RMSNorm + RoPE of ``tail_v2``.
-    from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_dspark_mla_ctx_norm_rope import (
-        k3_dspark_mla_ctx_norm_rope,
-    )
-    from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_dspark_rmsnorm_rope import (
-        k3_dspark_rmsnorm_rope,
-    )
-    from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_dspark_rmsnorm_rope_into import (
+    from ..ops.spec.k3_dspark_mla_ctx_norm_rope import k3_dspark_mla_ctx_norm_rope
+    from ..ops.spec.k3_dspark_rmsnorm_rope import k3_dspark_rmsnorm_rope
+    from ..ops.spec.k3_dspark_rmsnorm_rope_into import (
         build_rmsnorm_rope_into,
         k3_dspark_rmsnorm_rope_into,
     )
@@ -964,7 +958,7 @@ def _launch_mla_split_plan(
     """
     import triton
 
-    from ..kimi_k3_nvfp4__sm_107__default.kernels.spec import mla_split_plan as mla
+    from ..kernels.k3r_spec import mla_split_plan as mla
 
     num_requests = seq_lens.shape[0]
     if not 0 < num_requests <= mla._SPLIT_PLAN_MAX_REQUESTS:
@@ -1627,9 +1621,7 @@ class K3DSparkDrafter(_DSparkHeadMixin, _K3DFlashDrafterMixin, nn.Module):
         cached = self._mla_split_plan
         if cached is not None and cached[0] is fixup and cached[1] == fp8:
             return cached[2]
-        from ..kimi_k3_nvfp4__sm_107__default.kernels.spec.mla_split_plan import (
-            _SPLIT_PLAN_MAX_REQUESTS,
-        )
+        from ..kernels.k3r_spec.mla_split_plan import _SPLIT_PLAN_MAX_REQUESTS
 
         seq_lens = fixup.seq_lens_i32
         batch = seq_lens.shape[0]

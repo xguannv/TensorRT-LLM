@@ -28,7 +28,7 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.dspark.worker import (
     K3DFlashWorker,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__default.ops.spec.k3_fused_select_accept import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec.k3_fused_select_accept import (  # noqa: E501
     k3_fused_select_accept,
 )
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
