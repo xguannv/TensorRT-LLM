@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-# Adapted from CUTLASS utils.gemm.sm100.epilogue_tma_store.
+# Adapted from CUTLASS utils.gemm.sm100.epilogue_tma_store: the FP8 E4M3 output epilogue of the Kimi K3
+# MXFP8 dense GEMM (mxfp8_fp8_out_gemm.py).
 
 from typing import Any, Tuple
 
