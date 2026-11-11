@@ -103,7 +103,7 @@ where :func:`uses_k3_split_k_context` holds: SM107, matching Q / KV heads, head 
 * where kv_b is the FP8 block-scale GEMM with its weight scale in the SM107 CuTe MXFP8 layout
   (:func:`kv_b_takes_mxfp8`), each cached-prefix partition is gathered from the FP4 cache straight
   into MXFP8 (``ops/attention/fp4_mla_gather_mxfp8``), the current chunk is quantized with
-  ``fp8_quantize_1x128_packed_ue8m0``, and kv_b runs as ``cute_dsl_mxfp8_gemm_rubin`` writing FP8
+  ``fp8_quantize_1x128_packed_ue8m0``, and kv_b runs as ``k3_mxfp8_gemm_fp8_out`` writing FP8
   (the BF16 rounding at unit output scale); otherwise the BF16 gather and kv_b run and the output is
   quantized with ``static_quantize_e4m3_per_tensor``.
 
@@ -169,6 +169,7 @@ from ..ops.attention import k3_mla_cache as mla_cache
 from ..ops.attention.k3_context_fmha import k3_context_fmha
 from ..ops.attention.k3_mla_state import K3MlaAttnState
 from ..ops.attention.static_quantize_e4m3 import static_quantize_e4m3
+from ..ops.gemm.k3_mxfp8_gemm_fp8_out import k3_mxfp8_gemm_fp8_out
 from ..sm107_parts.layers import Bf16Linear, Fp8BlockScaleLinear, RMSNormWeight, fork_join, rms_norm
 
 # Head dimensions (K-nope, K-pe, V) the split-K context FMHA is built for.
@@ -475,12 +476,11 @@ def forward_context_split_k_fp4(
                     partition_compressed_kv.contiguous()
                 )
             # The FP8 output keeps the GEMM's BF16 rounding (unit output scale).
-            partition_kv = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+            partition_kv = k3_mxfp8_gemm_fp8_out(
                 activation,
                 layer.kv_b_proj.weight,
                 activation_scale,
                 layer.kv_b_proj.weight_scale,
-                output_dtype=torch.float8_e4m3fn,
             )
         else:
             partition_kv, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
@@ -499,7 +499,7 @@ def forward_context_split_k_fp4(
         logger.info_once(
             "Kimi K3 MLA context expand: per-chunk kv_b_proj runs as "
             + (
-                "cute_dsl_mxfp8_gemm_rubin (MXFP8 in, FP8 out)"
+                "k3_mxfp8_gemm_fp8_out (MXFP8 in, FP8 out)"
                 if kv_b_mxfp8
                 else "kv_b_proj (BF16) + static_quantize_e4m3_per_tensor"
             )
