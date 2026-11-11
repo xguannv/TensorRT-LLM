@@ -3,8 +3,9 @@
 """Launch wrapper of the fused FC12 NVFP4 MoE kernel (SM107) for Kimi K3.
 
 :func:`run_fc12` gathers, runs FC1 + SiTU + NVFP4 requant + FC2 and scatter-adds the weighted rows
-into ``output`` in one persistent kernel (``Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel``),
-with the AutoTuner's MMA tactic for the shape. Beyond the kernel's plain launch it takes:
+into ``output`` in one persistent kernel (``Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel``,
+the family's copy in :mod:`.fc12_kernel`), with the AutoTuner's MMA tactic for the shape. Beyond
+the kernel's plain launch it takes:
 
 * ``reserved_sms``: SMs left without an FC12 CTA, for the kernels another stream runs beside it;
 * ``zeroed_counters``: the kernel's counters, zeroed together with ``output`` by the caller on a
@@ -55,11 +56,9 @@ from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
     get_max_activate_clusters,
 )
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-from tensorrt_llm._torch.moe.kernels.rubin.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12 import (
-    Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel,
-)
 
 from .fc12 import fc12_counter_layout, fc12_die_sm_words
+from .fc12_kernel import Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel
 
 #: AutoTuner key of the MMA tactic (the one the fused FC12 op tunes under).
 TUNER_KEY = "trtllm::cute_dsl_nvfp4_fc12_fused_rubin"

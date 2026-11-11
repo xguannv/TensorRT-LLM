@@ -121,9 +121,10 @@ RUNTIME_INTERFACE_HOMES: Dict[str, str] = {
 
 #: Kernels under ``_torch/moe/`` (not the fused MoE layer): module -> (symbols, reason).
 MOE_KERNELS: Dict[str, Tuple[object, str]] = {
-    "tensorrt_llm._torch.moe.kernels.rubin.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12": (
-        {"Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel"},
-        "the SM107 fused FC1+FC2 CuTe DSL kernel K3Fc12Runner launches",
+    "tensorrt_llm._torch.moe.kernels.rubin": (
+        {"manual_mma_128dp"},
+        "the 128-datapath MMA helpers of the Rubin MoE kernels, which the family's copy of the "
+        "SM107 fused FC1+FC2 kernel (kernels/k3r_moe/fc12_kernel.py) calls",
     ),
     "tensorrt_llm._torch.moe.custom_ops": (
         {"cute_dsl_megamoe_custom_op"},
