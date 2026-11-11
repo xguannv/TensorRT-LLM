@@ -1197,7 +1197,8 @@ class _K3DFlashDrafterMixin:
         """
         if getattr(self, "_fc_shard", None) is None:
             self._fc_shard = False
-            all_reduce = self.model.layers[0].self_attn.o_proj.all_reduce
+            o_proj = self.model.layers[0].self_attn.o_proj
+            all_reduce = self._fc_all_reduce if o_proj is None else o_proj.all_reduce
             mapping = None if all_reduce is None else all_reduce.mapping
             in_features = self.fc.weight.shape[1]
             if (
@@ -1418,6 +1419,7 @@ class K3DSparkDrafter(_DSparkHeadMixin, _K3DFlashDrafterMixin, nn.Module):
         self._input_ln_eps = None
         # The TP-sharded fc, resolved on first use.
         self._fc_shard = None
+        self._fc_all_reduce = None
         self._init_dspark_heads(cfg)
 
         self._validate_mla_shape()
@@ -1479,6 +1481,8 @@ class K3DSparkDrafter(_DSparkHeadMixin, _K3DFlashDrafterMixin, nn.Module):
         under meta init, so dropped modules never allocate device memory.
         """
         backbone = self.draft_model_full.model
+        # The TP group of the sharded fc (``_resolve_fc_shard``) outlives o_proj.
+        self._fc_all_reduce = backbone.layers[0].self_attn.o_proj.all_reduce
         backbone.embed_tokens = None
         backbone.norm = None
         for layer in backbone.layers:

@@ -37,6 +37,9 @@ import pytest
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.dspark.drafter import (
+    K3DSparkPath,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.dspark.worker import (
     K3DFlashWorker,
 )
@@ -209,9 +212,19 @@ OFFSET = 400  # the draft layers' K-buffer offset in a per-layer page table entr
 WIDTH = 4
 
 
-def _refresh_worker(num_blocks, checks):
+@pytest.fixture(
+    params=[K3DSparkPath(), K3DSparkPath(spec_tail_fusion=True, tail_v2=True)],
+    ids=["plain", "tail_v2"],
+)
+def path(request):
+    """The deployment path: ``tail_v2`` decodes the block table over more programs."""
+    return request.param
+
+
+def _refresh_worker(num_blocks, checks, path):
     """A worker with what ``_refresh_ctx_block_tables`` touches, on the unified cache."""
     worker = SimpleNamespace(
+        _path=path,
         _ctx_block_tables=torch.zeros(NUM_SLOTS + 1, WIDTH, dtype=torch.int32, device="cuda"),
         _ctx_block_counts=torch.zeros(NUM_SLOTS + 1, dtype=torch.long, device="cuda"),
         _ctx_block_partial=torch.zeros(NUM_SLOTS + 1, dtype=torch.int32, device="cuda"),
@@ -243,8 +256,8 @@ def _offsets(rows):
     return src.cuda()
 
 
-def test_block_tables_take_the_page_counts_from_the_manager_on_the_host():
-    worker = _refresh_worker({100: 1, 101: 2}, checks=1)
+def test_block_tables_take_the_page_counts_from_the_manager_on_the_host(path):
+    worker = _refresh_worker({100: 1, 101: 2}, checks=1, path=path)
     attn_metadata = SimpleNamespace(num_contexts=2, kv_cache_block_offsets=_offsets([[5], [7, 9]]))
     # The first iteration checks the host counts against the decoded table (it reads it back).
     assert worker._refresh_ctx_block_tables(attn_metadata, 2, [100, 101])
@@ -257,8 +270,8 @@ def test_block_tables_take_the_page_counts_from_the_manager_on_the_host():
     assert worker._ctx_block_counts[:2].tolist() == [1, 2]
 
 
-def test_a_saturated_decoded_count_bounds_nothing_and_is_accepted():
-    worker = _refresh_worker({100: 1, 101: 2}, checks=1)
+def test_a_saturated_decoded_count_bounds_nothing_and_is_accepted(path):
+    worker = _refresh_worker({100: 1, 101: 2}, checks=1, path=path)
     # A zero layer offset: unallocated entries decode as page 0 and count as allocated.
     worker._ctx_block_offset = 0
     src = torch.zeros(1, NUM_SLOTS + 1, 2, WIDTH, dtype=torch.int32, device="cuda")
@@ -268,8 +281,8 @@ def test_a_saturated_decoded_count_bounds_nothing_and_is_accepted():
     assert worker._ctx_block_counts_host == [1, 2]
 
 
-def test_host_counts_that_disagree_with_the_table_are_dropped():
-    worker = _refresh_worker({100: 3, 101: 2}, checks=1)
+def test_host_counts_that_disagree_with_the_table_are_dropped(path):
+    worker = _refresh_worker({100: 3, 101: 2}, checks=1, path=path)
     attn_metadata = SimpleNamespace(num_contexts=2, kv_cache_block_offsets=_offsets([[5], [7, 9]]))
     assert worker._refresh_ctx_block_tables(attn_metadata, 2, [100, 101])
     assert worker._ctx_block_counts_host is None
