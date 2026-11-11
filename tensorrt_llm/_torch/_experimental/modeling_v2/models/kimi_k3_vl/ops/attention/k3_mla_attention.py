@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi K3 MLA attention calls over the engine's KV cache: context FMHA, FP8 decode and the op fallback.
+"""Kimi K3 MLA attention calls over the engine's KV cache: context FMHA, CuTe DSL decode and the op fallback.
 
 Every call takes the role's :class:`~.k3_mla_state.K3MlaAttnState` and the step's attention metadata, from
 which it reads the pools, block offsets and lengths (the engine owns the KV cache manager), and launches:
@@ -10,13 +10,14 @@ which it reads the pools, block offsets and lengths (the engine owns the KV cach
   RoPE) and appends the chunk's latent rows to the paged cache; with ``full_mask`` it attends a cached-prefix
   partition (padding mask) and writes its softmax statistics to ``softmax_stats``. ``quant_q_buffer`` /
   ``quant_scale_qkv`` hand the op an already-quantized FP8 Q; the FP8 context FMHA reads FP8 K / V as given.
-* :func:`mla_fp8_decode`: the absorbed decode over an FP8 latent cache. Where the CuTe DSL MLA decode serves
-  the batch (:func:`cute_dsl_fp8_decode_applies`) it runs ``trtllm::cute_dsl_mla_decode_fp8_blackwell`` on
-  the quantized query the generation cache update wrote, with the per-request split-KV plan of the step;
-  otherwise the attention op's MLA generation phase.
+* :func:`mla_decode`: the absorbed decode over an FP8 or BF16 / FP16 latent cache. Where the CuTe DSL MLA
+  decode serves the batch (:func:`cute_dsl_decode_applies`) it runs ``trtllm::cute_dsl_mla_decode_fp8_blackwell``
+  on the quantized query the generation cache update wrote (FP8 cache), or
+  ``trtllm::cute_dsl_mla_decode_fp16_blackwell`` on the query as is (a cache of the query's dtype), with the
+  per-request split-KV plan of the step; otherwise the attention op's MLA generation phase.
 
 These are the launches the attention op's FMHA libraries make for these calls on SM107 (the fallback library
-for context and for a decode the CuTe DSL kernel does not take, the CuTe DSL MLA library for the FP8 decode),
+for context and for a decode the CuTe DSL kernel does not take, the CuTe DSL MLA library for the decode),
 with the same arguments; their tests compare them with that path.
 """
 
@@ -267,7 +268,7 @@ def mla_generation_attention(
 
 
 # ---------------------------------------------------------------------------------------------
-# The CuTe DSL FP8 MLA decode.
+# The CuTe DSL MLA decode.
 # ---------------------------------------------------------------------------------------------
 
 # Per-request split-KV plan for the CuTe DSL MLA decode kernels. The kernel grid
@@ -443,8 +444,10 @@ def _page_size_exclusive_to_cute_dsl(md) -> bool:
     )
 
 
-# The CuTe DSL FP8 decode wins over the op's decode from these per-rank decode batch sizes, keyed by
-# (num_heads, seq_len_q); shapes outside the table take the op unless the next rule admits them.
+# The CuTe DSL decode on a BF16 / FP16 cache wins over the op's decode at these head counts.
+_PERF_FAVORABLE_HEADS_FP16 = (6, 12, 16, 96)
+# On an FP8 cache it wins from these per-rank decode batch sizes, keyed by (num_heads, seq_len_q); shapes
+# outside the table take the op unless the next rule admits them.
 _PERF_MIN_BATCH_FP8 = {
     (6, 1): 1,
     (12, 1): 1,
@@ -457,18 +460,30 @@ _PERF_MIN_BATCH_FP8 = {
 }
 
 
-def cute_dsl_fp8_decode_applies(
+def _kernel_dtype(state: K3MlaAttnState, fused_q: torch.Tensor) -> Optional[torch.dtype]:
+    """The CuTe DSL decode's input dtype: FP8 on an FP8 cache, else the query's (BF16 / FP16)."""
+    if state.has_fp8_kv_cache:
+        return torch.float8_e4m3fn
+    if fused_q.dtype in (torch.float16, torch.bfloat16):
+        return fused_q.dtype
+    return None
+
+
+def cute_dsl_decode_applies(
     state: K3MlaAttnState,
     fused_q: torch.Tensor,
     md,
     output: torch.Tensor,
     softmax_stats: Optional[torch.Tensor],
 ) -> bool:
-    """Whether the CuTe DSL MLA decode serves this FP8-cache generation batch (see the module docstring):
-    a linear-chain, beam-1 decode of up to 128 heads, with Helix softmax statistics under Helix, admitted
-    by its measured win table or by having no other kernel, and accepted by the kernel's
-    ``can_implement``."""
-    if not (state.has_fp8_kv_cache and _cute_dsl_mla_available(state)):
+    """Whether the CuTe DSL MLA decode serves this generation batch (see the module docstring): a
+    linear-chain, beam-1 decode of up to 128 heads, with Helix softmax statistics under Helix, admitted by
+    its measured win rule or by having no other kernel, over an FP8 cache or a cache of the query's dtype,
+    and accepted by the kernel's ``can_implement``."""
+    if state.has_fp4_kv_cache or not _cute_dsl_mla_available(state):
+        return False
+    kernel_dtype = _kernel_dtype(state, fused_q)
+    if kernel_dtype is None:
         return False
     if md.num_generations <= 0:
         return False
@@ -500,7 +515,12 @@ def cute_dsl_fp8_decode_applies(
             or not softmax_stats.is_contiguous()
         ):
             return False
-    fp8_wide_head_verify_group = 64 < state.num_heads < 128 and seq_len_q > 1 and not helix
+    fp8_wide_head_verify_group = (
+        64 < state.num_heads < 128
+        and seq_len_q > 1
+        and not helix
+        and kernel_dtype == torch.float8_e4m3fn
+    )
     if not (
         helix_verify_group
         or fp8_wide_head_verify_group
@@ -509,14 +529,24 @@ def cute_dsl_fp8_decode_applies(
     ):
         from tensorrt_llm._torch.autotuner import AutoTuner
 
-        min_batch = _PERF_MIN_BATCH_FP8.get((state.num_heads, seq_len_q))
-        if min_batch is None:
-            return False
-        if not AutoTuner.get().is_tuning_mode and batch_size < min_batch:
-            return False
+        if kernel_dtype != torch.float8_e4m3fn:
+            if state.num_heads not in _PERF_FAVORABLE_HEADS_FP16:
+                return False
+        else:
+            min_batch = _PERF_MIN_BATCH_FP8.get((state.num_heads, seq_len_q))
+            if min_batch is None:
+                return False
+            if not AutoTuner.get().is_tuning_mode and batch_size < min_batch:
+                return False
     if md.kv_cache_manager is None or output is None:
         return False
+    if (
+        kernel_dtype != torch.float8_e4m3fn
+        and md.kv_cache_manager.get_buffers(state.layer_idx).dtype != kernel_dtype
+    ):
+        return False
     return _kernel_can_implement(
+        kernel_dtype,
         output.dtype,
         batch_size,
         seq_len_q,
@@ -528,32 +558,40 @@ def cute_dsl_fp8_decode_applies(
 
 
 def _kernel_can_implement(
-    out_dtype, batch_size, seq_len_q, page_size, num_heads, kv_lora_rank, qk_rope_head_dim
+    in_dtype, out_dtype, batch_size, seq_len_q, page_size, num_heads, kv_lora_rank, qk_rope_head_dim
 ) -> bool:
-    """The FP8 MLA decode kernel's ``can_implement`` under the tiler the op launches with."""
+    """The MLA decode kernel's (FP8 or FP16 / BF16 input) ``can_implement`` under the tiler the op
+    launches with."""
     import cutlass
 
-    # The kernel class the CuTe DSL MLA decode op compiles, as the op module exposes it.
+    # The kernel classes the CuTe DSL MLA decode ops compile, as the op module exposes them.
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
         BlackwellMultiHeadLatentAttentionForwardFP8,
+        BlackwellMultiHeadLatentAttentionForwardFP16,
     )
 
-    cute_out_dtype = {
+    to_cute = {
         torch.float8_e4m3fn: cutlass.Float8E4M3FN,
         torch.float16: cutlass.Float16,
         torch.bfloat16: cutlass.BFloat16,
-    }.get(out_dtype)
-    if cute_out_dtype is None:
+    }
+    cute_in_dtype, cute_out_dtype = to_cute.get(in_dtype), to_cute.get(out_dtype)
+    if cute_in_dtype is None or cute_out_dtype is None:
         return False
+    kernel_class = (
+        BlackwellMultiHeadLatentAttentionForwardFP8
+        if cute_in_dtype == cutlass.Float8E4M3FN
+        else BlackwellMultiHeadLatentAttentionForwardFP16
+    )
     return bool(
-        BlackwellMultiHeadLatentAttentionForwardFP8.can_implement(
+        kernel_class.can_implement(
             batch_size,
             seq_len_q,
             2,  # A fake K to bypass the K check.
             num_heads,
             kv_lora_rank,
             qk_rope_head_dim,
-            cutlass.Float8E4M3FN,
+            cute_in_dtype,
             cute_out_dtype,
             cutlass.Float32,
             cutlass.Float32,
@@ -637,25 +675,39 @@ def _required_workspace_bytes(
     )
 
 
-def cute_dsl_fp8_decode(
+def cute_dsl_decode(
     state: K3MlaAttnState,
     fused_q: torch.Tensor,
     md,
     output: torch.Tensor,
     *,
-    quant_q_buffer: torch.Tensor,
-    mla_bmm1_scale: torch.Tensor,
-    mla_bmm2_scale: torch.Tensor,
+    quant_q_buffer: Optional[torch.Tensor],
+    mla_bmm1_scale: Optional[torch.Tensor],
+    mla_bmm2_scale: Optional[torch.Tensor],
     softmax_stats: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """``trtllm::cute_dsl_mla_decode_fp8_blackwell`` over the FP8 latent cache of this layer for the
-    quantized query ``quant_q_buffer`` (``fused_q`` provides shapes) into ``output`` (``[T, H * 512]``)."""
+    """The CuTe DSL MLA decode over this layer's latent cache into ``output`` (``[T, H * 512]``): on an FP8
+    cache ``trtllm::cute_dsl_mla_decode_fp8_blackwell`` on the quantized query ``quant_q_buffer``
+    (``fused_q`` provides shapes) with the device BMM scales; on a cache of the query's dtype
+    ``trtllm::cute_dsl_mla_decode_fp16_blackwell`` on ``fused_q`` with the softmax scale of the head
+    dims."""
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
     from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
-    for name, scale in (("mla_bmm1_scale", mla_bmm1_scale), ("mla_bmm2_scale", mla_bmm2_scale)):
-        if scale is None or scale.dtype != torch.float32 or scale.numel() < 1:
-            raise RuntimeError(f"{name} must contain at least one float32 value.")
+    kernel_dtype = _kernel_dtype(state, fused_q)
+    fp8 = kernel_dtype == torch.float8_e4m3fn
+    if fp8:
+        for name, scale in (("mla_bmm1_scale", mla_bmm1_scale), ("mla_bmm2_scale", mla_bmm2_scale)):
+            if scale is None or scale.dtype != torch.float32 or scale.numel() < 1:
+                raise RuntimeError(f"{name} must contain at least one float32 value.")
+        softmax_scale, output_scale = mla_bmm1_scale, mla_bmm2_scale
+        op = torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell
+    else:
+        softmax_scale = float(
+            1.0 / (math.sqrt(state.qk_nope_head_dim + state.qk_rope_head_dim) * state.q_scaling)
+        )
+        output_scale = 1.0
+        op = torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell
     state._ensure_rope_table_size(md.max_seq_len)
     local_layer_idx = state.get_local_layer_idx(md)
     # The decode keeps state across the workspace; it may not be reclaimed.
@@ -677,15 +729,15 @@ def cute_dsl_fp8_decode(
         workspace.resize_((math.ceil(required / workspace.element_size()),))
 
     logger.info_once(
-        f"Kimi K3 MLA FP8 decode: layer {state.layer_idx} runs the CuTe DSL MLA decode "
-        "(cute_dsl_mla_decode_fp8_blackwell).",
-        key=("k3_mla_fp8_decode", state.layer_idx),
+        f"Kimi K3 MLA decode: layer {state.layer_idx} runs the CuTe DSL MLA decode "
+        f"({'cute_dsl_mla_decode_fp8_blackwell' if fp8 else 'cute_dsl_mla_decode_fp16_blackwell'}).",
+        key=("k3_mla_cute_dsl_decode", state.layer_idx),
     )
-    q_view = (
-        quant_q_buffer.view(torch.float8_e4m3fn)
-        .view_as(fused_q)
-        .view(batch_size, seq_len_q, num_heads, d_latent + d_rope)
-    )
+    if fp8 and quant_q_buffer is not None:
+        q_kernel = quant_q_buffer.view(torch.float8_e4m3fn).view_as(fused_q)
+    else:
+        q_kernel = fused_q if fused_q.dtype == kernel_dtype else fused_q.to(kernel_dtype)
+    q_view = q_kernel.view(batch_size, seq_len_q, num_heads, d_latent + d_rope)
     kv_pool = md.kv_cache_manager.get_buffers(state.layer_idx)
     packed_block = 1
     for size in kv_pool.shape[1:]:
@@ -702,7 +754,7 @@ def cute_dsl_fp8_decode(
         )
     else:
         layers_in_pool = 1
-    kv_pool = kv_pool.view(torch.float8_e4m3fn)
+    kv_pool = kv_pool.view(kernel_dtype)
     if kv_pool.dim() != 5 or kv_pool.shape[1] != 1 or kv_pool.shape[3] != 1:
         raise RuntimeError(
             "CuTe DSL MLA decode expects KV cache layout "
@@ -740,7 +792,7 @@ def cute_dsl_fp8_decode(
     workspace = workspace[: math.ceil(required / workspace.element_size())]
     block_split_kvs = _split_kv_plan(md, cache_seqs, batch_size, seq_len_q, num_heads)
     output_view = output.view(batch_size, seq_len_q, num_heads, d_latent)
-    torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell(
+    op(
         q_view[..., :d_latent].permute(2, 3, 1, 0),
         q_view[..., d_latent:].permute(2, 3, 1, 0),
         c_pool_latent,
@@ -752,8 +804,8 @@ def cute_dsl_fp8_decode(
         num_heads,
         seq_len_q,
         page_size,
-        mla_bmm1_scale,
-        mla_bmm2_scale,
+        softmax_scale,
+        output_scale,
         int(md.max_num_requests),
         softmax_stats,
         (
@@ -766,7 +818,7 @@ def cute_dsl_fp8_decode(
     return output
 
 
-def mla_fp8_decode(
+def mla_decode(
     state: K3MlaAttnState,
     fused_q: torch.Tensor,
     md,
@@ -777,14 +829,14 @@ def mla_fp8_decode(
     cu_q_seqlens: torch.Tensor,
     cu_kv_seqlens: torch.Tensor,
     fmha_scheduler_counter: torch.Tensor,
-    mla_bmm1_scale: torch.Tensor,
-    mla_bmm2_scale: torch.Tensor,
-    quant_q_buffer: torch.Tensor,
+    mla_bmm1_scale: Optional[torch.Tensor],
+    mla_bmm2_scale: Optional[torch.Tensor],
+    quant_q_buffer: Optional[torch.Tensor],
     softmax_stats: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """The absorbed decode of an FP8-cache layer (see the module docstring)."""
-    if cute_dsl_fp8_decode_applies(state, fused_q, md, output, softmax_stats):
-        return cute_dsl_fp8_decode(
+    """The absorbed decode of an FP8- or BF16 / FP16-cache layer (see the module docstring)."""
+    if cute_dsl_decode_applies(state, fused_q, md, output, softmax_stats):
+        return cute_dsl_decode(
             state,
             fused_q,
             md,
@@ -795,9 +847,9 @@ def mla_fp8_decode(
             softmax_stats=softmax_stats,
         )
     logger.info_once(
-        f"Kimi K3 MLA FP8 decode: layer {state.layer_idx} batch outside the CuTe DSL MLA decode runs "
+        f"Kimi K3 MLA decode: layer {state.layer_idx} batch outside the CuTe DSL MLA decode runs "
         "the attention op's MLA generation.",
-        key=("k3_mla_fp8_decode_op", state.layer_idx),
+        key=("k3_mla_decode_op", state.layer_idx),
     )
     return mla_generation_attention(
         state,
@@ -817,10 +869,10 @@ def mla_fp8_decode(
 
 
 __all__ = [
-    "cute_dsl_fp8_decode",
-    "cute_dsl_fp8_decode_applies",
+    "cute_dsl_decode",
+    "cute_dsl_decode_applies",
     "launch_mla_split_kv_plan",
     "mla_context_attention",
-    "mla_fp8_decode",
+    "mla_decode",
     "mla_generation_attention",
 ]

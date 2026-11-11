@@ -58,8 +58,8 @@ weights and attention backends. The chain of one generation batch of ``T`` token
   ``mla_rope_generation`` (identity RoPE, the cache append and, on an FP4 cache, the FP4 query
   quantization), on the attention aux stream for a BF16 cache.
 * **Attention** (:func:`gen_attention`): K3's packed FP4 decode (``ops/attention/_fp4_mla_decode``) on an FP4
-  cache with the CuTe DSL FP4 MLA backend; on an FP8 cache the CuTe DSL FP8 MLA decode where it serves
-  the batch, else the attention op's MLA generation (``mla_fp8_decode``).
+  cache with the CuTe DSL FP4 MLA backend; on an FP8 or BF16 cache the CuTe DSL MLA decode where it
+  serves the batch, else the attention op's MLA generation (``mla_decode``).
 * **Helix CP** (:func:`attn_forward_gen`): the V up-projection of this rank's partials
   (``trtllm::bmm_out`` on ``helix_v_b_proj_full``), then the fifo-v2 MNNVL all-to-all
   (``HelixAllToAllNative.alltoall_native``, which zeroes the rows this rank holds no KV for) and
@@ -1327,8 +1327,8 @@ def helix_tail_applies(layer, num_tokens: int) -> bool:
 def gen_attention(layer, q: torch.Tensor, md: AttentionMetadata, **kwargs) -> torch.Tensor:
     """The absorbed decode of ``q`` (``[T, H * 576]``) into a new ``[T, H * kv_lora_rank]``: K3's
     packed FP4 decode on an FP4 cache with the CuTe DSL FP4 MLA backend (with the layer's
-    ``constants``); on an FP8 cache the CuTe DSL FP8 MLA decode where it serves the batch, else the
-    attention op's MLA generation (``ops/attention/k3_mla_attention``). ``kwargs``: the buffers of
+    ``constants``); on an FP8 or BF16 cache the CuTe DSL MLA decode where it serves the batch, else
+    the attention op's MLA generation (``ops/attention/k3_mla_attention``). ``kwargs``: the buffers of
     the generation cache update (``mla_rope_generation``) and ``softmax_stats_tensor``."""
     if fp4_mla_decode.applies(layer.mqa):
         assert kwargs.get("out_scale") is None
@@ -1348,8 +1348,7 @@ def gen_attention(layer, q: torch.Tensor, md: AttentionMetadata, **kwargs) -> to
     assert kwargs.pop("out_scale", None) is None
     softmax_stats = kwargs.pop("softmax_stats_tensor", None)
     output = q.new_empty((q.shape[0], mqa.num_heads * mqa.kv_lora_rank))
-    decode = mla_attn.mla_fp8_decode if mqa.has_fp8_kv_cache else mla_attn.mla_generation_attention
-    return decode(mqa, q, md, output, softmax_stats=softmax_stats, **kwargs)
+    return mla_attn.mla_decode(mqa, q, md, output, softmax_stats=softmax_stats, **kwargs)
 
 
 def _helix_gen(

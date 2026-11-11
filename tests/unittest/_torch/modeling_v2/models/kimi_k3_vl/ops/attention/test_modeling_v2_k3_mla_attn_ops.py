@@ -57,6 +57,8 @@ def _quant_config(kind: str):
     from tensorrt_llm.models.modeling_utils import QuantConfig
     from tensorrt_llm.quantization.mode import QuantAlgo
 
+    if kind == "bf16":
+        return QuantConfig()
     algo = QuantAlgo.FP8 if kind == "fp8" else QuantAlgo.NVFP4
     return QuantConfig(kv_cache_quant_algo=algo.value)
 
@@ -190,14 +192,15 @@ class _Bench:
             max_batch_size=batch,
             mapping=self.mapping,
         )
-        if kind == "fp8":
+        if kind in ("fp8", "bf16"):
             from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
             from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
+            data_type = tensorrt_llm.bindings.DataType
             self.manager = KVCacheManagerV2(
                 KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=False),
                 cache_type,
-                dtype=tensorrt_llm.bindings.DataType.FP8,
+                dtype=data_type.FP8 if kind == "fp8" else data_type.BF16,
                 **common,
             )
         else:
@@ -225,7 +228,7 @@ class _Bench:
 
     def pools(self) -> list:
         """Every cache pool a call of these tests may write."""
-        if self.kind == "fp8":
+        if self.kind != "nvfp4":
             return [self.manager.get_buffers(0)]
         manager = self.manager
         kv, sf = manager.get_fp4_mla_cache_buffers(0)
@@ -330,7 +333,7 @@ def _kv_b(seed: int) -> torch.Tensor:
 # ---------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kind", ["fp8", "nvfp4"])
+@pytest.mark.parametrize("kind", ["bf16", "fp8", "nvfp4"])
 def test_state_matches_backend_roles(kind):
     mha, mqa = _backend_roles(kind)
     ctx, gen = _family_roles(kind)
@@ -387,10 +390,12 @@ def test_state_matches_backend_roles(kind):
 
 
 # ---------------------------------------------------------------------------------------------
-# FP8 latent cache (K3's FP8 MLA layers): context, cached-prefix context, generation.
+# FP8 latent cache (K3's FP8 MLA layers): context, cached-prefix context, generation; the BF16
+# cache's context and generation.
 # ---------------------------------------------------------------------------------------------
 
-# (generation batch, q rows per request, CuTe DSL decode expected on SM100 / SM103 at 32-token pages)
+# (generation batch, q rows per request, CuTe DSL FP8 decode expected on SM100 / SM103 at 32-token
+# pages). On a BF16 cache the CuTe DSL decode takes K3's 96 heads at every batch size.
 _GEN_CASES = {
     "op_b2_q1": (2, 1, False),
     "cute_table_b8_q1": (8, 1, True),
@@ -400,7 +405,8 @@ _GEN_CASES = {
 
 @pytest.mark.parametrize("tokens_per_block", [32, 128])
 @pytest.mark.parametrize("gen_case", list(_GEN_CASES))
-def test_fp8_context_and_decode_match_backend(tokens_per_block, gen_case, monkeypatch):
+@pytest.mark.parametrize("kind", ["fp8", "bf16"])
+def test_context_and_decode_match_backend(kind, tokens_per_block, gen_case, monkeypatch):
     from tensorrt_llm._torch.attention.backends.interface import (
         AttentionForwardArgs,
         AttentionInputType,
@@ -408,6 +414,8 @@ def test_fp8_context_and_decode_match_backend(tokens_per_block, gen_case, monkey
 
     ops = _ops()
     batch, q_len, expect_cute = _GEN_CASES[gen_case]
+    if kind == "bf16":
+        expect_cute = True
     if tokens_per_block == 128:
         if _sm_version() == 107:
             expect_cute = True  # 128-token pages are the CuTe DSL decode's alone on SM107.
@@ -418,18 +426,23 @@ def test_fp8_context_and_decode_match_backend(tokens_per_block, gen_case, monkey
     ctx_lens = [37, 130, 5, 64, 200, 17, 90, 11][:batch]
     steps = 2
     max_seq_len = max(ctx_lens) + steps * q_len + 1
-    benches = [_Bench("fp8", tokens_per_block, max_seq_len, batch) for _ in range(2)]
+    benches = [_Bench(kind, tokens_per_block, max_seq_len, batch) for _ in range(2)]
     decode_calls = []
-    real_decode = torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell
+    decode_op = (
+        "cute_dsl_mla_decode_fp8_blackwell"
+        if kind == "fp8"
+        else "cute_dsl_mla_decode_fp16_blackwell"
+    )
+    real_decode = getattr(torch.ops.trtllm, decode_op)
 
     def counting_decode(*args, **kwargs):
         decode_calls.append(1)
         return real_decode(*args, **kwargs)
 
-    monkeypatch.setattr(torch.ops.trtllm, "cute_dsl_mla_decode_fp8_blackwell", counting_decode)
+    monkeypatch.setattr(torch.ops.trtllm, decode_op, counting_decode)
     try:
-        mha, mqa = _backend_roles("fp8")
-        ctx, gen = _family_roles("fp8")
+        mha, mqa = _backend_roles(kind)
+        ctx, gen = _family_roles(kind)
         for bench in benches:
             bench.grow(ctx_lens)
         mds = [b.metadata(ctx_lens, [0] * batch, context=True) for b in benches]
@@ -527,10 +540,8 @@ def test_fp8_context_and_decode_match_backend(tokens_per_block, gen_case, monkey
                         ),
                     )
                 else:
-                    assert (
-                        ops.attn.cute_dsl_fp8_decode_applies(gen, fq, md, out, None) == expect_cute
-                    )
-                    ops.attn.mla_fp8_decode(gen, fq, md, out, **decode_args)
+                    assert ops.attn.cute_dsl_decode_applies(gen, fq, md, out, None) == expect_cute
+                    ops.attn.mla_decode(gen, fq, md, out, **decode_args)
                 results.append((bufs, out))
             assert len(decode_calls) == (2 if expect_cute else 0), decode_calls
             (b_bufs, b_out), (f_bufs, f_out) = results
