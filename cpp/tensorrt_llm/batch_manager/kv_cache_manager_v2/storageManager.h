@@ -399,6 +399,12 @@ private:
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
         size_t gpuPhysMemSize, std::optional<SecondaryPoolBudget> const& secondBudget = std::nullopt);
+    //! Logs each pool group's floor, and the life cycles behind it, when the hot level's slot
+    //! floors need more than its configured quota. computeSlotCountForLevel() then raises the
+    //! quota to the floors, which would otherwise go unreported. Arguments as for that call.
+    void warnIfHotFloorsExceedQuota(CacheTierConfig const& tierConfig,
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists, size_t gpuPhysMemSize,
+        std::optional<SecondaryPoolBudget> const& secondBudget) const;
     //! For the config stage, which sizes a level before it exists: every fact it needs is
     //! named in the call rather than read off the manager.
     [[nodiscard]] static size_t minQuotaForLevel(

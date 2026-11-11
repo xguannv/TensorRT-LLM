@@ -35,6 +35,7 @@
 #include <limits>
 #include <numeric>
 #include <set>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -385,8 +386,10 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     mHostSparsePoolQuota = config.hostSparsePoolQuota.has_value() ? *config.hostSparsePoolQuota
                                                                   : defaultHostSparsePoolQuota(config.cacheTiers);
     // From the descriptors: the level's storage does not exist yet.
-    auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mHotMinSlots,
-        gpuGranularity, _secondaryBudget(sparsePools, hostMemSizeGranularity(), mHostSparsePoolQuota));
+    auto const hotSecondBudget = _secondaryBudget(sparsePools, hostMemSizeGranularity(), mHostSparsePoolQuota);
+    warnIfHotFloorsExceedQuota(config.cacheTiers[kHotLevel], slotSizeLists, gpuGranularity, hotSecondBudget);
+    auto gpuSlotCounts = computeSlotCountForLevel(
+        config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mHotMinSlots, gpuGranularity, hotSecondBudget);
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
         gpuSlotCounts, mGpuPhysMemAllocator.get(), HostMemBackingOptions{}, mHostSparsePoolQuota);
 
@@ -2177,6 +2180,66 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(Cac
     size_t const granularity = tierCommitUnit(tierConfig, gpuPhysMemSize);
     quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots, secondBudget), roundUp(quota, granularity));
     return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots, secondBudget);
+}
+
+// ---------------------------------------------------------------------------
+// warnIfHotFloorsExceedQuota
+// ---------------------------------------------------------------------------
+
+void StorageManager::warnIfHotFloorsExceedQuota(CacheTierConfig const& tierConfig,
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists, size_t gpuPhysMemSize,
+    std::optional<SecondaryPoolBudget> const& secondBudget) const
+{
+    size_t const granularity = tierCommitUnit(tierConfig, gpuPhysMemSize);
+    size_t const quota = roundUp(cacheTierQuota(tierConfig), granularity);
+    size_t const floorQuota = minQuotaForLevel(slotSizeLists, granularity, mHotMinSlots, secondBudget);
+    if (floorQuota <= quota)
+    {
+        return;
+    }
+    auto const pools = CacheLevelStorage::poolsPaidByQuota(slotSizeLists, secondBudget);
+    auto const& grouping = lifeCycleGrouping(kHotLevel);
+    std::ostringstream groups;
+    for (PoolGroupIndex pg{0}; pg < slotSizeLists.size(); ++pg)
+    {
+        size_t bytes = 0;
+        for (PoolIndex pool : pools[pg])
+        {
+            bytes += roundUp(slotCountToSizeT(mHotMinSlots[pg]) * slotSizeLists[pg][pool], granularity);
+        }
+        groups << (pg == PoolGroupIndex{0} ? "" : "; ") << "pool group " << pg.value() << " (life cycles";
+        for (auto const& [lcId, lc] : mLifeCycles)
+        {
+            if (grouping[lcId] != pg)
+            {
+                continue;
+            }
+            groups << ' ' << lcId.value();
+            if (auto const* attn = std::get_if<AttnLifeCycle>(&lc); attn == nullptr)
+            {
+                groups << " [ssm]";
+            }
+            else if (attn->windowSize.has_value())
+            {
+                groups << " [window " << *attn->windowSize << ']';
+            }
+            else
+            {
+                groups << " [full attention]";
+            }
+        }
+        groups << "): " << mHotMinSlots[pg] << " slots, " << bytes << " bytes";
+    }
+    // The quota is raised rather than the floors lowered: a floor is a batch the runtime relies on
+    // being able to hold. The size of the raise is reported because a floor that does not fit usually
+    // means it was derived from the wrong length, most often a window wider than any sequence the
+    // deployment can reach, and nothing else would show it.
+    TLLM_LOG_WARNING(
+        "KV cache GPU quota of %zu bytes is below the %zu bytes its pool groups' slot floors need, so the quota is "
+        "raised to the floors (%zu bytes more than configured). Floors by pool group: %s. A floor holds the "
+        "constraint batches and one request at the widest attention window; check for a window wider than any "
+        "sequence the deployment can reach, or raise the quota.",
+        quota, floorQuota, floorQuota - quota, groups.str().c_str());
 }
 
 //! Host-backed pools round to HostMem::sizeGranularity(), not to the device granularity, so the
