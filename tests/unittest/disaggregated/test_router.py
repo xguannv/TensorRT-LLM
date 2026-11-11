@@ -229,7 +229,7 @@ async def test_cancelled_selection_finishes_once_after_settlement(
     selection_tasks = []
 
     async def select(payload: dict) -> dict:
-        if content_required and not isinstance(payload["routing_key"], dict):
+        if content_required and "block_hashes" not in payload["routing_key"]:
             return {"server": None, "info": {ROUTING_CONTENT_REQUIRED: True}}
         selection_tasks.append(asyncio.current_task())
         entered.set()
@@ -290,7 +290,7 @@ async def test_coordinator_selection_hands_off_or_cleans_up(
     router.finish_request = mock.AsyncMock()
 
     async def select(payload: dict) -> dict:
-        if content_required and not isinstance(payload["routing_key"], dict):
+        if content_required and "block_hashes" not in payload["routing_key"]:
             return {"server": None, "info": {ROUTING_CONTENT_REQUIRED: True}}
         if cancel_on_completion:
             pending.cancel("cancel at completion")
@@ -1999,13 +1999,10 @@ async def test_conversation_router_new_conversation_follows_matching_prefix():
 
 
 @pytest.mark.asyncio
-async def test_conversation_router_shared_preamble_does_not_pin_new_conversations(
-):
-    """A preamble that every conversation shares spreads them over servers.
+async def test_conversation_router_new_conversations_always_follow_a_match():
+    """A new conversation follows its match however busy that server is.
 
-    The first follower of a single conversation still joins it; once the
-    preamble is shared by more than a 1/N share of the remembered
-    conversations, new conversations go to the least-loaded server.
+    That holds also when the match is a preamble every conversation shares.
     """
     servers = ["server1", "server2", "server3", "server4"]
     router = ConversationRouter(server_role=None,
@@ -2017,45 +2014,63 @@ async def test_conversation_router_shared_preamble_does_not_pin_new_conversation
     ]
     placed = [(await router.get_next_server(request))[0]
               for request in requests]
-    assert placed[1] == placed[0]
-    counts = {server: placed.count(server) for server in servers}
-    assert max(counts.values()) <= 5, counts
-    assert min(counts.values()) >= 3, counts
+    assert set(placed) == {placed[0]}
     for request in requests:
         await router.finish_request(request)
 
 
 @pytest.mark.asyncio
-async def test_conversation_router_follows_conversation_specific_prefix():
-    """A prefix that belongs to one conversation family is followed.
+async def test_conversation_router_load_is_the_uncached_backlog():
+    """With matching on, load counts estimated uncached prompt tokens.
 
-    All conversations share a system prompt, which does not pin them, but a
-    new conversation_id that extends the content of exactly one earlier
-    conversation follows it, and so does a second sibling while the family
-    stays within a 1/N share of the remembered conversations.
+    A followed conversation adds its prompt past the matched prefix, a known
+    conversation the growth of its prompt (at least one block).
     """
-    servers = ["server1", "server2", "server3", "server4"]
     router = ConversationRouter(server_role=None,
-                                servers=servers,
+                                servers=["server1", "server2"],
                                 **_NEW_CONV_ARGS)
-    roots = [
-        _conv_token_request(f"root-{index}",
-                            _SHARED_PREFIX + [index + 1] * 256 + [0] * 40)
-        for index in range(8)
-    ]
-    root_servers = [(await router.get_next_server(request))[0]
-                    for request in roots]
-    assert len(set(root_servers)) == len(servers)
+    root = _conv_token_request("root", _SHARED_PREFIX + [1] * 40)
+    server, _ = await router.get_next_server(root)
+    assert router._get_content_load(server) == 296
 
-    family_prefix = _SHARED_PREFIX + [4] * 256
-    sibling_1 = _conv_token_request("root-3::sub-1",
-                                    family_prefix + [100] * 256)
-    sibling_2 = _conv_token_request("root-3::sub-2",
-                                    family_prefix + [200] * 256)
-    assert (await router.get_next_server(sibling_1))[0] == root_servers[3]
-    assert (await router.get_next_server(sibling_2))[0] == root_servers[3]
-    for request in roots + [sibling_1, sibling_2]:
+    sibling = _conv_token_request("root::sub", _SHARED_PREFIX + [2] * 40)
+    assert (await router.get_next_server(sibling))[0] == server
+    assert router._get_content_load(server) == 296 + 40
+
+    turn = _conv_token_request("root", _SHARED_PREFIX + [1] * 40 + [5] * 100)
+    assert (await router.get_next_server(turn))[0] == server
+    tiny_turn = _conv_token_request("root",
+                                    _SHARED_PREFIX + [1] * 40 + [5] * 101)
+    assert (await router.get_next_server(tiny_turn))[0] == server
+    assert router._get_content_load(server) == 296 + 40 + 100 + 16
+
+    # An unmatched new conversation goes to the server with less backlog.
+    other = _conv_token_request("other", list(range(5000, 5300)))
+    assert (await router.get_next_server(other))[0] != server
+    for request in (root, sibling, turn, tiny_turn, other):
         await router.finish_request(request)
+    assert sum(router._server_content_load.values()) == 0
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_logs_follow_counts(monkeypatch):
+    router = ConversationRouter(server_role=None,
+                                servers=["server1", "server2"],
+                                **_NEW_CONV_ARGS)
+    lines = []
+    monkeypatch.setattr("tensorrt_llm.serve.router.logger.info", lines.append)
+    for index in range(256):
+        tokens = (_SHARED_PREFIX if index % 2 else list(
+            range(10_000 * (index + 1), 10_000 * (index + 1) + 256)))
+        request = _conv_token_request(f"conv-{index}", tokens + [index] * 8)
+        await router.get_next_server(request)
+        await router.finish_request(request)
+    assert [
+        line for line in lines if line.startswith("ConversationRouter")
+    ] == [
+        "ConversationRouter: 127/256 new conversations followed a matching "
+        "earlier conversation"
+    ]
 
 
 @pytest.mark.asyncio
@@ -2265,7 +2280,7 @@ async def test_conversation_router_by_key_requests_content_for_new_ids():
     sibling_b = _conv_token_request("t::sa:b", _SHARED_PREFIX + [2] * 40)
 
     key = router.routing_key(sibling_a)
-    assert key == "t::sa:a"
+    assert key == {"conversation_id": "t::sa:a", "num_tokens": 296}
     server, info, req_id = await router.get_next_server_by_key(key, req_id=1)
     assert server is None and req_id == 1
     assert info == {ROUTING_CONTENT_REQUIRED: True}
@@ -2325,7 +2340,11 @@ async def test_coordinator_delegating_router_repeats_select_with_content():
         msgpack.unpackb(call.kwargs["data"], raw=False)["routing_key"]
         for call in session.post.call_args_list
     ]
-    assert keys == ["conv-a", local_router.content_routing_key(request)]
+    assert keys == [{
+        "conversation_id": "conv-a",
+        "num_tokens": len(_SHARED_PREFIX)
+    },
+                    local_router.content_routing_key(request)]
 
 
 @pytest.mark.asyncio
