@@ -154,6 +154,41 @@ def test_mla_profile_uses_runtime_chunk_dimensions(mla_profile_creator: KvCacheC
     assert creator._get_mla_chunked_profile_length(262143) == 40960
 
 
+@pytest.mark.parametrize("kv_cache_max_seq_len", [73728 + 14, 73728 + 13])
+def test_mla_profile_says_when_the_kv_cache_shortens_it_away(
+    kv_cache_max_seq_len: int, mla_profile_creator: KvCacheCreator
+) -> None:
+    """A max_seq_len the KV cache shortens below the chunk-aware prompt switches the reserve on.
+
+    The profile is rebuilt for the shorter length and the workspace it measured is
+    reserved from the KV cache budget instead. That is the intended fallback, but the
+    budget it takes is large, so the switch is announced, with the length that keeps it.
+    """
+    creator = mla_profile_creator
+    # The model engine's length exceeds the network's by the 13 spec-decoding tokens, and the
+    # profiling prompt leaves one token to generate.
+    creator._net_max_seq_len = 262144
+    creator._max_seq_len = 262144 + 13
+    creator._create_dummy_context_requests(creator._net_max_seq_len - 1)
+    assert creator._mla_chunked_profile_length == 73728
+
+    with patch("tensorrt_llm._torch.pyexecutor._util.logger") as mock_logger:
+        creator._recreate_dummy_requests_for_max_seq_len(kv_cache_max_seq_len)
+
+    if kv_cache_max_seq_len == 73728 + 14:
+        assert creator._mla_chunked_profile_length == 73728
+        assert all(len(req.input_token_ids) == 73728 for req in creator._dummy_reqs)
+        mock_logger.warning.assert_not_called()
+    else:
+        assert creator._mla_chunked_profile_length is None
+        assert sum(len(req.input_token_ids) for req in creator._dummy_reqs) == 8192
+        mock_logger.warning.assert_called_once()
+        message = mock_logger.warning.call_args.args[0]
+        assert f"max_seq_len to {kv_cache_max_seq_len}" in message
+        assert f"below the {73728 + 14}" in message
+        assert "fp8_context_mla_kv_len_cap" in message
+
+
 @pytest.mark.parametrize("profiled", [False, True])
 @pytest.mark.parametrize("bounded", [False, True])
 def test_mla_profile_reserve_requires_measured_chunk(profiled: bool, bounded: bool) -> None:

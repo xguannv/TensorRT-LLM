@@ -1501,6 +1501,31 @@ class KvCacheCreator:
             return None
         return profile_length
 
+    def _recreate_dummy_requests_for_max_seq_len(self,
+                                                 max_seq_len: int) -> None:
+        """Rebuild the profiling requests for the max_seq_len a KV cache manager allows.
+
+        A shorter prompt can no longer reach the length the chunk-aware MLA
+        profile needs, in which case the context-MLA workspace that profile
+        would have measured is reserved from the KV cache budget instead.
+        """
+        chunked_profile_length = self._mla_chunked_profile_length
+        prompt_overhead = self._max_seq_len - self._net_max_seq_len + 1
+        self._dummy_reqs = self._create_dummy_context_requests(
+            max(1, max_seq_len - prompt_overhead))
+        if (chunked_profile_length is not None
+                and self._mla_chunked_profile_length is None):
+            logger.warning(
+                f"The KV cache limits max_seq_len to {max_seq_len}, below the "
+                f"{chunked_profile_length + prompt_overhead} the chunk-aware MLA "
+                f"profile needs for its {chunked_profile_length}-token prompt, so "
+                "profiling runs without cached-KV chunks and the context-MLA "
+                "workspace it would have measured, if the attention backend "
+                "declares one, is reserved from the KV cache budget instead. "
+                "Raise kv_cache_config.max_tokens (or the KV cache memory) to "
+                "keep the chunk-aware profile, or set kv_cache_config."
+                "fp8_context_mla_kv_len_cap to bound the reserve.")
+
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
         # Keep the LLM dummy text-only so it can always fill max_num_tokens.
@@ -2254,10 +2279,8 @@ class KvCacheCreator:
             # When SWA is enabled, max_seq_len is updated inside kv_cache_manager.
             if kv_cache_manager is not None:
                 if kv_cache_manager.max_seq_len < self._max_seq_len:
-                    self._dummy_reqs = self._create_dummy_context_requests(
-                        max(
-                            1, self._net_max_seq_len - 1 -
-                            (self._max_seq_len - kv_cache_manager.max_seq_len)))
+                    self._recreate_dummy_requests_for_max_seq_len(
+                        kv_cache_manager.max_seq_len)
                 self._max_seq_len = kv_cache_manager.max_seq_len
         else:
             if kv_cache_manager is not None:
