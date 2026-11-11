@@ -53,6 +53,9 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.packed_plan import (
     _fp4_mla_packed_plan_geometry,
 )
 
+# The packed decode's task slots per request: the plan written here is planned with the same count.
+from ...ops.attention._fp4_mla_decode import _SPLITS as _DECODE_SPLITS
+
 # The family copies of the FP4 MLA cache-update code outside the KV-cache-manager contract.
 from ...ops.attention._k3_fp4_mla_cache import (
     _get_cutedsl_persistent_v_packed_cache,
@@ -698,6 +701,7 @@ def _scatter_generation_kv_only_2d(
                 num_tokens,
                 use_helix=helix_position_offsets is not None or helix_is_inactive_rank is not None,
             ),
+            num_splits=_DECODE_SPLITS,
         )
     kv_lens_gen, gen_lens_gen = _fp4_mla_uniform_generation_lengths(
         metadata, num_tokens, num_gen, plan_geometry=plan_geometry
