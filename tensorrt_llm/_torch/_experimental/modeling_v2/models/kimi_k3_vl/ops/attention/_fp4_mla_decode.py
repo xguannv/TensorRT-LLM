@@ -38,6 +38,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
     FP4_MLA_TOKENS_PER_BLOCK,
     _cutedsl_backend_available,
     _fp4_mla_attention_backend,
+    _fp4_mla_cutedsl_kernel_module,
     _fp4_mla_packed_rows_per_seq,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.layout import (
@@ -58,6 +59,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.metadata import (
     materialize_fp4_mla_device_page_table,
     populate_fp4_mla_generation_lengths,
 )
+from tensorrt_llm._torch.attention.backends.fp4_mla.packed_plan import _PackedPlanGeometry
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
@@ -266,6 +268,85 @@ def packed_plan_geometry(
         lpt_m_tiles,
         lpt_wave_clusters,
         wave_plan,
+    )
+
+
+def backend_plan_geometry(
+    metadata: Any,
+    *,
+    num_heads: int,
+    query_len: int,
+    num_requests: int,
+    device: torch.device,
+    helix_kv_bounds: torch.Tensor | None,
+) -> _PackedPlanGeometry | None:
+    """The FP4 MLA backend's packed plan geometry of this step, with this decode's :data:`_SPLITS`
+    task slots per request.
+
+    The generation KV update (``kernels/k3r_fp4_mla/fp4_mla_kv_append``) is the first FP4 MLA kernel
+    of a step: it hands this geometry to the backend's ``_fp4_mla_uniform_generation_lengths``, which
+    writes the backend's plan fused with the generation lengths. The backend's own geometry
+    (``packed_plan._fp4_mla_packed_plan_geometry``) picks its split count from the batch shape
+    (``TRTLLM_FP4_MLA_SPLIT_KV`` overrides it); the reference recipes planned the K3 generation
+    servers with 8 (= :data:`_SPLITS`), so this is that function with the count fixed. Everything
+    else (task-length cap, the backend kernel's KV profile, the plan workspace and the plan key) is
+    the backend's, so the backend's step state reads the result as its own.
+    """
+    rows_per_seq = _fp4_mla_packed_rows_per_seq(num_heads, query_len)
+    if rows_per_seq == 0 or num_requests <= 0:
+        return None
+    if not metadata.fp4_mla_state.device_page_table:
+        return None
+    # The fixed-stride generation page-table capacity (see _max_generation_pages).
+    max_pages = int(metadata.fp4_mla_state.page_table_stride)
+    if max_pages <= 0:
+        return None
+    max_kv_len = max_pages * metadata.page_size
+    is_cuda_graph = bool(getattr(metadata, "is_cuda_graph", False))
+    m_tiles = rows_per_seq // FP4_MLA_SCALE_ROW_GROUP
+    splits = _SPLITS
+    wave_tasks = _packed_wave_tasks(device, m_tiles)
+    kv_tiles = _ceil_div(max(max_kv_len, 1), 256)
+    if wave_tasks <= 2 * num_requests:
+        task_tiles = kv_tiles
+    else:
+        task_tiles = min(kv_tiles, max(_ceil_div(kv_tiles, splits - 1), 2))
+    split_kv_len = max(task_tiles * 256, 256)
+    # The backend kernel's runtime KV profile (a bucket >= split_kv_len).
+    profile_tiles = _fp4_mla_cutedsl_kernel_module()._select_runtime_kv_profile(split_kv_len) // 256
+    tasks = splits * num_requests
+    # Graph buckets hold exactly their tasks; eager metadata grows on demand.
+    task_capacity = tasks if is_cuda_graph else max(tasks, 32)
+    plan = _ensure_workspace_tensor(
+        metadata,
+        "_fp4_mla_packed_plan",
+        (_reduce_module().packed_plan_length(num_requests, task_capacity),),
+        dtype=torch.int32,
+        device=device,
+    )
+    kv_lens = metadata.fp4_mla_state.generation_kv_lens
+    key = (
+        num_requests,
+        splits,
+        wave_tasks,
+        profile_tiles,
+        query_len,
+        task_capacity,
+        kv_lens.data_ptr() if isinstance(kv_lens, torch.Tensor) else 0,
+        helix_kv_bounds.data_ptr() if helix_kv_bounds is not None else 0,
+        plan.data_ptr(),
+    )
+    return _PackedPlanGeometry(
+        num_requests,
+        query_len,
+        splits,
+        wave_tasks,
+        profile_tiles,
+        task_capacity,
+        split_kv_len,
+        helix_kv_bounds,
+        plan,
+        key,
     )
 
 

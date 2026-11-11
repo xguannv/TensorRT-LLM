@@ -48,13 +48,10 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.metadata import (
     _fp4_mla_uniform_generation_lengths,
     _materialize_fp4_mla_device_page_table_for_forward,
 )
-from tensorrt_llm._torch.attention.backends.fp4_mla.packed_plan import (
-    _fp4_mla_helix_plan_bounds,
-    _fp4_mla_packed_plan_geometry,
-)
+from tensorrt_llm._torch.attention.backends.fp4_mla.packed_plan import _fp4_mla_helix_plan_bounds
 
-# The packed decode's task slots per request: the plan written here is planned with the same count.
-from ...ops.attention._fp4_mla_decode import _SPLITS as _DECODE_SPLITS
+# The backend's plan geometry with the packed decode's task slots per request.
+from ...ops.attention._fp4_mla_decode import backend_plan_geometry
 
 # The family copies of the FP4 MLA cache-update code outside the KV-cache-manager contract.
 from ...ops.attention._k3_fp4_mla_cache import (
@@ -690,7 +687,7 @@ def _scatter_generation_kv_only_2d(
     # launch also writes the packed split plan the decode layers reuse.
     plan_geometry = None
     if num_q_heads > 0:
-        plan_geometry = _fp4_mla_packed_plan_geometry(
+        plan_geometry = backend_plan_geometry(
             metadata,
             num_heads=num_q_heads,
             query_len=num_tokens // num_gen,
@@ -701,7 +698,6 @@ def _scatter_generation_kv_only_2d(
                 num_tokens,
                 use_helix=helix_position_offsets is not None or helix_is_inactive_rank is not None,
             ),
-            num_splits=_DECODE_SPLITS,
         )
     kv_lens_gen, gen_lens_gen = _fp4_mla_uniform_generation_lengths(
         metadata, num_tokens, num_gen, plan_geometry=plan_geometry

@@ -3,7 +3,7 @@
 """Launch geometry and per-step KV split plan of the packed FP4 MLA decode."""
 
 import os
-from typing import Any, NamedTuple, Optional
+from typing import Any, NamedTuple
 
 import torch
 
@@ -45,7 +45,6 @@ def _select_packed_split_count(
     *,
     max_kv_len: int,
     is_cuda_graph: bool,
-    num_splits: Optional[int] = None,
 ) -> int:
     """Task slots per request (grid.z = requests * splits): enough for two
     waves of 2-CTA clusters plus one task per request, and never fewer than
@@ -56,14 +55,8 @@ def _select_packed_split_count(
     The count depends only on the request count and tile count, so a CUDA
     graph bucket always replays the same geometry. Eager calls know the real
     longest KV and keep at least _FP4_MLA_PACKED_MIN_TILES_PER_SPLIT KV tiles
-    per split.
-
-    ``num_splits`` is a caller's fixed count (a model whose decode always runs
-    that many splits); it is used as given, capped to the supported range.
-    Without it, ``TRTLLM_FP4_MLA_SPLIT_KV`` overrides the count for testing.
+    per split. ``TRTLLM_FP4_MLA_SPLIT_KV`` overrides the count for testing.
     """
-    if num_splits is not None:
-        return max(1, min(num_splits, _FP4_MLA_PACKED_MAX_SPLITS))
     override = os.getenv(_FP4_MLA_SPLIT_KV_ENV, "auto")
     if override != "auto":
         return max(1, min(int(override), _FP4_MLA_PACKED_MAX_SPLITS))
@@ -101,7 +94,6 @@ def _fp4_mla_packed_plan_geometry(
     num_requests: int,
     device: torch.device,
     helix_kv_bounds: torch.Tensor | None,
-    num_splits: Optional[int] = None,
 ) -> _PackedPlanGeometry | None:
     """Slots, task-length cap and plan buffer of this step's packed decode.
 
@@ -111,8 +103,6 @@ def _fp4_mla_packed_plan_geometry(
     one, and whichever runs first writes the step's plan fused with the
     generation lengths (``_fp4_mla_uniform_generation_lengths``). ``key`` is
     None when every request keeps a single task and no plan is needed.
-    ``num_splits``: the caller's fixed task slots per request (see
-    ``_select_packed_split_count``).
     """
     rows_per_seq = _fp4_mla_packed_rows_per_seq(num_heads, query_len)
     if rows_per_seq == 0 or num_requests <= 0:
@@ -132,7 +122,6 @@ def _fp4_mla_packed_plan_geometry(
         device,
         max_kv_len=max_kv_len,
         is_cuda_graph=is_cuda_graph,
-        num_splits=num_splits,
     )
     # Tasks that fill one wave of 2-CTA clusters: the plan's task-length reference.
     wave_tasks = _packed_wave_tasks(device, m_tiles)
