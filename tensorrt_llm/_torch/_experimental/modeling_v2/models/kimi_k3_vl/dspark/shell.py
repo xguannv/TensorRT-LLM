@@ -39,19 +39,23 @@ Target constants, set on the target's class (no runtime switch reads them):
 
 import inspect
 from dataclasses import replace
-from typing import Callable, Generic, Optional
+from typing import Callable, Generic, Optional, TypeVar
 
 import torch
+from torch import nn
 
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
-from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, TConfig, TModel
+from tensorrt_llm._torch.model_config import ModelConfig, TConfig
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks
 from tensorrt_llm._torch.speculative import SpecMetadata, should_use_separate_draft_kv_cache
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .drafter import K3DSparkPath, build_k3_dspark_drafter
 from .worker import K3DSparkWorker
+
+# The target's decoder model (a ``DecoderModel``).
+TModel = TypeVar("TModel", bound=nn.Module)
 
 
 def _draft_config_kwargs(model_config: ModelConfig, spec_config) -> dict:
