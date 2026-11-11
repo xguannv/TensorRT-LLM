@@ -91,7 +91,9 @@ def test_family_geometry_is_the_backend_geometry_planned_with_8(monkeypatch, env
         assert isinstance(family, packed_plan._PackedPlanGeometry), shape
         assert family.splits == decode._SPLITS == 8, shape
         assert family._replace(plan=None) == backend._replace(plan=None), shape
-        assert family.plan is backend.plan, shape
+        # The same workspace buffer (the workspace hands out a fresh view per call).
+        assert family.plan.data_ptr() == backend.plan.data_ptr(), shape
+        assert family.plan.shape == backend.plan.shape, shape
 
 
 def test_without_the_fixed_count_the_selection_is_not_always_8(monkeypatch):
