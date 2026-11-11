@@ -450,6 +450,10 @@ class K3MoERuntime(nn.Module):
                 return None
         return slot_start, num_local
 
+    def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """FP32 router logits: the BF16 router GEMM."""
+        return self.gate.compute_logits(hidden_states)
+
     def _router(self, tail_target: Optional[Tuple[int, int]]):
         """The routing of this forward's router logits, for the experts
         ``[local_expert_offset, local_expert_offset + local_num_experts)`` the routed experts ask
@@ -611,7 +615,7 @@ class K3MoERuntime(nn.Module):
             self.moe_latent_fork_event.record()
             if hidden_states.shape[0] <= _K3_ROUTER_FIRST_MAX_M:
                 # Router before latent_down in creation order (see _K3_ROUTER_FIRST_MAX_M).
-                router_logits = self.gate.compute_logits(hidden_states)
+                router_logits = self._router_logits(hidden_states)
                 router_issued = True
             with torch.cuda.stream(self.latent_down_stream):
                 self.moe_latent_fork_event.wait()
@@ -623,7 +627,7 @@ class K3MoERuntime(nn.Module):
             # blocks until capture ends): the tensor is read on main only
             # after the join, and later work on this stream forks from main.
         if not router_issued:
-            router_logits = self.gate.compute_logits(hidden_states)
+            router_logits = self._router_logits(hidden_states)
 
         def _routed_output():
             # Latent down/up projections via the min-latency fused GEMM op:
