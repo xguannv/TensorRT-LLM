@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi K3 NVFP4 on Rubin (SM107): checkpoint mapping, loading and sharding.
+"""Kimi K3 NVFP4 on Rubin (SM107), tp1: checkpoint mapping and loading.
 
 The model loads through two mixins, each the first base of the class it serves:
 
@@ -9,11 +9,8 @@ The model loads through two mixins, each the first base of the class it serves:
   vision tower's and projector's tensors (``vision_tower.*``, ``mm_projector.*``) are never read.
 * ``KimiK3DefaultTextWeights`` (of ``KimiK3DefaultForCausalLM``): the checkpoint name plan and
   its key check, the trunk parameters, the checkpoint FP8 attention projections, and the
-  routed experts. The checkpoint is streamed, and every rank keeps only its share: its
-  attention heads (under Helix CP its chunk of the ``v_b_proj`` heads), its slice of the
-  tensor-parallel MLPs, and its slice of each MoE layer's expert bank (whole experts under
-  MoE EP; under MoE TP the intermediate shard of every expert, so every expert tensor is
-  read).
+  routed experts. The checkpoint is streamed into the one rank, which holds every attention
+  head, the whole MLPs and every routed expert (the shard helpers below cut a ``1 / 1`` share).
 
 The module-level helpers name the checkpoint keys of fused projections, cut a rank's slice
 of a tensor, and read FP8 block-scaled projections (dequantized for a BF16 parameter).
@@ -38,6 +35,7 @@ from tensorrt_llm.logger import logger
 
 from ..common.parallel import TensorParallelMode
 from ..common.weight_io import run_concurrently, text_model_weights
+from ..sm107_parts.layers import Bf16Linear, Fp8BlockScaleLinear, shard_range
 from .fp8_weight_read import (
     _convert_moe_mlps_to_fp8_weight_read,
     _Fp8BlockScaleWeightReadLinear,
@@ -46,7 +44,6 @@ from .fp8_weight_read import (
     _swap_linear_to_fp8_weight_read,
 )
 from .kda import K3KDALinearAttention
-from ..sm107_parts.layers import Bf16Linear, Fp8BlockScaleLinear, shard_range
 from .moe_runtime import K3MoERuntime
 
 _KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (
@@ -135,27 +132,6 @@ def _shard_head_major_param(
         tp = src.shape[1] // param.shape[1]
         return _shard_dim(src, 1, tp, model_tp_rank % tp, param.device)
     return src
-
-
-def _helix_cp_v_b_shard(
-    v_weight: torch.Tensor,
-    *,
-    num_heads_tp_cp: int,
-    cp_rank: int,
-) -> torch.Tensor:
-    """Select this CP rank's ``v_b_proj`` head chunk from a tp-local KV-B split.
-
-    Under Helix context-parallel (cp_size > 1) ``v_b_proj`` holds only this
-    rank's 1/cp post-all-to-all head chunk, while ``kv_b_proj`` and
-    ``k_b_proj_trans`` keep every tp-local head. When cp_size == 1
-    (``num_heads_tp_cp`` equals the full tp-local head count) the tensor is
-    returned unchanged. ``v_weight`` is ``[num_heads_tp, v_head_dim,
-    kv_lora_rank]``; only its leading head axis is sliced.
-    """
-    if num_heads_tp_cp != v_weight.shape[0]:
-        lo = cp_rank * num_heads_tp_cp
-        v_weight = v_weight[lo : lo + num_heads_tp_cp]
-    return v_weight
 
 
 _FP8_BLOCK_SCALE_SUFFIX = "_scale"
@@ -446,23 +422,6 @@ class KimiK3DefaultTextWeights:
         )
         attention.k_b_proj_trans.data.copy_(key_weight.transpose(1, 2))
         attention.k_b_proj_trans_scale.data.copy_(key_scale.transpose(1, 2))
-        if attention.mapping.has_cp_helix():
-            expanded = value_scale.repeat_interleave(_FP8_BLOCK, -2).repeat_interleave(
-                _FP8_BLOCK, -1
-            )
-            # The MLA layer owns the V-up-before-exchange flag; bind through it (its
-            # transform_weights rebuilds the same weight from kv_b_proj).
-            attention._bind_helix_v_up_weight((value_weight.float() * expanded).to(torch.bfloat16))
-        value_weight = _helix_cp_v_b_shard(
-            value_weight,
-            num_heads_tp_cp=attention.num_heads_tp_cp,
-            cp_rank=attention.mapping.cp_rank,
-        )
-        value_scale = _helix_cp_v_b_shard(
-            value_scale,
-            num_heads_tp_cp=attention.num_heads_tp_cp,
-            cp_rank=attention.mapping.cp_rank,
-        )
         # Absorption must keep raw checkpoint codes independent of Linear's
         # backend-specific weight transformations.
         attention.v_b_proj = nn.Parameter(value_weight.clone().contiguous(), requires_grad=False)
@@ -665,13 +624,7 @@ class KimiK3DefaultTextWeights:
         # MLP TP shard index. A dense MLP whose intermediate size does not
         # divide model TP uses a smaller repeated TP subgroup, so its local
         # shard rank is model tp_rank modulo the parameter's shard count.
-        # Under helix the modules were sharded against the repurposed
-        # mapping; the restored CP original's tp_rank is 0 on every rank.
-        model_tp_rank = (
-            self._repurposed_tp_mapping.tp_rank
-            if self._repurposed_tp_mapping is not None
-            else self.model_config.mapping.tp_rank
-        )
+        model_tp_rank = self.model_config.mapping.tp_rank
         # KDA head-shard (attention-DP off): rank r loads head rows/cols
         # [r*local : (r+1)*local] of every head-major KDA tensor.
         kda_tp_size, kda_tp_rank = 1, 0
@@ -760,14 +713,9 @@ class KimiK3DefaultTextWeights:
                 mla_mixer.k_b_proj_trans.data.copy_(k_weight.transpose(1, 2))
                 # Share the loaded BF16 V rows with context GEMM instead of keeping a
                 # separate copy. Wrap the view to retain v_b_proj's parameter registration.
-                v_weight = _helix_cp_v_b_shard(
-                    param[h * n :].view(h, v, kv),
-                    num_heads_tp_cp=mla_mixer.num_heads_tp_cp,
-                    cp_rank=mla_mixer.mapping.cp_rank,
+                mla_mixer.v_b_proj = nn.Parameter(
+                    param[h * n :].view(h, v, kv), requires_grad=False
                 )
-                mla_mixer.v_b_proj = nn.Parameter(v_weight, requires_grad=False)
-                if mla_mixer.mapping.has_cp_helix():
-                    mla_mixer._bind_helix_v_up_weight(param[h * n :].view(h, v, kv))
                 return
             if name.endswith(".A_log") and src.numel() != param.numel():
                 # The checkpoint pads A_log from [num_heads] to [head_dim]
@@ -1106,9 +1054,7 @@ class KimiK3DefaultTextWeights:
                 attention = layer.self_attn.mixer
             for name, linear in attention.named_children():
                 if _is_fp8_block_projection(linear):
-                    _swap_linear_to_fp8_weight_read(
-                        attention, name, (type(linear),), constants=self.k3_constants
-                    )
+                    _swap_linear_to_fp8_weight_read(attention, name, (type(linear),))
             fused = getattr(attention, "qkvg_proj", None)
             if isinstance(fused, _Fp8BlockScaleWeightReadLinear):
                 offset = 0
@@ -1124,11 +1070,11 @@ class KimiK3DefaultTextWeights:
         logger.info(
             f"Kimi K3: loaded {num_params} parameters and expert slices of {num_moe_layers} layers"
         )
-        if self._fp8_weight_read_moe_mlp and is_sm_100f():
+        # The BF16 shared and latent MoE MLP weights are read as block-scaled FP8.
+        if is_sm_100f():
             converted = _convert_moe_mlps_to_fp8_weight_read(
                 self.model,
                 include_fused_gate_up=self.model_config.mapping.enable_attention_dp,
-                constants=self.k3_constants,
             )
             logger.info(f"Kimi K3: quantized {converted} BF16 shared/latent MLP projections to FP8")
 

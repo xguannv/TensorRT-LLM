@@ -70,9 +70,11 @@ def test_target_class_declares_its_constants_and_no_model_defaults():
     import importlib
 
     module = importlib.import_module(f"{_FAMILY}.{_TARGET}.modeling")
-    family = importlib.import_module(f"{_FAMILY}.sm107_parts.modeling")
     cls = getattr(module, _CLASS)
-    assert issubclass(cls, family.KimiK3Sm107ForConditionalGeneration)
+    # The target carries its own glue: its class is built from the target's modules, not the
+    # family's SM107 parts.
+    assert cls.__module__ == module.__name__
+    assert issubclass(cls, module.KimiK3DefaultWeights)
     assert cls.K3_CONSTANTS is importlib.import_module(f"{_FAMILY}.{_TARGET}.constants").CONSTANTS
     # The model loader applies the model defaults of the checkpoint's built-in class before it
     # routes a Modeling V2 target, so a target's get_model_defaults would never run: the recipe

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi Delta Attention (KDA) for the Kimi K3 (k3_rubin) text model.
+"""Kimi Delta Attention (KDA) for the Kimi K3 text model of the tp1 target (one rank).
 
 ``K3KDALinearAttention`` holds the layer's weights in K3's own containers (``layers.py``) and
 runs one explicit kernel chain per phase (prefill, decode, multi-token verify) on the package's
@@ -30,23 +30,25 @@ Weights (checkpoint names under ``model.layers.<i>.self_attn.``, this rank's hea
 Kernel chains (``H`` heads of this rank, ``D = 128``; ``x`` the BF16 rows):
 
 * **Prefill** (:meth:`forward_prefill`): QKVG GEMM -> ``F.linear`` ``[f_a | b]`` and ``F.linear``
-  ``f_b`` -> short convolution with its conv-pool write-back, SiLU and Q/K L2 norm
-  (``fused_kda_conv_prefill``; or ``extract_transpose_prefill_slice`` + ``causal_conv1d_fwd`` +
-  ``fused_kda_post_conv``) -> ``kda_prefill`` (fused K1-K3, A_kk inverse, persistent
+  ``f_b`` -> short convolution with its conv-pool write-back, SiLU and Q/K L2 norm, a single
+  unaligned sequence's Q/K/V/beta zero-padded to the prefill chunk
+  (``fused_kda_conv_prefill``) -> ``kda_prefill`` (fused K1-K3, A_kk inverse, persistent
   K4) on fp32 state rows (a BF16 pool is staged through an fp32 copy and written back) -> gated
-  RMSNorm (``rms_norm_gated_token_major``) -> o_proj (and the TP all-reduce).
+  RMSNorm (``rms_norm_gated_token_major``) -> o_proj.
 * **Decode** (:meth:`forward_decode`, one token per request): QKVG GEMM, next to ``[f_a | b]`` /
   ``f_b`` on the projection aux stream -> the fused CUDA decode kernel (convolution, gate,
   recurrence, gated RMSNorm, conv / state pools updated by slot) -> o_proj.
-* **Verify** (:meth:`forward_verify_fused`, ``1 + num_spec`` tokens per request): QKVG GEMM (or its
-  MXFP8 hand-off form) next to the gate kernel on the aux stream (``k3_kda_fab_fa`` -> the forget
-  gate computed in the verify kernel; ``k3_kda_fab_proj``; or ``F.linear`` ``[f_a | b]`` and
-  ``f_b``), the L2 prefetch of the next KDA layer's weights -> ``kda_mtp_decode`` (forget gate
-  from ``f_a`` in the kernel, or BF16 core, or MXFP8 core for o_proj) on the replay caches ->
-  o_proj, with the all-reduce pushed into its Lamport buffers where the GEMM can.
+* **Verify** (:meth:`forward_verify_fused`, ``1 + num_spec`` tokens per request): QKVG GEMM next
+  to the gate kernel on the aux stream (``k3_kda_fab_fa`` -> the forget gate computed in the
+  verify kernel; ``k3_kda_fab_proj``; or ``F.linear`` ``[f_a | b]`` and ``f_b``) ->
+  ``kda_mtp_decode`` (forget gate from ``f_a`` in the kernel, or BF16 core, or MXFP8 core for
+  o_proj) on the replay caches -> o_proj.
 
-The kernels are called through the target's ``ops/ssm`` entries (and the family's
-``causal_conv1d_fwd`` / ``rms_norm_gated_token_major``).
+tp1 serves context requests; the decode and verify chains run on the generation-shaped rows a
+context server can still see (warmup, dummy rows) and in the test harness.
+
+The kernels are called through the family's ``ops/ssm`` entries and
+``rms_norm_gated_token_major``.
 
 Cache ownership: three short-convolution states in the combined ``[slots, 3D, W - 1]`` BF16 pool
 and one delta-rule recurrent state in the ``[slots, H, V, K]`` pool (fp32 or BF16), plus the replay
@@ -62,7 +64,7 @@ import functools
 import math
 import weakref
 from dataclasses import dataclass
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import List, NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -75,38 +77,22 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
 from tensorrt_llm._torch.utils import get_model_extra_attrs
-from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..common.kda_metadata import (  # noqa: F401 — the target's metadata class and plan
-    KDA_PREFILL_CHUNK_SIZE,
-    K3MambaMetadata,
-    KDASnapshotPlan,
-    build_kda_snapshot_plan,
-)
-from ..common.multi_stream import do_multi_stream
+from ..common.kda_metadata import KDASnapshotPlan
 from ..kernels.k3r_kda._kda_kernels import (
-    PAD_SLOT_ID,
     K3KDAKernelDispatch,
-    extract_transpose_prefill_slice,
     kda_mtp_verify_ctas,
     reset_recurrent_state_rows,
 )
 from ..ops.norm.rms_norm_gated_token_major import rms_norm_gated_token_major
-from ..ops.ssm.causal_conv1d_fwd import causal_conv1d_fwd
-from ..sm107_parts.constants import K3Sm107Constants
 from ..sm107_parts.layers import (
     Bf16Linear,
     Fp8BlockScaleLinear,
-    LamportPending,
     RMSNormWeight,
     ShortConvWeight,
-    TpAllReduce,
-    finish_lamport_push,
     fork_join,
-    lamport_push_target,
-    lamport_push_tensor,
 )
 
 # Prefill chunk of the kda_prefill entry.
@@ -124,19 +110,6 @@ _KDA_BFA_MULTISTREAM_MAX_ROWS = 128
 # at most 16 heads (the Helix head shards); other shapes keep the [f_a | b] -> f_b chain.
 _KDA_FAB_FUSED_MAX_ROWS = 256
 _KDA_FUSED_FB_LOWM_ROWS = 224
-# Decode verify with the target's ``kda_l2_prefetch``: once this layer's QKVG projection and
-# [f_a | b] kernel are done, the projection aux stream prefetches the next KDA layer's QKVG,
-# [f_a | b], f_b and o_proj weights into L2 (k3_l2_prefetch) while this layer's recurrence and
-# all-reduce leave HBM idle. Hints only: no result depends on them. Up to
-# _KDA_L2_PREFETCH_MAX_ROWS verify rows: the prefetched lines stay in L2 through the MoE block,
-# whose weight streams then run about 1 % slower. The prefetch kernel stays on the aux stream,
-# which the MoE block of the same layer reuses for its shared experts and joins back; no
-# main-stream kernel waits for it.
-_KDA_L2_PREFETCH_MAX_ROWS = 16
-# KDA mixers of one model by layer index (keyed by the model's text config), for the prefetch of
-# the next KDA layer's weights.
-_KDA_LAYERS: Dict[int, "weakref.WeakValueDictionary[int, K3KDALinearAttention]"] = {}
-
 _FP8_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "g_proj", "o_proj")
 _QKVG_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "g_proj")
 
@@ -366,26 +339,10 @@ class K3KDALinearAttention(nn.Module):
         self,
         cfg,
         layer_idx: int,
-        mapping=None,
-        allreduce_strategy=AllReduceStrategy.AUTO,
         aux_stream: Optional[torch.cuda.Stream] = None,
         model_config: Optional[ModelConfig] = None,
-        reduce_output: bool = True,
-        *,
-        constants: K3Sm107Constants,
     ) -> None:
         super().__init__()
-        # The post-convolution kernel writes a single unaligned prefill sequence's Q/K/V/beta
-        # zero-padded to the prefill op's chunk instead of the op padding copies of them.
-        self._prepad_prefill = constants.kda_prepad_prefill
-        # Prefill: the short convolution (with its conv-pool read and write-back), SiLU, Q/K L2
-        # norm and the Q/K/V layout change run as one Triton pass over the QKVG projection output
-        # (fused_kda_conv_prefill) instead of extract_transpose_prefill_slice + causal_conv1d_fwd
-        # + fused_kda_post_conv.
-        self._fused_conv_prefill = constants.kda_fused_conv_prefill
-        # Decode verify: prefetch the next KDA layer's weights into L2 (see
-        # ``_KDA_L2_PREFETCH_MAX_ROWS``).
-        self._l2_prefetch = constants.kda_l2_prefetch
         lin = cfg.linear_attn_config
         _check_kda_shape(lin)
         self.hidden_size = cfg.hidden_size
@@ -396,28 +353,10 @@ class K3KDALinearAttention(nn.Module):
         self.gate_lower_bound = lin["gate_lower_bound"]
         self.rms_norm_eps = cfg.rms_norm_eps
 
-        if mapping is not None and mapping.tp_size > 1 and not mapping.enable_attention_dp:
-            self._kda_tp_size = mapping.tp_size
-        else:
-            self._kda_tp_size = 1
-        self._kda_tp_rank = mapping.tp_rank if self._kda_tp_size > 1 else 0
-        # reduce_output=False returns the row-sharded o_proj partials; the
-        # caller owns the reduction (helix_a2a reduce-scatters them).
-        self._o_allreduce = (
-            TpAllReduce(mapping, torch.bfloat16, allreduce_strategy)
-            if self._kda_tp_size > 1 and reduce_output
-            else None
-        )
-        # Set by the decoder layer for one forward: a pushed o_proj all-reduce may be returned
-        # unfinished, as a LamportPending that A_mid finishes.
-        self.ar_finish_deferred = False
-
-        num_heads = lin["num_heads"]
-        if num_heads % self._kda_tp_size != 0:
-            raise ValueError(
-                f"KDA num_heads {num_heads} not divisible by tp_size {self._kda_tp_size}"
-            )
-        self.num_heads = num_heads // self._kda_tp_size
+        # One rank: every head, no o_proj all-reduce.
+        self._kda_tp_size = 1
+        self._kda_tp_rank = 0
+        self.num_heads = lin["num_heads"]
         projection_size = self.num_heads * self.head_dim
         self.proj_size = projection_size
 
@@ -479,20 +418,11 @@ class K3KDALinearAttention(nn.Module):
         self._projection_join_event = torch.cuda.Event()
         # Output buffer of the in-place decode kernel outside breakable CUDA graphs.
         self._o_dense: Optional[torch.Tensor] = None
-        # [3D, W] BF16 conv weight of causal_conv1d_fwd, its [W, 3D] copy for
-        # fused_kda_conv_prefill, and the fp32 [D, W] weights of the verify kernels.
+        # The [W, 3D] BF16 conv weight of fused_kda_conv_prefill (from the packed [3D, W] one) and
+        # the fp32 [D, W] weights of the verify kernels.
         self._packed_conv_weight: Optional[torch.Tensor] = None
         self._fused_conv_weight_t: Optional[torch.Tensor] = None
         self._mtp_conv_weights: Optional[Tuple[torch.Tensor, ...]] = None
-        # L2 prefetch of the next KDA layer's projection weights (``kda_l2_prefetch``).
-        self._kda_group = _KDA_LAYERS.setdefault(id(cfg), weakref.WeakValueDictionary())
-        self._kda_group[layer_idx] = self
-        self._l2_prefetch_ranges_cache: Optional[List[Tuple[int, int]]] = None
-        self._l2_prefetch_start = torch.cuda.Event()
-        # Set by the decoder layer for the next forward only (the target's ``attn_res_mxfp8``): the
-        # MXFP8 form ``(xq, xs)`` of the generation rows, which the fused QKVG projection of the
-        # verify path consumes instead of quantizing the BF16 rows (see qkvg_takes_mxfp8).
-        self.next_input_mxfp8: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
         self.register_to_config = False
         self.layer_idx_str = str(layer_idx)
@@ -606,9 +536,8 @@ class K3KDALinearAttention(nn.Module):
             for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d)
         )
         self._packed_conv_weight = torch.cat(conv_weights, dim=0).to(torch.bfloat16).contiguous()
-        if self._fused_conv_prefill:
-            # Channel-contiguous taps load in the input tile's layout in the fused kernel.
-            self._fused_conv_weight_t = self._packed_conv_weight.t().contiguous()
+        # Channel-contiguous taps load in the input tile's layout in the fused kernel.
+        self._fused_conv_weight_t = self._packed_conv_weight.t().contiguous()
         self._mtp_conv_weights = tuple(weight.float().contiguous() for weight in conv_weights)
 
     def _require_finalized(self) -> None:
@@ -619,39 +548,6 @@ class K3KDALinearAttention(nn.Module):
             )
 
     # ------------------------------------------------------------------
-    # MXFP8 hand-off of the decoder layer (the target's ``attn_res_mxfp8``).
-    # ------------------------------------------------------------------
-
-    def qkvg_takes_mxfp8(self, num_rows: int) -> bool:
-        """Whether the fused FP8 QKVG projection of ``num_rows`` rows can take their MXFP8 form
-        (``next_input_mxfp8``) instead of the BF16 rows: it runs the low-M kernel on them (or the
-        staged kernel above the low-M cut-over, :meth:`qkvg_stages_weights`)."""
-        takes = getattr(self.qkvg_proj, "takes_mxfp8_input", None)
-        if takes is None:
-            return False
-        return takes(num_rows) or self.qkvg_stages_weights(num_rows) or self.qkvg_mx_atom(num_rows)
-
-    def qkvg_mx_atom(self, num_rows: int) -> bool:
-        """Whether the fused QKVG projection takes the MXFP8 rows with the scales in the mid-M
-        GEMM's layout (``takes_mid_mxfp8_input``)."""
-        takes_mid = getattr(self.qkvg_proj, "takes_mid_mxfp8_input", None)
-        return takes_mid is not None and bool(takes_mid(num_rows))
-
-    def qkvg_stages_weights(self, num_rows: int) -> bool:
-        """Whether the fused QKVG projection of ``num_rows`` MXFP8 rows stages its weights on chip
-        before its ``griddepcontrol.wait``: then the attn_res in front of it may release it at
-        kernel entry.
-
-        On the MXFP8 hand-off (``next_input_mxfp8``) of a decode verify the fused QKVG low-M GEMM
-        keeps its whole weight slice on chip before its wait (k3_fp8w_lowm_mxfp8.staged_mx_tactic;
-        the same bits), also for 33 to 64 rows, and the pre-attention attn_res in front of it
-        releases it at kernel entry, so its CTAs stream the QKVG weights while the attn_res and the
-        latent-up GEMM before it still run. The L2 prefetch of the next KDA layer's weights
-        (:meth:`_issue_l2_prefetch`) is skipped where the next layer stages them."""
-        takes = getattr(self.qkvg_proj, "takes_staged_mxfp8_input", None)
-        return takes is not None and takes(num_rows)
-
-    # ------------------------------------------------------------------
     # Forward.
     # ------------------------------------------------------------------
 
@@ -660,9 +556,7 @@ class K3KDALinearAttention(nn.Module):
     ) -> torch.Tensor:
         """Select the eager path or breakable-CUDA-graph path.
 
-        Returns the o_proj output (all-reduced under head TP), or with the Lamport push
-        (``_project_output``) a ``LamportPending`` for the decoder layer's
-        A_mid.
+        Returns the o_proj output.
         """
         if self.register_to_config and is_in_breakable_cuda_graph():
             core = hidden_states.new_empty(
@@ -670,15 +564,9 @@ class K3KDALinearAttention(nn.Module):
                 dtype=torch.bfloat16,
             )
             maybe_bcg_kda_core_inplace(hidden_states, self.layer_idx_str, core)
-            self.next_input_mxfp8 = None
             return self._project_output(core)
 
-        core = self._forward_impl(hidden_states, attn_metadata)
-        # The MXFP8 rows of the decoder layer serve this forward only (consumed by the verify
-        # projection, if it ran).
-        self.next_input_mxfp8 = None
-        # The push serves the one o_proj call of a generation-only batch.
-        return self._project_output(core, allow_ar_push=attn_metadata.num_contexts == 0)
+        return self._project_output(self._forward_impl(hidden_states, attn_metadata))
 
     def _forward_impl(
         self,
@@ -771,57 +659,11 @@ class K3KDALinearAttention(nn.Module):
             return output
         return cores[0] if len(cores) == 1 else torch.cat(cores, dim=0)
 
-    def _project_output(
-        self,
-        core: Union[torch.Tensor, _KdaPrequantizedCore],
-        allow_ar_push: bool = False,
-    ) -> Union[torch.Tensor, LamportPending]:
-        """o_proj on the post-o_norm core, then the head-TP all-reduce of its partials.
-
-        ``allow_ar_push`` (generation-only batches, outside breakable CUDA graphs): o_proj stores
-        its partial straight into the all-reduce's Lamport buffers where the low-M GEMM serves it
-        (``o_proj.next_ar_push``); the decoder layer's ``ar_finish_deferred`` then makes this
-        return a ``LamportPending``.
-        """
-        num_rows = core.activation.shape[0] if isinstance(core, tuple) else core.shape[0]
-        ar_push = None
-        if allow_ar_push and self._o_allreduce is not None and hasattr(self.o_proj, "next_ar_push"):
-            ar_push = lamport_push_target(
-                self._o_allreduce,
-                num_rows,
-                self.hidden_size,
-                deferred=self.ar_finish_deferred,
-            )
-            self.o_proj.next_ar_push = ar_push
-
+    def _project_output(self, core: Union[torch.Tensor, _KdaPrequantizedCore]) -> torch.Tensor:
+        """o_proj on the post-o_norm core (the BF16 rows, or the verify epilogue's MXFP8 form)."""
         if isinstance(core, _KdaPrequantizedCore):
-            out = self.o_proj.forward_prequantized(core.activation, core.scale)
-        else:
-            out = self.o_proj(core.reshape(-1, self.proj_size))
-
-        if ar_push is not None:
-            self.o_proj.next_ar_push = None
-        if ar_push is not None and ar_push.pushed:
-            # The decoder layer sets ar_finish_deferred where A_mid finishes the all-reduce: then
-            # this returns a LamportPending.
-            out_shape = out.shape
-            out = finish_lamport_push(
-                self._o_allreduce,
-                ar_push,
-                deferred=self.ar_finish_deferred,
-            )
-            if not isinstance(out, LamportPending):
-                out = out.view(out_shape)
-        elif ar_push is not None and ar_push.deferred:
-            # o_proj ran without the push epilogue (e.g. the MXFP8 GEMM on the prequantized
-            # verify output); a copy kernel pushes it and A_mid finishes.
-            lamport_push_tensor(self._o_allreduce, ar_push, out.reshape(ar_push.output.shape))
-            out = finish_lamport_push(self._o_allreduce, ar_push, deferred=True)
-        elif self._o_allreduce is not None:
-            # Head-sharded TP: every rank ran its head shard on the same
-            # local batch; sum the row-sharded o_proj partials.
-            out = self._o_allreduce(out)
-        return out
+            return self.o_proj.forward_prequantized(core.activation, core.scale)
+        return self.o_proj(core.reshape(-1, self.proj_size))
 
     def _sync_kda_replay_conv_window(self, layer_cache, slot_indices, conv_pool) -> None:
         """Seed the fused verify kernel's replay conv caches from the live committed conv pool.
@@ -842,21 +684,15 @@ class K3KDALinearAttention(nn.Module):
         bfa = F.linear(x, self._bfa_proj_weight)
         return bfa[..., hd : hd + H], F.linear(bfa[..., :hd], self.f_b_proj.weight)
 
-    def _project_packed_conv_input(
-        self, x: torch.Tensor, token_major: bool
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _project_packed_conv_input(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(conv_input, onorm_g)`` of the prefill rows ``x`` ``[1, T, hidden]``: the QKVG GEMM,
-        its ``[q | k | v]`` columns as a ``[T, 3D]`` view (``token_major``, for
-        ``fused_kda_conv_prefill``) or repacked channel-major ``[3D, T]``
-        (``extract_transpose_prefill_slice``, for ``causal_conv1d_fwd``), and its output-gate
-        columns."""
+        its ``[q | k | v]`` columns as a ``[T, 3D]`` view (for ``fused_kda_conv_prefill``), and
+        its output-gate columns."""
         d = self.proj_size
         qkvg = self.qkvg_proj(x)
         onorm_g = qkvg[..., 3 * d : 4 * d]
         qkvg_2d = qkvg.squeeze(0)
-        if token_major:
-            return qkvg_2d[:, : 3 * d], onorm_g
-        return extract_transpose_prefill_slice(qkvg_2d, qkvg_2d.shape[0], 0, 3 * d), onorm_g
+        return qkvg_2d[:, : 3 * d], onorm_g
 
     def forward_prefill(
         self,
@@ -873,10 +709,9 @@ class K3KDALinearAttention(nn.Module):
     ) -> torch.Tensor:
         """Prefill ``num_prefills`` packed sequences and update their conv / recurrent rows.
 
-        The convolution is ``fused_kda_conv_prefill`` (``kda_fused_conv_prefill``) or
-        ``causal_conv1d_fwd`` + ``fused_kda_post_conv``; Q/K leave it L2-normalized for
-        ``kda_prefill``. A single unaligned sequence is chunk-padded by the
-        post-convolution kernel (``kda_prepad_prefill``) or by the op. A BF16 state pool
+        The convolution is ``fused_kda_conv_prefill``; Q/K leave it L2-normalized for
+        ``kda_prefill``. A single unaligned sequence is chunk-padded by that kernel (with beta)
+        where beta is unit-stride, else by the op. A BF16 state pool
         (and every in-forward snapshot plan) is staged through an fp32 copy; a ``kda_snapshot``
         plan also stores mid-chunk states and convolution windows.
         """
@@ -906,14 +741,13 @@ class K3KDALinearAttention(nn.Module):
                 "cache manager's staging views"
             )
 
-        fused_conv = self._fused_conv_prefill
-        packed_conv, onorm_g = self._project_packed_conv_input(x, token_major=fused_conv)
+        packed_conv, onorm_g = self._project_packed_conv_input(x)
         snapshot_windows = None
         if snapshot is not None:
             # The window is read before the convolution below, which may overwrite its input in
             # place. A live slot's window still feeds that convolution; it is swapped after it.
             snapshot_windows = _snapshot_conv_windows(
-                packed_conv, conv_pool, snapshot, token_major=fused_conv
+                packed_conv, conv_pool, snapshot, token_major=True
             )
             if inforward_stage is None:
                 conv_pool.index_copy_(0, snapshot.slots, snapshot_windows)
@@ -930,31 +764,14 @@ class K3KDALinearAttention(nn.Module):
             slot_indices,
             snapshot=snapshot,
         )
-        if not fused_conv:
-            # The convolution input is a contiguous channel-major [3D, T] copy: the op writes
-            # its output over it.
-            causal_conv1d_fwd(
-                packed_conv,
-                self._packed_conv_weight,
-                None,
-                conv_pool,
-                mamba_metadata.query_start_loc[: num_prefills + 1],
-                mamba_metadata.state_indices[:num_prefills],
-                has_init,
-                True,
-                PAD_SLOT_ID,
-            )
-
-        # The prefill op needs a single unaligned sequence zero-padded to a chunk multiple.
-        # ``kda_prepad_prefill`` produces Q/K/V/beta at that length directly instead of
-        # padding copies; g needs no pad because the op rebuilds g's sentinel tail from the
-        # real prefix.
+        # The prefill op needs a single unaligned sequence zero-padded to a chunk multiple. The
+        # convolution kernel produces Q/K/V/beta at that length directly instead of padding
+        # copies; g needs no pad because the op rebuilds g's sentinel tail from the real prefix.
         num_tokens = x2d.shape[0]
         padded_tokens = None
         single_sequence_length = getattr(mamba_metadata, "kda_single_sequence_length", None)
         if (
-            self._prepad_prefill
-            and num_prefills == 1
+            num_prefills == 1
             and single_sequence_length is not None
             and single_sequence_length == num_tokens
             and num_tokens % _PREFILL_CHUNK != 0
@@ -964,47 +781,30 @@ class K3KDALinearAttention(nn.Module):
         beta, g = self._project_gate_inputs(x)
         g = g.unflatten(-1, (self.num_heads, self.head_dim))
 
-        # Imported here: these entries import this package's kernels, and the package imports
-        # this module.
+        # Imported here: the entry imports this package's kernels, and the package imports this
+        # module.
         from ..ops.ssm.fused_kda_conv_prefill import fused_kda_conv_prefill
-        from ..ops.ssm.fused_kda_post_conv import fused_kda_post_conv
 
-        if fused_conv:
-            prepad_beta = padded_tokens is not None and beta.stride(-1) == 1
-            if not prepad_beta:
-                beta = beta.float()
-            outputs = fused_kda_conv_prefill(
-                packed_conv,
-                self._fused_conv_weight_t.t(),
-                conv_pool,
-                query_start_loc=mamba_metadata.query_start_loc[: num_prefills + 1],
-                cache_indices=mamba_metadata.state_indices[:num_prefills],
-                has_initial_state=has_init,
-                num_heads=self.num_heads,
-                head_dim=self.head_dim,
-                padded_tokens=padded_tokens if prepad_beta else None,
-                beta=beta if prepad_beta else None,
-                normalize_qk=True,
-            )
-            if prepad_beta:
-                q, k, v, beta = outputs
-            else:
-                q, k, v = outputs
-        elif padded_tokens is not None and beta.stride(-1) == 1 and packed_conv.is_contiguous():
-            q, k, v, beta = fused_kda_post_conv(
-                packed_conv,
-                num_heads=self.num_heads,
-                head_dim=self.head_dim,
-                padded_tokens=padded_tokens,
-                beta=beta,
-            )
-        else:
+        prepad_beta = padded_tokens is not None and beta.stride(-1) == 1
+        if not prepad_beta:
             beta = beta.float()
-            q, k, v = fused_kda_post_conv(
-                packed_conv,
-                num_heads=self.num_heads,
-                head_dim=self.head_dim,
-            )
+        outputs = fused_kda_conv_prefill(
+            packed_conv,
+            self._fused_conv_weight_t.t(),
+            conv_pool,
+            query_start_loc=mamba_metadata.query_start_loc[: num_prefills + 1],
+            cache_indices=mamba_metadata.state_indices[:num_prefills],
+            has_initial_state=has_init,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            padded_tokens=padded_tokens if prepad_beta else None,
+            beta=beta if prepad_beta else None,
+            normalize_qk=True,
+        )
+        if prepad_beta:
+            q, k, v, beta = outputs
+        else:
+            q, k, v = outputs
 
         o = self._prefill_recurrence(
             q,
@@ -1313,17 +1113,13 @@ class K3KDALinearAttention(nn.Module):
         ``gate_from_fa`` and the f_a-mode fab kernel served these rows (``forget_gate`` is then
         None and the verify kernel computes it), else None.
 
-        The QKVG GEMM takes the decoder layer's MXFP8 rows (``next_input_mxfp8``,
-        ``attn_res_mxfp8``) where they were handed over, staging its weights. The gate is
+        The gate is
         ``k3_kda_fab_fa`` (f_a mode), ``k3_kda_fab_proj`` (beta and the forget gate) where they
         accept the shapes, else ``F.linear`` ``[f_a | b]`` -> ``f_b``.
         """
         fused_qkvg = self.qkvg_proj
-        mxfp8_input, self.next_input_mxfp8 = self.next_input_mxfp8, None
 
         def _project_qkvg() -> torch.Tensor:
-            if mxfp8_input is not None:
-                return fused_qkvg.forward_mxfp8(x, *mxfp8_input, stage_weights=True)
             return fused_qkvg(x)
 
         bfa_weight = self._bfa_proj_weight
@@ -1377,62 +1173,6 @@ class K3KDALinearAttention(nn.Module):
             return q_proj, k_proj, v_proj, None, beta, onorm_g, gate
         return q_proj, k_proj, v_proj, gate, beta, onorm_g, None
 
-    def _next_kda_layer(self) -> Optional["K3KDALinearAttention"]:
-        """The KDA mixer of the next KDA layer of this model, if any."""
-        later = [idx for idx in self._kda_group.keys() if idx > self.layer_idx]
-        return self._kda_group.get(min(later)) if later else None
-
-    def l2_prefetch_ranges(self) -> List[Tuple[int, int]]:
-        """``(address, bytes)`` of the weights the fused verify path streams from HBM: the QKVG
-        and o_proj weights and scales, ``[f_a | b]`` and ``f_b``."""
-        if self._l2_prefetch_ranges_cache is None:
-            from ..kernels.k3r_kda.k3_l2_prefetch import MAX_RANGES, tensor_range
-
-            tensors = []
-            for module in (self.qkvg_proj, self.o_proj):
-                if module is not None:
-                    tensors += [
-                        getattr(module, "weight", None),
-                        getattr(module, "weight_scale", None),
-                    ]
-            tensors += [self._bfa_proj_weight, self.f_b_proj.weight]
-            ranges = []
-            for tensor in tensors:
-                if isinstance(tensor, torch.Tensor) and tensor.is_cuda and tensor.numel():
-                    try:
-                        ranges.append(tensor_range(tensor))
-                    except ValueError:
-                        continue
-            self._l2_prefetch_ranges_cache = ranges[:MAX_RANGES]
-        return self._l2_prefetch_ranges_cache
-
-    def _issue_l2_prefetch(self, num_rows: int) -> None:
-        """Prefetch the next KDA layer's weights into L2 from the projection aux stream, after the
-        projections of this layer (see ``_KDA_L2_PREFETCH_MAX_ROWS``)."""
-        if (
-            not self._l2_prefetch
-            or num_rows > _KDA_L2_PREFETCH_MAX_ROWS
-            or self._projection_aux_stream is None
-            or not do_multi_stream()
-        ):
-            return
-        nxt = self._next_kda_layer()
-        if nxt is not None and nxt.qkvg_stages_weights(num_rows):
-            # The next layer streams its QKVG weights on chip itself.
-            return
-        ranges = nxt.l2_prefetch_ranges() if nxt is not None else []
-        if not ranges:
-            return
-        from ..ops.ssm.k3_l2_prefetch import k3_l2_prefetch
-
-        # Recorded after the [f_a | b] join: the prefetch starts once QKVG and [f_a | b] are done
-        # (both read their weights from HBM), i.e. under the recurrence. The aux stream is joined
-        # back by its next user (see _KDA_L2_PREFETCH_MAX_ROWS).
-        self._l2_prefetch_start.record()
-        with torch.cuda.stream(self._projection_aux_stream):
-            self._l2_prefetch_start.wait()
-            k3_l2_prefetch(ranges)
-
     def forward_verify_fused(
         self,
         x2d,
@@ -1478,7 +1218,6 @@ class K3KDALinearAttention(nn.Module):
         q_proj, k_proj, v_proj, forget_gate, beta_proj, onorm_g, f_a = self._project_verify_inputs(
             x, T_total, gate_from_fa=not mxfp8_output
         )
-        self._issue_l2_prefetch(T_total)
         x_q = q_proj.view(1, T_total, H, K)
         x_k = k_proj.view(1, T_total, H, K)
         x_v = v_proj.view(1, T_total, H, self.head_dim)
