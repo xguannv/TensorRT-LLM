@@ -79,6 +79,10 @@ RUNTIME_INTERFACES: Dict[str, Tuple[object, str]] = {
     ),
     f"{_FP4_MLA}.layout": ("*", "FP4 MLA KV cache layout contract (as above)"),
     f"{_FP4_MLA}.metadata": ("*", "FP4 MLA KV cache page-table metadata contract (as above)"),
+    f"{_FP4_MLA}.packed_plan": (
+        "*",
+        "the packed decode plan geometry the metadata contract builds every step (as above)",
+    ),
     "tensorrt_llm._torch.modules.kimi_kda.cache_manager": (
         {"KimiK3HybridCacheManager", "KDAReplayState"},
         "the KV cache manager the engine builds for K3 (README: 'the KV cache managers'); "
@@ -116,21 +120,6 @@ RUNTIME_INTERFACE_HOMES: Dict[str, str] = {
 #: V1 code still imported, by the line of the K3 v2 plan that replaces it:
 #: module -> (symbols or "*", owner). Delete an entry with the import.
 PENDING: Dict[str, Tuple[object, str]] = {
-    # fam_attn: MLA through TrtllmAttention, and the FP4 MLA kernels / helpers beyond the
-    # layout contract.
-    _ATTENTION: (
-        {"AttentionForwardArgs", "AttentionInputType", "TrtllmAttention"},
-        "fam_attn",
-    ),
-    f"{_ATTENTION}.interface": (
-        {"PredefinedAttentionMask", "PositionalEmbeddingParams", "RopeParams"},
-        "fam_attn",
-    ),
-    f"{_ATTENTION}.utils": ({"create_attention"}, "fam_attn"),
-    f"{_FP4_MLA}.cache_update": ("*", "fam_attn"),
-    f"{_FP4_MLA}.fp4_mla_kernels": ("*", "fam_attn"),
-    f"{_FP4_MLA}.packed_plan": ("*", "fam_attn"),
-    f"{_FP4_MLA}.v_cache": ("*", "fam_attn"),
     # fam_moe: the MegaMoE module layer, the CuTe DSL MoE AutoTuner runner adapters, and the
     # routing + moe_sort kernel (not in the reference 084745cde4; keep it or drop it).
     "tensorrt_llm._torch.moe.fused_moe": (
