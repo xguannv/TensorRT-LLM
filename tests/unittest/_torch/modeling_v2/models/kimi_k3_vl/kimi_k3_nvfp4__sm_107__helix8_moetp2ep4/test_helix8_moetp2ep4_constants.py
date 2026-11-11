@@ -70,7 +70,7 @@ def test_target_class_declares_its_constants_and_no_model_defaults():
     import importlib
 
     module = importlib.import_module(f"{_FAMILY}.{_TARGET}.modeling")
-    family = importlib.import_module(f"{_FAMILY}.sm107_parts.modeling")
+    family = importlib.import_module(f"{_FAMILY}.sm107_helix8_parts.modeling")
     cls = getattr(module, _CLASS)
     assert issubclass(cls, family.KimiK3Sm107ForConditionalGeneration)
     assert cls.K3_CONSTANTS is importlib.import_module(f"{_FAMILY}.{_TARGET}.constants").CONSTANTS

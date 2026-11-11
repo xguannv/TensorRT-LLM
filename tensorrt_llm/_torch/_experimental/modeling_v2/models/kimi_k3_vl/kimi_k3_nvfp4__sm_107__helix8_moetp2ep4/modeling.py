@@ -5,7 +5,7 @@
 Serves generation over Helix CP8 (tp 1, no attention DP), the routed experts split MoE TP2 x EP4
 on CUTEDSL_FC12: the c240 recipe.
 
-The model is the family's SM107 code (``sm107_parts/``), run with this target's constants
+The model is the helix8 targets' SM107 glue (``sm107_helix8_parts/``), built for these constants
 (``constants.py``).
 
 Engine settings (block reuse, page size) are the recipe's: the model loader applies model defaults of
@@ -18,8 +18,8 @@ from typing import ClassVar
 
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 
+from ..sm107_helix8_parts.modeling import KimiK3Sm107ForConditionalGeneration
 from ..sm107_parts.constants import K3Sm107Constants
-from ..sm107_parts.modeling import KimiK3Sm107ForConditionalGeneration
 from .constants import CONSTANTS
 
 
