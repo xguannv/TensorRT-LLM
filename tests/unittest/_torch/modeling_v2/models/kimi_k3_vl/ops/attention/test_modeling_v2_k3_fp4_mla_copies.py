@@ -29,6 +29,14 @@ SOURCES = (
     "fp4_mla_kernels",
     "fp4_mla_triton",
 )
+# Copied definitions whose source reads an environment override the K3 targets do not take; the copy keeps
+# the source's default path, so it is checked only for not reading the environment.
+ENV_FREE_DEFINITIONS = {
+    "_select_triton_block_v": "TRTLLM_FP4_MLA_BLOCK_V",
+    "_triton_prepack_v_enabled": "TRTLLM_FP4_MLA_PREPACK_V / TRTLLM_FP4_MLA_TRITON_PREPACK_V",
+    "_triton_v_packed_attr": "TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE",
+    "_set_triton_v_packed_cache_valid": "TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE",
+}
 WHOLE_COPIES = {
     "_k3_fp4_mla_v_repack": "fp4_mla_cutedsl_v_repack",
     "_k3_fp4_mla_cute_dsl_utils": "cute_dsl_utils",
@@ -83,6 +91,12 @@ def test_copied_definitions_match_their_sources(copy):
     assert copied
     for name, node in copied.items():
         assert name in sources, f"{copy}.{name} has no source definition"
+        if name in ENV_FREE_DEFINITIONS:
+            text = ast.unparse(node)
+            assert "environ" not in text and "getenv" not in text and "_env_" not in text, (
+                f"{copy}.{name} reads the environment"
+            )
+            continue
         matches = [
             src
             for src, src_node in sources[name]

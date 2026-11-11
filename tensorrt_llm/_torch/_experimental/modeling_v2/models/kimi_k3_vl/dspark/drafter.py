@@ -262,6 +262,9 @@ def dspark_markov_chain(
 
 k3_dspark_mla_ctx_norm_rope = None
 if IS_CUTLASS_DSL_AVAILABLE:
+    # Registers torch.ops.trtllm.cute_dsl_dspark_rope_into, the block decode's query RoPE.
+    import tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op  # noqa: F401
+
     # The DSpark RMSNorm + RoPE kernel compiled for row-strided input, and the one-launch
     # context-latent RMSNorm + RoPE of ``tail_v2``.
     from ..ops.spec.k3_dspark_mla_ctx_norm_rope import k3_dspark_mla_ctx_norm_rope

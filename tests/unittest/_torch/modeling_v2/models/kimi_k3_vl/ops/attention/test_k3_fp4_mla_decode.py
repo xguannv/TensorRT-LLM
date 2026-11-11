@@ -21,15 +21,25 @@ untouched). On SM107: the decode against the FP4 MLA backend's decode of the sam
 rows under each target's settings (``page_plan`` / ``reduce_pdl``), and the reduction's
 programmatic launch bitwise.
 
-The FP4 cache helpers are those of ``test_k3_mla_q_fused.py`` (same directory).
+The FP4 cache helpers are those of ``kernels/k3r_mla_q/test_k3_mla_q_fused.py``.
 """
 
+import importlib.util
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 PLAN_WS = "_k3_fp4_mla_packed_plan"
+_Q_FUSED_TEST = Path(__file__).resolve().parents[2] / "kernels/k3r_mla_q/test_k3_mla_q_fused.py"
+
+
+def _q_fused_helpers():
+    spec = importlib.util.spec_from_file_location("_k3_mla_q_fused_helpers", _Q_FUSED_TEST)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _decode():
@@ -233,7 +243,7 @@ _SEQ_LENS = {
 def _decode_case(seq_lens, seed, helix):
     """Real FP4 cache with this step's query rows written by the cache update; returns
     (manager, metadata, qf module)."""
-    import test_k3_mla_q_fused as qf
+    qf = _q_fused_helpers()
 
     if qf.k3_decode_unavailable():
         pytest.skip("needs an SM107 GPU and a CuTe DSL that builds the FP4 MLA decode kernels")
