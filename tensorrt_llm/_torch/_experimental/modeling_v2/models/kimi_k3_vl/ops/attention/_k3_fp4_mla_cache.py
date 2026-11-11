@@ -11,7 +11,6 @@ the KV-cache-manager contract modules (config, layout, metadata, packed_plan, st
 """
 
 import copy
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 
@@ -37,8 +36,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
     FP4_MLA_TOKENS_PER_BLOCK,
     HP_BLOCK_SIZE,
     _ceil_div,
-    _env_enabled_default,
-    _env_int,
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
     _fp4_mla_packed_rows_per_seq,
@@ -1281,19 +1278,7 @@ def load_fp4_mla_chunked_kv_cache(
     return compressed_kv, k_pe
 
 
-def _shared_v_pack_storage_enabled() -> bool:
-    return os.getenv("TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE", "1").lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
-
-
 def _select_triton_block_v(num_queries: int, *, prefer_prepacked_v: bool = False) -> int:
-    env_block_v = _env_int("TRTLLM_FP4_MLA_BLOCK_V")
-    if env_block_v is not None:
-        return env_block_v
     if prefer_prepacked_v:
         return 128
     return 32 if num_queries <= 32 else 128
@@ -1435,10 +1420,7 @@ def _v_packed_cache_tag(
 
 
 def _triton_prepack_v_enabled() -> bool:
-    if _fp4_mla_attention_backend() != "triton":
-        return False
-    default = _env_enabled_default("TRTLLM_FP4_MLA_PREPACK_V", True)
-    return _env_enabled_default("TRTLLM_FP4_MLA_TRITON_PREPACK_V", default)
+    return _fp4_mla_attention_backend() == "triton"
 
 
 def _triton_can_prepack_v(v_head_dim: int, page_size: int, block_v: int) -> bool:
@@ -1452,13 +1434,9 @@ def _triton_can_prepack_v(v_head_dim: int, page_size: int, block_v: int) -> bool
 
 
 def _triton_v_packed_attr(layer_idx: int) -> str:
-    if _shared_v_pack_storage_enabled():
-        return "_fp4_mla_triton_attention_v_packed_buf"
-    return f"_fp4_mla_triton_attention_v_packed_buf_l{layer_idx}"
-
-
-def _triton_v_packed_valid_attr(layer_idx: int) -> str:
-    return f"_fp4_mla_triton_attention_v_packed_valid_l{layer_idx}"
+    """The V-packed buffer every layer shares (one layer's V is packed at a time)."""
+    del layer_idx
+    return "_fp4_mla_triton_attention_v_packed_buf"
 
 
 def _triton_shared_v_packed_valid_attr() -> str:
@@ -1503,11 +1481,7 @@ def _set_triton_v_packed_cache_valid(
     page_ids: Optional[torch.Tensor] = None,
     block_v: int = 128,
 ) -> None:
-    valid_attr = (
-        _triton_shared_v_packed_valid_attr()
-        if _shared_v_pack_storage_enabled()
-        else _triton_v_packed_valid_attr(layer_idx)
-    )
+    valid_attr = _triton_shared_v_packed_valid_attr()
     metadata.fp4_mla_state.v_packed_cache_tags[valid_attr] = _triton_v_packed_cache_tag(
         layer_idx,
         kv_cache,
