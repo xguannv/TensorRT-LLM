@@ -15,6 +15,8 @@ function level, absolute and relative, and string arguments of ``importlib.impor
 * ``RUNTIME_INTERFACES``: the runtime interfaces the family declares it uses, each with the
   reason. Symbol lists are exact; ``"*"`` takes the whole module (only the FP4 MLA KV cache
   layout contract, which ``Fp4MlaKVCacheManagerV2`` owns).
+* ``MOE_KERNELS``: kernels and their custom ops that live under ``_torch/moe/`` but are not
+  the fused MoE layer (``fused_moe/``) the rule forbids, with exact symbol lists.
 * ``PENDING``: V1 code another line of the K3 v2 plan is still replacing, with that line's
   name. An entry no import needs any more fails ``test_no_stale_pending``, so the list only
   shrinks; it is empty when the plan is done.
@@ -117,26 +119,30 @@ RUNTIME_INTERFACE_HOMES: Dict[str, str] = {
     "tensorrt_llm._torch.modules.multi_stream_utils": "common/multi_stream.py",
 }
 
+#: Kernels under ``_torch/moe/`` (not the fused MoE layer): module -> (symbols, reason).
+MOE_KERNELS: Dict[str, Tuple[object, str]] = {
+    "tensorrt_llm._torch.moe.kernels.rubin.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12": (
+        {"Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel"},
+        "the SM107 fused FC1+FC2 CuTe DSL kernel K3Fc12Runner launches",
+    ),
+    "tensorrt_llm._torch.moe.custom_ops": (
+        {"cute_dsl_megamoe_custom_op"},
+        "the MegaMoE CuTe DSL op the dep16 target launches (availability probe)",
+    ),
+    "tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op": (
+        {
+            "megamoe_activation_sf_bytes_per_row",
+            "run_cute_dsl_megamoe_nvfp4_blackwell",
+            "set_active_megamoe_cute_buffer_cache",
+            "set_active_megamoe_cute_weight_cache",
+        },
+        "the MegaMoE CuTe DSL op: its launch, buffer / weight cache binding and SF row size",
+    ),
+}
+
 #: V1 code still imported, by the line of the K3 v2 plan that replaces it:
 #: module -> (symbols or "*", owner). Delete an entry with the import.
-PENDING: Dict[str, Tuple[object, str]] = {
-    # fam_moe: the MegaMoE module layer, the CuTe DSL MoE AutoTuner runner adapters, and the
-    # routing + moe_sort kernel (not in the reference 084745cde4; keep it or drop it).
-    "tensorrt_llm._torch.moe.fused_moe": (
-        {"ConfigurableMoE", "SiTuActivation", "create_moe"},
-        "fam_moe",
-    ),
-    "tensorrt_llm._torch.moe.fused_moe.routing": ({"DeepSeekV3MoeRoutingMethod"}, "fam_moe"),
-    "tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12": (
-        {"CuteDslFc12FusedMoENvfp4Runner"},
-        "fam_moe",
-    ),
-    "tensorrt_llm._torch.moe.fused_moe.cutedsl.runners": (
-        {"CuteDslFusedMoENvfp4Runner"},
-        "fam_moe",
-    ),
-    "tensorrt_llm._torch.moe.kernels.blackwell": ({"kimi_k3_routing"}, "fam_moe"),
-}
+PENDING: Dict[str, Tuple[object, str]] = {}
 
 
 class Import(NamedTuple):
@@ -249,6 +255,9 @@ def scan() -> Report:
                     pending[owner].append(imp)
                 else:
                     misplaced.append(imp)
+                continue
+            if _allowed(MOE_KERNELS, imp) is not None:
+                interface.append(imp)
                 continue
             owner = _allowed(PENDING, imp)
             if owner is not None:

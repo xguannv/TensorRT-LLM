@@ -11,6 +11,7 @@ operations do not read this class: their callers pass the values they need as ar
 from __future__ import annotations
 
 import dataclasses
+from typing import Any, Callable, Optional
 
 
 @dataclasses.dataclass(frozen=True)
@@ -27,12 +28,16 @@ class K3Sm107Constants:
     shared_sm: int
     # FC12 die-major expert layout and schedule (the routed experts' kernel set).
     fc12_die_major: bool
+    # The routed experts of a MEGAMOE_CUTEDSL layer: the target's MegaMoE module class, which
+    # ``K3MoERuntime`` builds with keyword arguments (``num_experts``, ``top_k``, ``hidden_size``,
+    # ``intermediate_size``, ``mapping``, ``layer_idx``, the two SiTU soft-caps,
+    # ``max_num_tokens``, ``dtype``, ``skip_create_weights_in_init``); ``None`` where the target
+    # runs no MegaMoE.
+    megamoe_experts: Optional[Callable[..., Any]]
     router_exact_kda: bool
     # The MoE gate GEMM on BF16 operands with FP32 accumulation and output (else the FP32 GEMM of
     # the upcast operands; the two can pick different top-k experts at a tie).
     router_bf16_gate: bool
-    # The CUTEDSL routed experts quantize their input on the auxiliary stream (up to 1024 tokens).
-    moe_async_input_quant: bool
     # The BF16 shared and latent MoE MLP weights are read as block-scaled FP8 (quantized once after
     # loading).
     fp8_weight_read_moe_mlp: bool

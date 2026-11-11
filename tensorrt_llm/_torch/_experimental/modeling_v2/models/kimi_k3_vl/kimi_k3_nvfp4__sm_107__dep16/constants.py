@@ -7,6 +7,7 @@ the speculative decode head (``spec_head_fusion`` off, unlike the helix8 targets
 """
 
 from ..sm107_parts.constants import K3Sm107Constants
+from .megamoe import K3MegaMoE
 
 CONSTANTS = K3Sm107Constants(
     spec_head_fusion=False,
@@ -15,9 +16,9 @@ CONSTANTS = K3Sm107Constants(
     ld_fused=False,
     shared_sm=0,
     fc12_die_major=False,
+    megamoe_experts=K3MegaMoE,
     router_exact_kda=False,
     router_bf16_gate=False,
-    moe_async_input_quant=True,
     fp8_weight_read_moe_mlp=True,
     latent_ar_own_ws=False,
     attn_res_pdl=True,

@@ -10,8 +10,6 @@ scales drawn directly, weight global scales 1, so every weight is exact in FP32)
 
 * against an FP32 reference on the same NVFP4 input (the module's own quantization) with the
   FC1 output requantized to NVFP4 as the kernel does (``_fp4_moe_test_utils._q_nvfp4``);
-* against ``sm107_parts.moe.K3RoutedExperts`` (the path through V1's tile runners) on the
-  same weights and routing, where that module is importable;
 * with ``x`` written on another stream and joined through ``input_ready_event``, and chunked
   (``max_chunk_tokens`` below the token count): the bits of the plain call.
 
@@ -192,49 +190,6 @@ def test_cutedsl_against_fp32_reference(num_tokens):
     got = _forward(module, layer)
     want = layer.reference(module)
     assert_within_ulp(got, want, 32, 4)
-
-
-@pytest.mark.parametrize("num_tokens", [24, 200])
-def test_cutedsl_against_target_module(num_tokens):
-    """The same weights, routing and input through ``sm107_parts.moe.K3RoutedExperts`` (V1's
-    tile runners, the same kernels): bitwise where the finalize's scatter-add order repeats,
-    within 2 bf16 ulp of the row's largest otherwise."""
-    target = pytest.importorskip(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.moe"
-    )
-    layer = _Layer(num_tokens, seed=100 + num_tokens)
-    module = _family()
-    layer.load(module)
-    old = target.K3RoutedExperts(
-        kernels="CUTEDSL",
-        num_experts=NUM_EXPERTS,
-        top_k=TOP_K,
-        hidden_size=HIDDEN,
-        intermediate_size=INTER,
-        mapping=Mapping(world_size=1, tp_size=1, rank=0),
-        layer_idx=0,
-        situ_beta=SITU_BETA,
-        situ_linear_beta=SITU_LINEAR_BETA,
-        aux_stream=torch.cuda.Stream(),
-        max_chunk_tokens=8192,
-        fc12_die_major=False,
-    ).to(DEV)
-    layer.load(old)
-    for name in ("w3_w1_weight", "w2_weight", "w3_w1_weight_scale", "w2_weight_scale"):
-        assert torch.equal(getattr(module.backend, name), getattr(old.backend, name)), name
-    for name in ("fc31_input_scale", "fc2_input_scale", "fc31_alpha", "fc2_alpha"):
-        assert torch.equal(getattr(module.backend, name), getattr(old.backend, name)), name
-
-    logits = torch.empty(num_tokens, NUM_EXPERTS, device=DEV)
-    with torch.inference_mode():
-        want = old(
-            layer.x,
-            logits,
-            route=lambda lg, o, n: target.SortedRouting(layer.ids, layer.weights, None),
-        )
-    torch.cuda.synchronize()
-    got = _forward(module, layer)
-    assert_within_ulp(got, want, 2, 0.5)
 
 
 def test_cutedsl_joins_input_stream_and_chunks():

@@ -26,9 +26,10 @@ _EXPECTED = {
     "ld_fused": False,
     "shared_sm": 0,
     "fc12_die_major": False,
+    # The MegaMoE module class, compared by name.
+    "megamoe_experts": "K3MegaMoE",
     "router_exact_kda": False,
     "router_bf16_gate": False,
-    "moe_async_input_quant": True,
     "fp8_weight_read_moe_mlp": True,
     "latent_ar_own_ws": False,
     "attn_res_pdl": True,
@@ -53,7 +54,11 @@ def test_constants_are_the_reference_profile():
 
     CONSTANTS = importlib.import_module(f"{_FAMILY}.{_TARGET}.constants").CONSTANTS
 
-    assert dataclasses.asdict(CONSTANTS) == _EXPECTED
+    got = dataclasses.asdict(CONSTANTS)
+    megamoe = got["megamoe_experts"]
+    assert megamoe.__module__ == f"{_FAMILY}.{_TARGET}.megamoe", megamoe.__module__
+    got["megamoe_experts"] = megamoe.__qualname__
+    assert got == _EXPECTED
 
 
 def test_target_reads_no_environment_variable():

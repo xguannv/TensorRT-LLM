@@ -212,35 +212,50 @@ def test_spec_decode_head_reads_main_names():
         assert hasattr(TrtllmAttentionMetadata, name), name
 
 
-def test_routed_experts_tune_the_routing_tile_with_mains_runners():
+def test_routed_experts_tune_the_routing_tile_like_mains_runners():
     """The routed experts (every target but dep16) run their own kernel chains; the AutoTuner picks
-    the routing tile through main's two CuteDSL outer runners, called with the experts' chain as
-    ``forward_impl``. The experts read the tile of a tactic (``tile_size_of``) and the tuning config
-    off them, and FC12 offers only the tiles its fused kernel serves."""
+    the routing tile through the family's copies of main's two CuteDSL outer runners
+    (``ops/moe/k3r_experts``). The copies keep main's AutoTuner keys, ``unique_id``, routing tiles
+    and tuning config, so a tactic cache written by either serves the other."""
     from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12 import CuteDslFc12FusedMoENvfp4Runner
     from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import CuteDslFusedMoENvfp4Runner
+    from tensorrt_llm._torch.utils import ActivationType
 
-    routed = _k3_module("sm107_parts.moe")
-    runners = routed._tile_runners()
-    assert runners["CUTEDSL"] == (CuteDslFusedMoENvfp4Runner, "CuteDslFusedMoE::run_moe_nvfp4")
-    assert runners["CUTEDSL_FC12"] == (
-        CuteDslFc12FusedMoENvfp4Runner,
-        "CuteDslFc12FusedMoE::run_moe_nvfp4",
-    )
-    params = inspect.signature(CuteDslFusedMoENvfp4Runner.__init__).parameters
-    for name in (
-        "forward_impl",
-        "num_experts",
-        "top_k",
-        "num_local_experts",
-        "local_expert_offset",
-        "enable_finalize_fusion",
-        "enable_alltoall",
-        "workload_identity",
+    kx = _k3_module("ops.moe.k3r_experts")
+    assert kx.TILE_TUNER_KEYS == {
+        "CUTEDSL": "CuteDslFusedMoE::run_moe_nvfp4",
+        "CUTEDSL_FC12": "CuteDslFc12FusedMoE::run_moe_nvfp4",
+    }
+    geometry = dict(num_experts=896, top_k=16, num_local_experts=112, local_expert_offset=224)
+    for kernels, mains, identity in (
+        ("CUTEDSL", CuteDslFusedMoENvfp4Runner, None),
+        ("CUTEDSL_FC12", CuteDslFc12FusedMoENvfp4Runner, (int(ActivationType.SiTu), 4.0, 25.0)),
     ):
-        assert name in params, name
-    assert CuteDslFusedMoENvfp4Runner.tile_size_of(-1) == 128
-    assert CuteDslFc12FusedMoENvfp4Runner._tile_sizes() == [128, 256]
+        ours = kx._tile_runner_class(kernels)(
+            forward_impl=None, workload_identity=identity, **geometry
+        )
+        theirs = mains(
+            forward_impl=None,
+            enable_finalize_fusion=True,
+            enable_alltoall=False,
+            workload_identity=identity,
+            **geometry,
+        )
+        assert ours.unique_id() == theirs.unique_id(), kernels
+        assert ours.tile_size_of(-1) == theirs.tile_size_of(-1) == 128
+        assert ours.tile_size_of(256) == theirs.tile_size_of(256) == 256
+        a, b = ours.get_tuning_config(), theirs.get_tuning_config()
+        for spec_a, spec_b in zip(a.dynamic_tensor_specs, b.dynamic_tensor_specs, strict=True):
+            assert (spec_a.input_idx, spec_a.dim_idx) == (spec_b.input_idx, spec_b.dim_idx)
+            assert spec_a.gen_tuning_buckets is spec_b.gen_tuning_buckets
+            assert spec_a.map_to_tuning_buckets is spec_b.map_to_tuning_buckets
+        assert [(c.input_idx, c.dim_idx) for c in a.constraint_specs] == [
+            (c.input_idx, c.dim_idx) for c in b.constraint_specs
+        ]
+        assert a.use_cold_l2_cache == b.use_cold_l2_cache
+    assert kx._tile_runner_class("CUTEDSL_FC12").tile_sizes() == (
+        CuteDslFc12FusedMoENvfp4Runner._tile_sizes()
+    )
 
 
 def test_latent_down_fusion_feeds_the_fc12_experts():
@@ -257,25 +272,50 @@ def test_latent_down_fusion_feeds_the_fc12_experts():
 @pytest.mark.parametrize(
     "target, expected",
     [
-        ("tp1", 0),
-        ("helix8_moeep8", 16),
-        ("helix8_moetp2ep4", 16),
-        ("dep16", 0),
+        ("tp1", {"sm_reserve": 0, "die_major": False, "die_sched_min_tokens": None}),
+        ("helix8_moeep8", {"sm_reserve": 16, "die_major": True, "die_sched_min_tokens": 24}),
+        ("helix8_moetp2ep4", {"sm_reserve": 16, "die_major": True, "die_sched_min_tokens": 24}),
+        ("dep16", {"sm_reserve": 0, "die_major": False, "die_sched_min_tokens": None}),
     ],
 )
-def test_routed_experts_sm_reserve_follows_the_target(target, expected):
-    """The helix8 targets leave 16 SMs of the FC12 grids to the shared expert, whose GEMMs are
-    confined to ``shared_sm`` = 16 SMs; die-major weights (``fc12_die_major``) are not available
-    yet and only logged. Only the FC12 kernels take a reserve."""
+def test_routed_experts_fc12_options_follow_the_target(target, expected):
+    """The FC12 routed experts of the helix8 targets leave 16 SMs to the shared expert, whose GEMMs
+    are confined to ``shared_sm`` = 16 SMs, and run die-major expert weights with die-local tile
+    claiming from 24 tokens per call. The CUTEDSL kernels (the tp1 context target) take no FC12
+    option (the tp1 row is what its constants would give FC12)."""
     moe_runtime = _k3_module("sm107_parts.moe_runtime")
     constants = _constants(target)
     kwargs = dict(shared_sm=constants.shared_sm, fc12_die_major=constants.fc12_die_major)
-    fc12 = SimpleNamespace(kernels="CUTEDSL_FC12", sm_reserve=0)
-    moe_runtime._k3_routed_backend_opt_ins(fc12, **kwargs)
-    assert fc12.sm_reserve == expected
-    other = SimpleNamespace(kernels="CUTEDSL", sm_reserve=0)
-    moe_runtime._k3_routed_backend_opt_ins(other, **kwargs)
-    assert other.sm_reserve == 0
+    assert moe_runtime._k3_fc12_options("CUTEDSL_FC12", **kwargs) == expected
+    assert moe_runtime._k3_fc12_options("CUTEDSL", **kwargs) == {}
+
+
+def test_router_precision_and_megamoe_follow_the_target():
+    """BF16 router GEMM on tp1 and both helix8 targets, FP32 on dep16 (attention DP); only dep16
+    builds MegaMoE routed experts, from its own module."""
+    assert {t for t in TARGETS if _constants(t).router_bf16_gate} == {
+        "tp1",
+        "helix8_moeep8",
+        "helix8_moetp2ep4",
+    }
+    assert {t for t in TARGETS if _constants(t).megamoe_experts is not None} == {"dep16"}
+    megamoe = _constants("dep16").megamoe_experts
+    assert megamoe.__module__ == f"{K3_RUBIN}.kimi_k3_nvfp4__sm_107__dep16.megamoe"
+    params = inspect.signature(megamoe.__init__).parameters
+    for name in (
+        "num_experts",
+        "top_k",
+        "hidden_size",
+        "intermediate_size",
+        "mapping",
+        "layer_idx",
+        "situ_beta",
+        "situ_linear_beta",
+        "max_num_tokens",
+        "dtype",
+        "skip_create_weights_in_init",
+    ):
+        assert name in params, name
 
 
 def test_private_persistent_grids_take_the_shared_sm_reserve(monkeypatch):
@@ -446,15 +486,17 @@ def test_dspark_latent_cache_helix_mapping():
 
 
 def test_router_picks_the_routing_kernel():
-    """The routing each forward hands the routed experts (``K3MoERuntime._router``): the CuTe
-    routing tail where ``_route_tail_target`` set a target, with its ``moe_sort`` tables where they
-    are of the experts asked for; else ``noaux_tc_route_sort`` where it serves; else
-    ``noaux_tc_op`` (the experts then run ``moe_sort``)."""
+    """The routing each forward hands the routed experts (``K3MoERuntime._router``), as in
+    084745cde4 (``k3_rubin/text_model.py``: ``_tail_route`` where ``_route_tail_target`` set a
+    target, else the routing method's ``noaux_tc_op`` and the backend's ``moe_sort``): the CuTe
+    routing tail where a target is set, with its ``moe_sort`` tables where they are of the experts
+    asked for; else ``noaux_tc_op`` (the experts then run ``moe_sort``)."""
     import torch
 
     moe_runtime = _k3_module("sm107_parts.moe_runtime")
-    routing_types = _k3_module("sm107_parts.moe")
+    routing_types = _k3_module("ops.moe.k3r_experts")
     assert _k3_module("kernels.k3r_moe.k3_route_tail").TILE == 128
+    assert not hasattr(moe_runtime.K3MoEGate, "route_with_sort")
     ids, weights = torch.zeros(2, 16, dtype=torch.int32), torch.ones(2, 16)
     tables = routing_types.SortTables(
         128, tuple(torch.zeros(1, dtype=torch.int32) for _ in range(6))
@@ -465,36 +507,71 @@ def test_router_picks_the_routing_kernel():
         calls.append(("tail", offset, num))
         return routing_types.SortedRouting(ids, weights, tables)
 
-    def route_with_sort(logits, offset, num):
-        calls.append(("sort", offset, num))
-        return routing_types.SortedRouting(ids, weights, tables) if logits.shape[0] <= 256 else None
-
     def route(logits):
         calls.append(("topk",))
         return ids, weights
 
     runtime = _bare(moe_runtime.K3MoERuntime)
-    runtime.gate = SimpleNamespace(
-        route=route, route_tail=route_tail, route_with_sort=route_with_sort
-    )
+    runtime.gate = SimpleNamespace(route=route, route_tail=route_tail)
     runtime.routed_experts = SimpleNamespace(consumes_sort_tables=True)
     logits = torch.empty(2, 896)
 
     assert runtime._router((0, 896))(logits, 0, 896).sort_tables is tables
     assert runtime._router((0, 896))(logits, 448, 448).sort_tables is None
-    assert runtime._router(None)(logits, 0, 896).sort_tables is tables
-    assert runtime._router(None)(torch.empty(300, 896), 0, 896).sort_tables is None
-    assert calls == [
-        ("tail", 0, 896),
-        ("tail", 0, 896),
-        ("sort", 0, 896),
-        ("sort", 0, 896),
-        ("topk",),
-    ]
+    assert runtime._router(None)(logits, 0, 896).sort_tables is None
+    assert calls == [("tail", 0, 896), ("tail", 0, 896), ("topk",)]
     calls.clear()
     runtime.routed_experts = SimpleNamespace(consumes_sort_tables=False)
     assert runtime._router(None)(logits, 0, 896).sort_tables is None
     assert calls == [("topk",)]
+
+
+#: This rank's routed experts and whether the routed experts run attention-DP, per target.
+_ROUTED_LAYOUT = {
+    "tp1": (896, False),
+    "helix8_moeep8": (112, False),
+    "helix8_moetp2ep4": (224, False),
+    "dep16": (56, True),
+}
+
+
+@pytest.mark.parametrize("target", TARGETS)
+def test_route_tail_serves_the_reference_sizes(monkeypatch, target):
+    """Which forwards route with ``k3_route_tail`` (``K3MoERuntime._route_tail_target``), as
+    084745cde4 ``k3_rubin/text_model.py`` ``_route_tail_target``: the routed experts not
+    attention-DP, 1 to 2048 tokens, up to 256 on one cluster and above that where the multi-CTA
+    sort fits this rank's experts. Every other forward routes with ``noaux_tc_op`` and the
+    experts' ``moe_sort``. So tp1 (896 local experts) routes 1..256 tokens with the tail and more
+    with ``noaux_tc_op`` + ``moe_sort``; the helix8 targets use the tail up to the sort's limit;
+    dep16 (attention-DP) never does."""
+    import torch
+
+    moe_runtime = _k3_module("sm107_parts.moe_runtime")
+    route_tail = _k3_module("kernels.k3r_moe.k3_route_tail")
+    experts_cls = _k3_module("ops.moe.k3r_experts").K3RoutedExperts
+    monkeypatch.setattr(route_tail, "supports_device", lambda device: True)
+    monkeypatch.setattr(route_tail, "wide_workspace", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    local, attention_dp = _ROUTED_LAYOUT[target]
+    runtime = _bare(moe_runtime.K3MoERuntime)
+    runtime.gate = SimpleNamespace(num_experts=896, e_score_correction_bias=torch.empty(896))
+    runtime.routed_experts = _bare(experts_cls)
+    runtime.routed_experts.backend = SimpleNamespace(
+        slot_start=0, expert_size_per_partition=local, num_slots=896
+    )
+    runtime._attention_dp = attention_dp
+    for m in (1, 16, 64, 256, 257, 512, 1024, 2048, 2049):
+        tail = (
+            not attention_dp
+            and 1 <= m <= 2048
+            and (m <= route_tail.MAX_M or route_tail.wide_sort_fits(m, local))
+        )
+        assert runtime._route_tail_target(m) == ((0, local) if tail else None), m
+    if target == "tp1":
+        assert runtime._route_tail_target(256) == (0, 896)
+        assert runtime._route_tail_target(257) is None
+    if target == "dep16":
+        assert runtime._route_tail_target(1) is None
 
 
 def test_dspark_split_plan_planner():
