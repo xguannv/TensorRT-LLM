@@ -8206,6 +8206,44 @@ def test_v2_kda_replay_seed_of_all_layers_at_once_is_bit_identical():
     assert stacked.prev_num_accepted_tokens.tolist() == [5, 0, 5, 0]
 
 
+@skip_no_cuda
+@pytest.mark.parametrize("kda_draft_records", [False, True])
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_v2_kimi_k3_manager_seeds_transferred_slots_of_all_layers_at_once(
+    kda_draft_records, is_disagg
+):
+    """The KVCM pool views of a Kimi K3 manager are affine across layers.
+
+    So a generation server seeds a transferred request's replay caches with
+    one launch per buffer instead of one per layer.
+    """
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=4,
+        num_mamba_layers=6,
+        num_attention_layers=2,
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+        conv_state_layout="q_k_v",
+        mamba_d_conv=4,
+        mamba_num_heads=4,
+        mamba_n_groups=4,
+        mamba_head_dim=128,
+        mamba_d_state=128,
+        mamba_ssm_cache_dtype=torch.float32,
+        kda_replay_num_spec=3,
+        kda_draft_records=kda_draft_records,
+        is_disagg=is_disagg,
+        max_tokens=1024,
+    )
+    try:
+        replay = mgr._kda_replay
+        assert isinstance(replay, KDAReplayState)
+        assert replay._stacked_seed_conv is not None
+        assert replay._stacked_seed_replay is not None
+        assert {"kda_conv_q", "kda_conv_k", "kda_conv_v"} <= set(replay._stacked_seed_replay)
+    finally:
+        mgr.shutdown()
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
     reason="Mixed-precision NVFP4 KV requires Blackwell",
