@@ -177,6 +177,11 @@
       "path": "cache_transceiver_config.transceiver_runtime"
     },
     {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "cache_transceiver_config.ucx_cuda_ipc_cache_max_regions"
+    },
+    {
       "allowed_values": [
         "auto",
         "native",

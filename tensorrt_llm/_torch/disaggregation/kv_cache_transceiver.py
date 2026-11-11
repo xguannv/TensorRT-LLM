@@ -23,6 +23,7 @@ from ..pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManagerV2, MixedMambaHybridCacheManager)
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import KVCacheManager
+from .cuda_ipc_cache import bound_cuda_ipc_cache
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
@@ -169,6 +170,13 @@ def create_kv_cache_transceiver(
             "Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
             "UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             "hangs or lower-than-expected performance.")
+
+    max_regions = cache_transceiver_config.ucx_cuda_ipc_cache_max_regions
+    if (cache_transceiver_config.backend in ("UCX", "NIXL")
+            and max_regions is not None):
+        # Before any transfer agent opens UCX: cap the peer mappings each
+        # sender keeps cached (see cuda_ipc_cache).
+        bound_cuda_ipc_cache(max_regions)
 
     # Select transceiver implementation based on transceiver_runtime.
     # transceiver_runtime == None or "CPP" -> use C++ transceiver.

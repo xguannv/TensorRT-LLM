@@ -5939,6 +5939,20 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "or set to all_reusable. Invalid static settings fail at startup; "
         "per-request constraints reject the request.")
 
+    ucx_cuda_ipc_cache_max_regions: Optional[PositiveInt] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "With the UCX or NIXL backend: mapped peer KV regions UCX keeps per "
+        "peer in its CUDA IPC remote-handle cache "
+        "(UCX_CUDA_IPC_CACHE_MAX_REGIONS, unbounded by default). Every mapping "
+        "takes an entry in a driver table shared by all processes on a node; "
+        "a long run that fills it fails new device mappings with out-of-memory "
+        "errors while memory is free. Evicted regions are mapped again on "
+        "their next write. None keeps UCX's setting; an "
+        "UCX_CUDA_IPC_CACHE_MAX_REGIONS or UCX_CUDA_IPC_CACHE_MAX_SIZE "
+        "environment variable takes precedence.")
+
     agent_bounce_buffer_enable: bool = Field(
         default=False,
         status="deprecated",
