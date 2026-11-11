@@ -327,11 +327,18 @@ def test_disaggregated_leader_cleanup_timeout_retains_guard(
     child.kill.assert_not_called()
 
 
-@pytest.mark.parametrize("cuda_device", [2, None])
+@pytest.mark.parametrize(
+    ("cuda_device", "visible"),
+    [(0, None), (0, "2"), (1, "3,2,1,0"), (2, None), (None, "2,3")],
+    ids=["device0", "single-visible", "reordered", "all-visible", "no-device"],
+)
 def test_disaggregated_leader_hands_its_cuda_device_to_the_proxy(
-    monkeypatch: pytest.MonkeyPatch, cuda_device: int | None
+    monkeypatch: pytest.MonkeyPatch, cuda_device: int | None, visible: str | None
 ) -> None:
-    """The proxy gets the leader's device; a leader that selected none passes none on."""
+    """The proxy gets the leader's logical device and the same visible-device list.
+
+    Device 0 is passed on like any other device; a leader that selected none passes none on.
+    """
     from tensorrt_llm.commands import serve
     from tensorrt_llm.llmapi import mgmn_leader_node
 
@@ -350,6 +357,10 @@ def test_disaggregated_leader_hands_its_cuda_device_to_the_proxy(
     ):
         monkeypatch.setenv(name, "7")
     monkeypatch.setenv("SLURM_PROCID", "2")
+    if visible is None:
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
     monkeypatch.setattr(serve, "find_free_ipc_addr", lambda: "ipc://fake-proxy")
     monkeypatch.setattr(serve.subprocess, "Popen", popen)
     monkeypatch.setattr(mgmn_leader_node, "launch_server_main", lambda comm: None)
@@ -359,12 +370,34 @@ def test_disaggregated_leader_hands_its_cuda_device_to_the_proxy(
     )
 
     proxy_env = popen.call_args.kwargs["env"]
-    # The proxy has no rank variables to derive a device from.
+    # The proxy has no rank variables to derive a device from, and the device is an ordinal of the
+    # visible-device list both processes share.
     assert "SLURM_PROCID" not in proxy_env
+    assert proxy_env.get("CUDA_VISIBLE_DEVICES") == visible
     if cuda_device is None:
         assert device_env not in proxy_env
     else:
         assert proxy_env[device_env] == str(cuda_device)
+
+
+@pytest.mark.parametrize(
+    ("rank", "visible_count", "expected"),
+    [(0, 4, 0), (3, 4, 3), (6, 4, 2), (5, 1, 0)],
+    ids=["rank0", "rank3", "second-node-rank", "single-visible"],
+)
+def test_set_cuda_device_returns_the_logical_device_it_selects(
+    monkeypatch: pytest.MonkeyPatch, rank: int, visible_count: int, expected: int
+) -> None:
+    """The leader hands its proxy exactly the ordinal it selected for itself."""
+    from tensorrt_llm.commands import serve
+
+    set_device = mock.Mock()
+    monkeypatch.setenv("OMPI_COMM_WORLD_RANK", str(rank))
+    monkeypatch.setattr(serve, "device_count", lambda: visible_count)
+    monkeypatch.setattr(serve.torch.cuda, "set_device", set_device)
+
+    assert serve.set_cuda_device() == expected
+    set_device.assert_called_once_with(expected)
 
 
 def _write_disagg_config(tmp_path: Path) -> Path:
@@ -420,7 +453,45 @@ def test_disaggregated_mpi_worker_passes_the_leader_device_to_the_proxy_launch(
     launch_leader.assert_called_once_with(sub_comm, 1, str(path), "info", cuda_device=3)
 
 
-@pytest.mark.parametrize("device", ["3", None])
+def test_disaggregated_mpi_worker_non_leader_rank_launches_no_proxy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A non-leader rank still selects its own device and only serves its leader's MPI tasks."""
+    import mpi4py.futures
+
+    from tensorrt_llm import _utils
+    from tensorrt_llm.commands import serve
+    from tensorrt_llm.llmapi import disagg_utils
+
+    path = _write_disagg_config(tmp_path)
+    _stub_worker_entry(monkeypatch, serve)
+    device_env = serve.DisaggLauncherEnvs.TLLM_DISAGG_PROXY_CUDA_DEVICE.value
+    monkeypatch.delenv(
+        serve.DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT.value, raising=False
+    )
+    monkeypatch.delenv(device_env, raising=False)
+    sub_comm = object()
+    executor = mock.MagicMock()
+    executor.return_value.__enter__.return_value = None
+    set_cuda_device = mock.Mock(return_value=1)
+    launch_leader = mock.Mock()
+    monkeypatch.setattr(serve, "set_cuda_device", set_cuda_device)
+    monkeypatch.setattr(disagg_utils, "split_world_comm", lambda configs: (False, 0, sub_comm))
+    monkeypatch.setattr(_utils, "set_mpi_comm", lambda comm: None)
+    monkeypatch.setattr(mpi4py.futures, "MPICommExecutor", executor)
+    monkeypatch.setattr(serve, "_launch_disaggregated_leader", launch_leader)
+
+    serve.disaggregated_mpi_worker.callback(
+        config_file=str(path), log_level="info", telemetry=False
+    )
+
+    set_cuda_device.assert_called_once_with()
+    executor.assert_called_once_with(sub_comm)
+    launch_leader.assert_not_called()
+    assert device_env not in os.environ
+
+
+@pytest.mark.parametrize("device", ["0", "3", None])
 def test_disaggregated_proxy_selects_the_device_its_leader_passed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, device: str | None
 ) -> None:
@@ -453,7 +524,7 @@ def test_disaggregated_proxy_selects_the_device_its_leader_passed(
     if device is None:
         set_device.assert_not_called()
     else:
-        set_device.assert_called_once_with(3)
+        set_device.assert_called_once_with(int(device))
     launch.assert_called_once_with(str(path), {})
 
 
