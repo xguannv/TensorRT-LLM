@@ -193,6 +193,14 @@ class PeerRegistrar:
                 "the same drafter, and a configuration that lets both workers keep "
                 "the draft layers in the target's KV cache manager (or neither)."
             )
+        if self._ri.num_draft_layers and self._ri.draft_kv_dtype != peer_ri.draft_kv_dtype:
+            # The drafter declares its pool dtype (draft_kv_dtype); bytes of
+            # one dtype read as another are garbage, not a transfer error.
+            raise ValueError(
+                "PeerRegistrar: unified draft KV dtype differs "
+                f"(local={self._ri.draft_kv_dtype}, peer={peer_ri.draft_kv_dtype}); "
+                "both peers must load the same drafter."
+            )
         # Draft layers carry the target's KV heads per rank, so they move with
         # the target's head mapping only when both sides shard heads alike. A
         # K-only (MLA) cache keeps the whole latent on every rank.
