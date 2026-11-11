@@ -21,7 +21,14 @@ FAMILY = ROOT / "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl
 BACKEND_PACKAGE = "tensorrt_llm._torch.attention.backends.fp4_mla"
 CONTRACT = ("config", "layout", "metadata", "packed_plan", "state")
 DEFINITION_COPIES = ("_k3_fp4_mla_cache", "_k3_fp4_mla_kernels")
-SOURCES = ("cache_update", "cache_gather", "v_cache", "fp4_mla_context", "fp4_mla_kernels")
+SOURCES = (
+    "cache_update",
+    "cache_gather",
+    "v_cache",
+    "fp4_mla_context",
+    "fp4_mla_kernels",
+    "fp4_mla_triton",
+)
 WHOLE_COPIES = {
     "_k3_fp4_mla_v_repack": "fp4_mla_cutedsl_v_repack",
     "_k3_fp4_mla_cute_dsl_utils": "cute_dsl_utils",
@@ -101,10 +108,6 @@ def test_copies_import_only_the_contract_from_the_backend(copy):
         if not module.startswith(BACKEND_PACKAGE):
             continue
         submodule = module[len(BACKEND_PACKAGE) + 1 :]
-        # The Triton FP4 MLA backend's V repack (SM100 / SM103 only) stays a backend import.
-        if submodule == "fp4_mla_triton":
-            assert [a.name for a in node.names] == ["fp4_mla_repack_v_cache"]
-            continue
         assert submodule in CONTRACT, f"{copy} imports backend module {module}"
         for alias in node.names:
             assert alias.name in contract_defs[submodule], f"{module}.{alias.name} not found"

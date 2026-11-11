@@ -1537,7 +1537,7 @@ def _update_triton_v_packed_cache(
         return None
     if page_ids.numel() == 0:
         return None
-    from tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_triton import fp4_mla_repack_v_cache
+    from ._k3_fp4_mla_kernels import fp4_mla_repack_v_cache
 
     def _tma_alloc(size: int, alignment: int, stream):
         return torch.empty(size, device=kv_cache.device, dtype=torch.int8)
