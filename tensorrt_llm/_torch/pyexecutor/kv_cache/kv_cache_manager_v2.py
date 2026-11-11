@@ -2500,6 +2500,16 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
         self.vocab_size = vocab_size
+        # Defensive cap for get_num_available_tokens: when host cache is
+        # enabled, clamp_max_seq_len_for_mem may return a value that spans
+        # both GPU and host tiers.  Storing the explicit max_tokens (if set)
+        # lets us cap the result to GPU-only capacity so callers like CUDA
+        # graph warmup don't over-allocate beyond the GPU pool.
+        # None when max_tokens is not explicitly configured — other config
+        # paths (max_gpu_total_bytes, free_gpu_memory_fraction) are already
+        # bounded by the GPU quota passed to GpuCacheTierConfig.
+        # Set before the cache config is built: _max_seq_len_upper_bound reads it.
+        self._gpu_max_tokens = kv_cache_config.max_tokens
 
         config = self._build_base_config(
             kv_cache_config,
@@ -2640,15 +2650,6 @@ class KVCacheManagerV2(BaseResourceManager):
         # so the latest width in _allocated_draft_lens belongs to step N+1;
         # update_resources must rewind step N by the width step N was given.
         self._inflight_draft_lens: dict[int, list[int]] = {}
-        # Defensive cap for get_num_available_tokens: when host cache is
-        # enabled, clamp_max_seq_len_for_mem may return a value that spans
-        # both GPU and host tiers.  Storing the explicit max_tokens (if set)
-        # lets us cap the result to GPU-only capacity so callers like CUDA
-        # graph warmup don't over-allocate beyond the GPU pool.
-        # None when max_tokens is not explicitly configured — other config
-        # paths (max_gpu_total_bytes, free_gpu_memory_fraction) are already
-        # bounded by the GPU quota passed to GpuCacheTierConfig.
-        self._gpu_max_tokens = kv_cache_config.max_tokens
 
         max_num_tokens = self.get_num_available_tokens(token_num_upper_bound=max_seq_len)
 
@@ -4802,6 +4803,20 @@ class KVCacheManagerV2(BaseResourceManager):
         full_slot_shape = [num_slots, scale, *page_shape]
         full_view = convert_to_torch_tensor(TensorWrapper(addr, torch_dtype, full_slot_shape))
         return full_view[:, 0]
+
+    def _max_seq_len_upper_bound(self) -> int:
+        """Longest ``max_seq_len`` this manager can be left with, known before it is built.
+
+        ``__init__`` shortens ``max_seq_len`` to :meth:`get_num_available_tokens`, which never
+        exceeds what ``kv_cache_config.max_tokens`` allows, so no request outgrows this bound.
+        A layout that sizes an attention window to cover every sequence, only to give some
+        layers a life cycle of their own, uses it instead of the unshortened ``max_seq_len``:
+        each attention life cycle's slot floor holds one request at the widest window, so a
+        window no request can reach makes the allocator raise the quota for nothing.
+        """
+        if self._gpu_max_tokens is None:
+            return self.max_seq_len
+        return max(1, min(self.max_seq_len, self._gpu_max_tokens - self._kv_alloc_extra_tokens))
 
     def get_num_available_tokens(
         self, *, token_num_upper_bound: int, batch_size: int = 1, max_num_draft_tokens: int = 0

@@ -480,8 +480,14 @@ class Fp4MlaV2CacheLayoutPolicy:
             raise ValueError("FP4 MLA V2 layout requires at least one local attention layer.")
         self._fp8_mla_manager_layer_ids = [LayerId(local_layer) for local_layer in fp8_local_layers]
         if fp8_local_layers:
+            # Covers every sequence the manager can admit, so the window never
+            # slides. The bound rather than max_seq_len: one request at this
+            # window is a slot floor for every attention life cycle.
             fp8_lifecycle_window = (
-                self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
+                self._max_seq_len_upper_bound()
+                + self.num_extra_kv_tokens
+                + self._kv_reserve_draft_tokens
+                + 1
             )
             for local_layer in fp8_local_layers:
                 cache_layers[local_layer] = AttentionLayerConfig(

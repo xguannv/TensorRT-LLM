@@ -53,6 +53,7 @@ from tensorrt_llm._torch.kimi_k3_cache_policy import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
+    GPU_LEVEL,
     KVCacheManagerV2,
     Role,
 )
@@ -1696,6 +1697,66 @@ def test_fp4_mla_manager_v2_registers_native_cache_and_hp_roles(monkeypatch) -> 
         assert v_scale_pool.dtype == torch.float8_e4m3fn
         assert manager.get_mla_v_scale_pool_base().dtype == torch.uint8
         assert hp_pool.shape[1:] == (2, 1, HP_BLOCK_SIZE * 576)
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "max_tokens, expected",
+    [(None, 1 << 20), (1 << 15, (1 << 15) - 3), (1 << 30, 1 << 20), (2, 1)],
+)
+def test_kv_cache_manager_v2_max_seq_len_upper_bound(max_tokens, expected) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.max_seq_len = 1 << 20
+    manager.num_extra_kv_tokens = 3
+    manager._gpu_max_tokens = max_tokens
+    assert manager._max_seq_len_upper_bound() == expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fp4_mla_manager_v2_fp8_window_follows_the_max_tokens_cap(monkeypatch) -> None:
+    """The FP8 fallback life cycle's window covers what max_tokens admits, not max_seq_len.
+
+    The window only gives the FP8 layers a pool of their own and must never slide. One
+    request at the widest attention window is a slot floor for every attention life cycle,
+    so a window sized from the max_seq_len that max_tokens later shortens charges every pool
+    for a sequence no request can reach, and the allocator raises the quota to hold it:
+    about 1 GB here against a quota of about 35 MB.
+    """
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "1")
+    max_tokens = 1 << 15
+    manager = Fp4MlaKVCacheManagerV2(
+        LlmKvCacheConfig(max_tokens=max_tokens, dtype="nvfp4", host_cache_size=0),
+        _CacheType.SELFKONLY,
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=576,
+        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
+        max_seq_len=1 << 20,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=_DataType.NVFP4,
+        max_num_tokens=4096,
+        pretrained_config=SimpleNamespace(
+            model_type="kimi_k3",
+            num_hidden_layers=2,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            linear_attn_config={"full_attn_layers": [1, 2]},
+        ),
+    )
+    try:
+        config = manager.kv_cache_manager_py_config
+        fp8_layer = config.layers[1]
+        assert [buffer.role for buffer in fp8_layer.buffers] == [Role.KEY]
+        extra = manager.num_extra_kv_tokens + manager._kv_reserve_draft_tokens + 1
+        # max_tokens shortened max_seq_len, and the window still covers it, so it never slides.
+        assert manager.max_seq_len <= max_tokens < 1 << 20
+        assert fp8_layer.sliding_window_size >= manager.max_seq_len + extra
+        assert fp8_layer.sliding_window_size <= max_tokens + extra
+        # The floors stay near the configured quota. Sized from max_seq_len they were 30x it.
+        assert manager.impl.get_quota(GPU_LEVEL) < 2 * config.cache_tiers[0].quota
     finally:
         manager.shutdown()
 
