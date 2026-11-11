@@ -148,6 +148,15 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_uncertified_generic_calls.py
   - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_gpt_oss_default_shards.py
+  # The Kimi K3 Rubin target's cpu_only cases: CuTe DSL hint tables, the context
+  # MLA split-K dispatch gates, the FP4 MLA decode plan geometry and the
+  # drafter's binding to the unified draft KV layers.
+  # Its GPU tests are in l0_gr100.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__default/kernels/test_k3r_dsl_hints.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__default/test_k3_features.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__default/mla/test_k3_fp4_mla_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__default/mla/test_k3_mla_ctx_split_k.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__default/spec/test_k3_unified_draft_binding.py
   # MiniMax-M3 sm_107 tp2 target: its device-free (cpu_only) tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_block_table_contract.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_n_valid_contract.py
