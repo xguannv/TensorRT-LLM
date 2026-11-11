@@ -289,7 +289,12 @@ def _assert_same(name: str, a: torch.Tensor, b: torch.Tensor) -> None:
     a_bits = a.contiguous().view(torch.uint8)
     b_bits = b.contiguous().view(torch.uint8)
     mismatch = (a_bits != b_bits).sum().item()
-    assert mismatch == 0, f"{name}: {mismatch} of {a_bits.numel()} bytes differ"
+    detail = ""
+    if mismatch and a.is_floating_point() and a.element_size() > 1:
+        diff = (a.float() - b.float()).abs()
+        rows = (diff.flatten(1).amax(1) > 0).sum().item() if diff.dim() > 1 else "-"
+        detail = f", max |diff| {diff.max().item():.3g}, rows differing {rows}"
+    assert mismatch == 0, f"{name}: {mismatch} of {a_bits.numel()} bytes differ{detail}"
 
 
 def _assert_same_pools(backend: _Bench, family: _Bench) -> None:
@@ -654,15 +659,17 @@ def _cached_context(calls, q, compressed_kv, latent, md, kv_b, fp8, record):
     q_fp8 = None
     if fp8:
         q_fp8 = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(q, calls.kv_scale)[0]
-    output = torch.empty(q.shape[0], H * VDIM, dtype=q.dtype, device=q.device)
+    # Zero-filled: a partition leaves the rows of requests without KV in it unwritten (the merge
+    # skips them), and the test compares every row.
+    output = torch.zeros(q.shape[0], H * VDIM, dtype=q.dtype, device=q.device)
     if not md.runtime_features.chunked_prefill:
         full_kv, full_pe = calls.load_paged(md)
         record += [("paged latent", full_kv), ("paged k_pe", full_pe)]
         k, v = _expand(full_kv, full_pe, kv_b, fp8)
         return calls.attend(q, k, v, md, output, q_fp8=q_fp8)
-    stats = torch.empty((md.num_ctx_tokens, H, 2), dtype=torch.float, device="cuda")
-    temp_stats = torch.empty_like(stats)
-    temp = torch.empty_like(output)
+    stats = torch.zeros((md.num_ctx_tokens, H, 2), dtype=torch.float, device="cuda")
+    temp_stats = torch.zeros_like(stats)
+    temp = torch.zeros_like(output)
     origin = (md.kv_lens_cuda_runtime, md.kv_lens_runtime, md.host_total_kv_lens[0].item())
     for loop_idx in range(md.chunked_loop_num):
         chunk_kv, chunk_pe = calls.load_chunked(md, loop_idx)
