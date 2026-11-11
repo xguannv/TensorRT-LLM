@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import math
 import sys
+import time
+from collections import OrderedDict
 from dataclasses import replace
 from typing import (
     TYPE_CHECKING,
@@ -52,6 +54,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     PagePriorityCallback,
     Role,
+    _request_conversation_id,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -72,6 +75,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttnLifeCycle,
     BatchDesc,
     BufferConfig,
+    CacheLevel,
     DataRole,
     KVCacheDesc,
     LayerId,
@@ -157,6 +161,76 @@ def _low_priority_recurrent_state(_ordinal: int, life_cycle: object) -> int:
     return PAGE_PRIORITY_MIN
 
 
+def _reuse_breakdown_conversation_id(req: LlmRequest) -> Optional[str]:
+    """Conversation id that classes a lookup in ``_ReuseBreakdown``.
+
+    The breakdown is diagnostic only. A request object without conversation
+    params (a test stand-in) counts as having no conversation.
+    """
+    if getattr(req, "py_conversation_params", None) is None:
+        return None
+    return _request_conversation_id(req)
+
+
+class _ReuseBreakdown:
+    """Token accounting of fresh prefix lookups by conversation novelty.
+
+    A request's first fresh lookup is classed ``new`` (first request of its
+    conversation_id on this manager), ``known``, or ``none`` (no
+    conversation_id); any later fresh lookup of the same request (after its
+    claim was released) is classed ``rep``. Per class: lookups, lookups with
+    reuse, lookup tokens, content match (before pruning), attention-only match
+    (pages and windows present), reused tokens.
+    """
+
+    _MAX_TRACKED_IDS = 65536
+    _FIELDS = ("n", "hit", "lookup", "matched", "attn", "reused")
+
+    def __init__(self) -> None:
+        self._seen_conversations: OrderedDict[str, None] = OrderedDict()
+        self._seen_requests: OrderedDict[int, None] = OrderedDict()
+        self._totals = {kind: [0] * len(self._FIELDS) for kind in ("new", "known", "none", "rep")}
+
+    @classmethod
+    def _remember(cls, seen: OrderedDict, key) -> bool:
+        """Mark ``key`` as seen; return whether it already was."""
+        if key in seen:
+            seen.move_to_end(key)
+            return True
+        seen[key] = None
+        if len(seen) > cls._MAX_TRACKED_IDS:
+            seen.popitem(last=False)
+        return False
+
+    def record(
+        self,
+        request_id: int,
+        conversation_id: Optional[str],
+        lookup: int,
+        matched: int,
+        attention_only: int,
+        reused: int,
+    ) -> None:
+        if self._remember(self._seen_requests, request_id):
+            kind = "rep"
+        elif conversation_id is None:
+            kind = "none"
+        elif self._remember(self._seen_conversations, conversation_id):
+            kind = "known"
+        else:
+            kind = "new"
+        totals = self._totals[kind]
+        for i, value in enumerate((1, int(reused > 0), lookup, matched, attention_only, reused)):
+            totals[i] += value
+
+    def format(self) -> str:
+        return " ".join(
+            f"reuse_{kind}="
+            + ",".join(f"{name}:{value}" for name, value in zip(self._FIELDS, totals))
+            for kind, totals in self._totals.items()
+        )
+
+
 class InforwardSnapshotEntry(NamedTuple):
     """One request's in-forward snapshot in this step's context chunk."""
 
@@ -188,6 +262,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """
 
     _supports_additional_snapshot_offsets = True
+    # With block reuse on, the recurrent snapshot and reuse counters are logged
+    # at INFO at most this often (see _maybe_log_branch_snapshot_counters).
+    _BRANCH_SNAPSHOT_COUNTERS_LOG_INTERVAL_S = 60.0
+    _branch_snapshot_counters_logged_at = float("-inf")
+    # Fresh prefix lookups by conversation novelty; created on the first lookup
+    # and logged with the recurrent snapshot counters.
+    _reuse_breakdown: Optional[_ReuseBreakdown] = None
     # Whether the model's recurrent layers implement the in-forward snapshot
     # split (GDN).
     _supports_inforward_snapshot = False
@@ -1768,6 +1849,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Count a recurrent-state snapshot committed at ``point`` of ``request``'s prompt."""
         if self._branch_snapshot_points.get(request.py_request_id) == point:
             self._branch_snapshots_taken_total += 1
+        waiter_points = (self._waiter_snapshot_points or {}).get(request.py_request_id, ())
+        if point in waiter_points:
+            self._inflight_prefix_points_taken_total += 1
 
     def _mark_context_position_as_history(self, request: LlmRequest, kv_cache) -> None:
         """Advance history without making later recurrent state reusable."""
@@ -1906,6 +1990,26 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             )
         request.expect_snapshot_points = aligned
 
+    def _maybe_log_branch_snapshot_counters(self) -> None:
+        """Log the recurrent snapshot and reuse counters at INFO, at most once a minute.
+
+        Called on every context admission of a block-reuse manager, so the line
+        shows whether branch, waiter and mid-chunk snapshots are being taken.
+        """
+        now = time.monotonic()
+        if (
+            now - self._branch_snapshot_counters_logged_at
+            < self._BRANCH_SNAPSHOT_COUNTERS_LOG_INTERVAL_S
+        ):
+            return
+        self._branch_snapshot_counters_logged_at = now
+        reuse_breakdown = "" if self._reuse_breakdown is None else self._reuse_breakdown.format()
+        logger.info(
+            f"[MambaHybridCacheManagerV2] recurrent snapshot counters "
+            f"{self._format_branch_snapshot_counters()} {reuse_breakdown} "
+            f"{self._format_storage_occupancy()}"
+        )
+
     def _skip_branch_snapshot(self, reason: str) -> None:
         self._branch_snapshots_skipped_total[reason] = (
             self._branch_snapshots_skipped_total.get(reason, 0) + 1
@@ -1916,11 +2020,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self, req: LlmRequest, kv_cache: _KVCache, num_lookup_tokens: Optional[int]
     ) -> None:
         """Snapshot where this request leaves the reuse tree, for its siblings."""
+        if req.is_dummy_request:
+            return
+        self._maybe_log_branch_snapshot_counters()
         if not self.kv_cache_config.block_reuse_config.enable_branch_snapshot:
             return
         # Generation-only requests receive their prompt state from the context
         # worker and never prefill here, so they cannot take a snapshot.
-        if req.is_dummy_request or req.is_disagg_generation_init_state:
+        if req.is_disagg_generation_init_state:
             return
         if num_lookup_tokens is None:
             self._skip_branch_snapshot("no_fresh_match")
@@ -1944,6 +2051,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             # for different fixes, so they are counted apart.
             self._snapshot_pruned_tokens_total += max(0, hybrid_depth - reused)
             self._page_pruned_tokens_total += max(0, divergence - hybrid_depth)
+            if self._reuse_breakdown is None:
+                self._reuse_breakdown = _ReuseBreakdown()
+            self._reuse_breakdown.record(
+                req.py_request_id,
+                _reuse_breakdown_conversation_id(req),
+                num_lookup_tokens,
+                divergence,
+                hybrid_depth,
+                reused,
+            )
 
         # The whole lookup range matched, so there is no fork here.
         if divergence >= num_lookup_tokens:
@@ -2006,8 +2123,20 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             f"branch_snapshots_taken={self._branch_snapshots_taken_total} "
             f"branch_snapshots_skipped={sum(skipped.values())} "
             f"branch_snapshots_skipped_by_reason="
-            f"{dict(sorted(skipped.items()))}"
+            f"{dict(sorted(skipped.items()))} "
+            f"{self._format_inflight_prefix_counters()}"
         )
+
+    def _format_storage_occupancy(self) -> str:
+        """Free + evictable / total slots of every pool group, per cache level."""
+        levels = []
+        for level in range(len(self.impl.cache_tier_list)):
+            pool_groups = ",".join(
+                f"{stats.free}+{stats.evictable}/{stats.total}"
+                for stats in self._get_storage_statistics(CacheLevel(level))
+            )
+            levels.append(f"L{level}=[{pool_groups}]")
+        return "slots_free+evictable/total=" + " ".join(levels)
 
     @override
     def get_iteration_stats(self) -> Optional[KVCacheV2IterationStatsReport]:

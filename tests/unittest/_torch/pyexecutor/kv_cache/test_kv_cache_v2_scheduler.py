@@ -29,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.scheduler import scheduler_v2 as scheduler_v2_module
 from tensorrt_llm._torch.pyexecutor.scheduler.prefix_wait_planner import (
     MAX_WAIT_PASSES,
     MIN_GAIN_BLOCKS,
@@ -5392,6 +5393,85 @@ class TestLongContextDemotionExact:
         assert waiting.py_uncached_prefill_tokens == 200
         assert waiting.context_chunk_size == 200
         assert mgr.probe_context_reuse.call_count == 2
+        # Only the pass that kept it waiting counts a prefix wait.
+        mgr.count_prefix_waits.assert_called_once_with(1)
+
+
+class TestUnscheduledFirstChunkClaim:
+    """A first context chunk that held a cache claim and was not scheduled
+    releases the claim; it is counted per schedule action and by whether
+    admission ran out of KV pages."""
+
+    def _make(self, prepared_remaining=None, resize_context_fn=None):
+        mgr = make_kv_cache_manager(tokens_per_block=64, resize_context_fn=resize_context_fn)
+        prepared_remaining = prepared_remaining or {}
+
+        def prepare(req, reuse_limit=None):
+            mgr.kv_cache_map[req.py_request_id]  # the request now holds a cache
+            if req.py_request_id in prepared_remaining:
+                req.context_remaining_length = prepared_remaining[req.py_request_id]
+            return True
+
+        mgr.prepare_context.side_effect = prepare
+        mgr.free_resources.side_effect = lambda req: mgr.kv_cache_map.pop(req.py_request_id)
+        with patch.dict("os.environ", {"TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "0"}):
+            sched = make_scheduler(
+                mgr,
+                max_num_tokens=1024,
+                ctx_chunk_config=(None, 64),
+                context_demote_uncached_tokens=1024,
+                context_demote_max_iters=0,
+                exact_context_demotion=True,
+            )
+        return sched, mgr
+
+    @staticmethod
+    def _req(request_id, remaining, estimate):
+        req = make_ctx_request(request_id, context_remaining_length=remaining)
+        req.py_uncached_prefill_tokens = estimate
+        req.py_uncached_prefill_probed = False
+        return req
+
+    def test_deferred_first_chunk_releases_and_is_counted(self):
+        sched, mgr = self._make(prepared_remaining={0: 10_000})
+        lost, short = self._req(0, 10_000, 256), self._req(1, 256, 256)
+        with patch.object(scheduler_v2_module.logger, "info") as info:
+            out = sched.schedule_request([lost, short], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert lost.context_chunk_size == 768
+        assert sched._unscheduled_first_chunk_claims == {("defer", False): 1}
+        mgr.free_resources.assert_called_once_with(lost)
+        info.assert_any_call(
+            "KVCacheV2Scheduler: unscheduled first context chunks with a claim "
+            "defer/other/released=1"
+        )
+
+    def test_out_of_pages_is_counted_apart(self):
+        sched, mgr = self._make(resize_context_fn=lambda req, n: False)
+        req = self._req(0, 256, 256)
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == []
+        mgr.free_resources.assert_called_once_with(req)
+        assert sched._unscheduled_first_chunk_claims == {("skip", True): 1}
+
+    def test_no_claim_is_not_counted(self):
+        """A first chunk skipped before prepare_context holds nothing to release."""
+        sched, mgr = self._make()
+        mgr.prepare_context.side_effect = lambda req, reuse_limit=None: False
+        out = sched.schedule_request([self._req(0, 256, 256)], set())
+        assert ids(out.context_requests) == []
+        assert sched._unscheduled_first_chunk_claims == {}
+
+    def test_info_line_is_rate_limited(self):
+        sched, _ = self._make()
+        with (
+            patch.object(scheduler_v2_module.time, "monotonic", side_effect=[100.0, 130.0, 161.0]),
+            patch.object(scheduler_v2_module.logger, "info") as info,
+        ):
+            for _ in range(3):
+                sched._count_unscheduled_first_chunk_claim(ScheduleAction.STOP)
+        assert info.call_count == 2
+        assert info.call_args.args[0].endswith("stop/other/released=3")
 
 
 class TestLongContextDemotion:

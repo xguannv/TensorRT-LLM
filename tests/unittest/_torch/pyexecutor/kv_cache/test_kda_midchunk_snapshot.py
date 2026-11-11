@@ -18,6 +18,7 @@ SSM snapshot pages of the KV cache manager V2 C++ backend; a test writes the
 states the KDA layers would.
 """
 
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -30,6 +31,9 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import BlockReusePolicy
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    mamba_cache_manager_v2 as mamba_cache_manager_v2_module,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import HybridCachePolicy, RuntimeHooks
@@ -168,6 +172,8 @@ def _manager_stub(local_num_mamba_layers=1, alignment=64):
     mgr._reuse_token_source = lambda request: request.tokens
     mgr._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
     mgr.kv_cache_map = {}
+    # Logged just now, so the rate-limited INFO counters stay quiet.
+    mgr._branch_snapshot_counters_logged_at = time.monotonic()
     return mgr
 
 
@@ -185,6 +191,7 @@ def _context_request(request_id, cur, chunk, prompt_len, points, alignment=64):
         py_midchunk_snapshot_alignment=alignment,
         tokens=tokens,
         is_last_context_chunk=True,
+        py_conversation_params=None,
     )
     request.context_remaining_length = prompt_len - cur
     return request, tokens
@@ -465,6 +472,106 @@ def test_record_branch_snapshot_point_marks_the_pass_point():
     assert mgr._format_branch_snapshot_counters().endswith(
         " midchunk_snapshots_taken=0 midchunk_snapshots_skipped=0"
     )
+
+
+def _counters_stub():
+    mgr = _manager_stub()
+    mgr.tokens_per_block = 128
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        block_reuse_config=BlockReuseConfig(enable_branch_snapshot=True),
+    )
+    mgr._snapshot_pruned_tokens_total = 0
+    mgr._page_pruned_tokens_total = 0
+    mgr._branch_snapshots_skipped_total = {}
+    return mgr
+
+
+def test_reuse_breakdown_classes_fresh_lookups():
+    """A request's first fresh lookup is new / known / none by its conversation;
+    a later fresh lookup of the same request (a released claim) is rep."""
+    mgr = _counters_stub()
+    kv_cache = SimpleNamespace(
+        _get_num_reusable_tokens_before_pruning=lambda: 700,
+        _get_num_reusable_tokens_before_hybrid_pruning=lambda: 640,
+        num_committed_tokens=512,
+    )
+    no_match = SimpleNamespace(
+        _get_num_reusable_tokens_before_pruning=lambda: 0,
+        _get_num_reusable_tokens_before_hybrid_pruning=lambda: 0,
+        num_committed_tokens=0,
+    )
+
+    def lookup(request_id, conversation_id, matched=True):
+        request, _ = _context_request(request_id, 0, 1000, 1000, [1000])
+        if conversation_id is not None:
+            request.py_conversation_params = SimpleNamespace(conversation_id=conversation_id)
+        mgr._record_branch_snapshot_point(
+            request, kv_cache if matched else no_match, num_lookup_tokens=999
+        )
+
+    lookup(1, "a", matched=False)
+    lookup(2, "a")
+    lookup(2, "a")
+    lookup(3, " ")
+    # A resumed cache is not a fresh lookup.
+    mgr._record_branch_snapshot_point(
+        _context_request(4, 0, 1000, 1000, [1000])[0], kv_cache, num_lookup_tokens=None
+    )
+    assert mgr._reuse_breakdown.format() == (
+        "reuse_new=n:1,hit:0,lookup:999,matched:0,attn:0,reused:0 "
+        "reuse_known=n:1,hit:1,lookup:999,matched:700,attn:640,reused:512 "
+        "reuse_none=n:1,hit:1,lookup:999,matched:700,attn:640,reused:512 "
+        "reuse_rep=n:1,hit:1,lookup:999,matched:700,attn:640,reused:512"
+    )
+
+
+def test_inflight_prefix_counters():
+    """Distinct waiter points are counted when requested and when committed;
+    prefix waits are counted as the scheduler reports them."""
+    mgr = _counters_stub()
+    mgr.num_extra_kv_tokens = 0
+    owner, _ = _context_request(1, 0, 256, 1000, [1000])
+    assert mgr.request_prefix_snapshot(owner, 520)
+    assert mgr.request_prefix_snapshot(owner, 600)  # rounds down to the same point
+    assert not mgr.request_prefix_snapshot(owner, 1100)  # past the prompt
+    mgr.count_prefix_waits(2)
+    mgr._count_snapshot_commit(owner, 256)
+    mgr._count_snapshot_commit(owner, 512)
+    assert mgr._format_inflight_prefix_counters() == (
+        "inflight_prefix_deferrals=2 inflight_prefix_points_requested=1 "
+        "inflight_prefix_points_taken=1"
+    )
+    assert "inflight_prefix_deferrals=2" in mgr._format_branch_snapshot_counters()
+
+
+def test_snapshot_counters_are_logged_at_info_once_a_minute(monkeypatch):
+    mgr = _counters_stub()
+    mgr._branch_snapshot_counters_logged_at = float("-inf")
+    mgr.impl = SimpleNamespace(cache_tier_list=[object(), object()])
+    mgr._get_storage_statistics = lambda level: [
+        SimpleNamespace(free=level + 1, evictable=2, total=10),
+        SimpleNamespace(free=0, evictable=0, total=4),
+    ]
+    clock = iter([1000.0, 1030.0, 1061.0])
+    monkeypatch.setattr(time, "monotonic", lambda: next(clock))
+    info = MagicMock()
+    monkeypatch.setattr(mamba_cache_manager_v2_module.logger, "info", info)
+    request, _ = _context_request(1, 0, 1000, 1000, [1000])
+    kv_cache = SimpleNamespace(
+        _get_num_reusable_tokens_before_pruning=lambda: 0,
+        _get_num_reusable_tokens_before_hybrid_pruning=lambda: 0,
+        num_committed_tokens=0,
+    )
+    for _ in range(3):
+        mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=999)
+    assert info.call_count == 2
+    line = info.call_args.args[0]
+    assert line.startswith("[MambaHybridCacheManagerV2] recurrent snapshot counters ")
+    assert "inflight_prefix_deferrals=0" in line
+    assert "midchunk_snapshots_taken=0" in line
+    assert "reuse_rep=n:1," in line
+    assert line.endswith("slots_free+evictable/total=L0=[1+2/10,0+0/4] L1=[2+2/10,0+0/4]")
 
 
 @pytest.mark.parametrize("case", ["not_run", "inactive", "lost_page", "already_committed"])
