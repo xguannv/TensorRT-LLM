@@ -163,6 +163,13 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_sm107_routing.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/sm107_parts/test_k3_mla_ctx_split_k.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/sm107_parts/test_k3_unified_draft_binding.py
+  # Kimi K3 family glue and kernels: V1 import scan, source parity with V1 / the reference,
+  # and the KDA mid-chunk snapshot plan (their GPU cases are in l0_b300).
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_v1_imports.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/common/test_k3_common.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/common/test_k3_kda_metadata.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_situ/test_k3r_situ.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_rms_norm_gated/test_k3r_rms_norm_gated.py
   # MiniMax-M3 sm_107 tp2 target: its device-free (cpu_only) tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_block_table_contract.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_n_valid_contract.py
