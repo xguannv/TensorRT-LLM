@@ -34,8 +34,14 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 from ..common.multi_stream import do_multi_stream
 from ..ops.moe.k3_moe_residual_add import k3_moe_residual_add as k3_moe_residual_add_op
 from ..ops.moe.k3r_experts import K3RoutedExperts, SortedRouting
+from ..sm107_parts.layers import (
+    GatedMlp,
+    RMSNormWeight,
+    fork_join,
+    gated_activation,
+    subgroup_mapping,
+)
 from .attn_res import _DeferredMoEResidual
-from .layers import GatedMlp, RMSNormWeight, fork_join, gated_activation, subgroup_mapping
 from .megamoe import K3MegaMoE
 from .text_config import _resolve_kimi_situ_betas
 

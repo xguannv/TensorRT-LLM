@@ -38,6 +38,7 @@ from tensorrt_llm.logger import logger
 
 from ..common.parallel import TensorParallelMode
 from ..common.weight_io import run_concurrently, text_model_weights
+from ..sm107_parts.layers import Bf16Linear, Fp8BlockScaleLinear, shard_range
 from .fp8_weight_read import (
     _convert_moe_mlps_to_fp8_weight_read,
     _Fp8BlockScaleWeightReadLinear,
@@ -46,7 +47,6 @@ from .fp8_weight_read import (
     _swap_linear_to_fp8_weight_read,
 )
 from .kda import K3KDALinearAttention
-from .layers import Bf16Linear, Fp8BlockScaleLinear, shard_range
 from .moe_runtime import K3MoERuntime
 
 _KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (

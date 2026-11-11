@@ -169,7 +169,7 @@ from ..ops.attention import k3_mla_cache as mla_cache
 from ..ops.attention.k3_context_fmha import k3_context_fmha
 from ..ops.attention.k3_mla_state import K3MlaAttnState
 from ..ops.attention.static_quantize_e4m3 import static_quantize_e4m3
-from .layers import Bf16Linear, Fp8BlockScaleLinear, RMSNormWeight, fork_join, rms_norm
+from ..sm107_parts.layers import Bf16Linear, Fp8BlockScaleLinear, RMSNormWeight, fork_join, rms_norm
 
 # Head dimensions (K-nope, K-pe, V) the split-K context FMHA is built for.
 _SPLIT_K_HEAD_DIMS = (128, 64, 128)

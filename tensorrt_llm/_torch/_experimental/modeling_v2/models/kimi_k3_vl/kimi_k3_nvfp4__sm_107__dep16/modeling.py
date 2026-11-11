@@ -73,6 +73,7 @@ from ..dspark.drafter import K3DSparkPath
 from ..dspark.shell import KimiK3SpecForCausalLM
 from ..ops.attention import _fp4_mla_decode as fp4_mla_decode
 from ..sm107_parts.constants import K3Sm107Constants
+from ..sm107_parts.layers import EmbeddingTable, GatedMlp, RMSNormWeight, rms_norm, subgroup_mapping
 from .attn_res import (
     _apply_attn_res,
     _apply_attn_res_add_and_rmsnorm,
@@ -85,7 +86,6 @@ from .attn_res import (
 from .constants import CONSTANTS
 from .kda import K3KDALinearAttention, K3MambaMetadata
 from .kv_balance import K3Dep16KvBalancedAdmission
-from .layers import EmbeddingTable, GatedMlp, RMSNormWeight, rms_norm, subgroup_mapping
 from .mla import K3MLARuntime, resolve_attention_quant_config
 from .moe_runtime import K3MoERuntime
 from .text_config import _get_text_config, _is_kda_layer, _is_mla_layer

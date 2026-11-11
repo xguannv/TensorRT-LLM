@@ -23,7 +23,12 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 from ..ops.gemm.k3_fp8w_lowm_gemm import k3_fp8w_lowm_gemm as k3_fp8w_lowm_gemm_op
 from ..ops.gemm.k3_mxfp8_gemm import k3_mxfp8_gemm as k3_mxfp8_gemm_op
-from .layers import Bf16Linear, Fp8BlockScaleLinear, fp8_block_scale_gemm, prepare_fp8_block_weight
+from ..sm107_parts.layers import (
+    Bf16Linear,
+    Fp8BlockScaleLinear,
+    fp8_block_scale_gemm,
+    prepare_fp8_block_weight,
+)
 
 # ---------------------------------------------------------------------------
 # FP8 block-scale weight read for attention and replicated MoE-layer MLP projections.

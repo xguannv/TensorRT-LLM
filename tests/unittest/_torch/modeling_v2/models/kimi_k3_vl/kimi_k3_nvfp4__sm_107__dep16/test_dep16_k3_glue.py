@@ -12,7 +12,7 @@ import pytest
 import torch
 from utils.util import getSMVersion
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__dep16 import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
     layers as linear,
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE

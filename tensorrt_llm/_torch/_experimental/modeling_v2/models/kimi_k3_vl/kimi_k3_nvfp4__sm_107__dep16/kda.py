@@ -92,7 +92,13 @@ from ..kernels.k3r_kda._kda_kernels import (
 )
 from ..ops.norm.rms_norm_gated_token_major import rms_norm_gated_token_major
 from ..ops.ssm.causal_conv1d_fwd import causal_conv1d_fwd
-from .layers import Bf16Linear, Fp8BlockScaleLinear, RMSNormWeight, ShortConvWeight, fork_join
+from ..sm107_parts.layers import (
+    Bf16Linear,
+    Fp8BlockScaleLinear,
+    RMSNormWeight,
+    ShortConvWeight,
+    fork_join,
+)
 
 # Prefill chunk of the kda_prefill entry.
 _PREFILL_CHUNK = 64
