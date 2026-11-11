@@ -327,6 +327,136 @@ def test_disaggregated_leader_cleanup_timeout_retains_guard(
     child.kill.assert_not_called()
 
 
+@pytest.mark.parametrize("cuda_device", [2, None])
+def test_disaggregated_leader_hands_its_cuda_device_to_the_proxy(
+    monkeypatch: pytest.MonkeyPatch, cuda_device: int | None
+) -> None:
+    """The proxy gets the leader's device; a leader that selected none passes none on."""
+    from tensorrt_llm.commands import serve
+    from tensorrt_llm.llmapi import mgmn_leader_node
+
+    device_env = serve.DisaggLauncherEnvs.TLLM_DISAGG_PROXY_CUDA_DEVICE.value
+    child = mock.MagicMock(pid=12345)
+    child.poll.return_value = 0
+    popen = mock.Mock(return_value=child)
+    monkeypatch.setattr(serve, "_child_p_global", None)
+    for name in (
+        serve.LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS.value,
+        serve.LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR.value,
+        serve.LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.value,
+        serve.DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT.value,
+        serve.DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX.value,
+        device_env,
+    ):
+        monkeypatch.setenv(name, "7")
+    monkeypatch.setenv("SLURM_PROCID", "2")
+    monkeypatch.setattr(serve, "find_free_ipc_addr", lambda: "ipc://fake-proxy")
+    monkeypatch.setattr(serve.subprocess, "Popen", popen)
+    monkeypatch.setattr(mgmn_leader_node, "launch_server_main", lambda comm: None)
+
+    serve._launch_disaggregated_leader(
+        SimpleNamespace(Get_rank=lambda: 0), 2, "fake", "info", cuda_device=cuda_device
+    )
+
+    proxy_env = popen.call_args.kwargs["env"]
+    # The proxy has no rank variables to derive a device from.
+    assert "SLURM_PROCID" not in proxy_env
+    if cuda_device is None:
+        assert device_env not in proxy_env
+    else:
+        assert proxy_env[device_env] == str(cuda_device)
+
+
+def _write_disagg_config(tmp_path: Path) -> Path:
+    import yaml
+
+    path = tmp_path / "disagg.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "hostname": "localhost",
+                "port": 8000,
+                "context_servers": {"num_instances": 1, "urls": ["localhost:8001"]},
+                "generation_servers": {"num_instances": 1, "urls": ["localhost:8002"]},
+            }
+        )
+    )
+    return path
+
+
+def _stub_worker_entry(monkeypatch: pytest.MonkeyPatch, serve: ModuleType) -> None:
+    monkeypatch.setattr(
+        serve._command_telemetry, "apply_disaggregated_telemetry_config", lambda *a, **k: None
+    )
+    monkeypatch.setattr(serve, "_build_llm_args_from_disagg_server_cfg", lambda args: {})
+    monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", "0")
+
+
+def test_disaggregated_mpi_worker_passes_the_leader_device_to_the_proxy_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A leader rank launches its proxy with the device set_cuda_device() selected."""
+    from tensorrt_llm import _utils
+    from tensorrt_llm.commands import serve
+    from tensorrt_llm.llmapi import disagg_utils
+
+    path = _write_disagg_config(tmp_path)
+    _stub_worker_entry(monkeypatch, serve)
+    monkeypatch.delenv(
+        serve.DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT.value, raising=False
+    )
+    monkeypatch.setenv(serve.DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX.value, "placeholder")
+    sub_comm = object()
+    launch_leader = mock.Mock()
+    monkeypatch.setattr(serve, "set_cuda_device", lambda: 3)
+    monkeypatch.setattr(disagg_utils, "split_world_comm", lambda configs: (True, 1, sub_comm))
+    monkeypatch.setattr(_utils, "set_mpi_comm", lambda comm: None)
+    monkeypatch.setattr(serve, "_launch_disaggregated_leader", launch_leader)
+
+    serve.disaggregated_mpi_worker.callback(
+        config_file=str(path), log_level="info", telemetry=False
+    )
+
+    launch_leader.assert_called_once_with(sub_comm, 1, str(path), "info", cuda_device=3)
+
+
+@pytest.mark.parametrize("device", ["3", None])
+def test_disaggregated_proxy_selects_the_device_its_leader_passed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, device: str | None
+) -> None:
+    """The proxy branch selects the leader's device, not the rank-derived one or device 0."""
+    from tensorrt_llm.commands import serve
+
+    path = _write_disagg_config(tmp_path)
+    _stub_worker_entry(monkeypatch, serve)
+    device_env = serve.DisaggLauncherEnvs.TLLM_DISAGG_PROXY_CUDA_DEVICE.value
+    monkeypatch.setenv(
+        serve.DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT.value, "1"
+    )
+    monkeypatch.setenv(serve.DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX.value, "1")
+    if device is None:
+        monkeypatch.delenv(device_env, raising=False)
+    else:
+        monkeypatch.setenv(device_env, device)
+    set_cuda_device = mock.Mock()
+    set_device = mock.Mock()
+    launch = mock.Mock()
+    monkeypatch.setattr(serve, "set_cuda_device", set_cuda_device)
+    monkeypatch.setattr(serve.torch.cuda, "set_device", set_device)
+    monkeypatch.setattr(serve, "_launch_disaggregated_server", launch)
+
+    serve.disaggregated_mpi_worker.callback(
+        config_file=str(path), log_level="info", telemetry=False
+    )
+
+    set_cuda_device.assert_not_called()
+    if device is None:
+        set_device.assert_not_called()
+    else:
+        set_device.assert_called_once_with(3)
+    launch.assert_called_once_with(str(path), {})
+
+
 if __name__ == "__main__":
     mode, directory, scenario = sys.argv[1], Path(sys.argv[2]), sys.argv[3]
     if mode == "descendant":

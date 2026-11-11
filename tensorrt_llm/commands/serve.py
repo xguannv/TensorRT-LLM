@@ -2896,7 +2896,7 @@ def _run_fleet_worker_impl():
     asyncio.run(server(host, port, sockets=[s]))
 
 
-def set_cuda_device():
+def set_cuda_device() -> int:
     if (os.getenv("OMPI_COMM_WORLD_RANK")):
         env_global_rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
     elif (os.getenv("SLURM_PROCID")):
@@ -2908,6 +2908,20 @@ def set_cuda_device():
         f"env_global_rank: {env_global_rank}, set device_id: {device_id} before importing mpi4py"
     )
     torch.cuda.set_device(device_id)
+    return device_id
+
+
+def _set_disagg_proxy_cuda_device():
+    """Put a disaggregated leader's proxy process on the leader's GPU.
+
+    The proxy runs without the MPI rank variables that set_cuda_device() reads.
+    Left on the default device, its first CUDA call creates a context on GPU 0,
+    one per leader on the node, when every rank can see every GPU.
+    """
+    device = os.environ.get(
+        DisaggLauncherEnvs.TLLM_DISAGG_PROXY_CUDA_DEVICE.value)
+    if device is not None:
+        torch.cuda.set_device(int(device))
 
 
 def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
@@ -2991,9 +3005,12 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
     _refuse_dense_dwdp_on_generation_servers(disagg_cfg)
 
     from tensorrt_llm._utils import mpi_rank
+    cuda_device = None
     if os.environ.get(DisaggLauncherEnvs.
                       TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
-        set_cuda_device()
+        cuda_device = set_cuda_device()
+    else:
+        _set_disagg_proxy_cuda_device()
     # Importing mpi4py after setting CUDA device. This is needed to work around an issue with mpi4py and CUDA
     from mpi4py.futures import MPICommExecutor
 
@@ -3044,8 +3061,11 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         # so any future use of llm_args here behaves the same way.
         _build_llm_args_from_disagg_server_cfg(server_cfg.other_args)
 
-        _launch_disaggregated_leader(sub_comm, instance_idx, config_file,
-                                     log_level)
+        _launch_disaggregated_leader(sub_comm,
+                                     instance_idx,
+                                     config_file,
+                                     log_level,
+                                     cuda_device=cuda_device)
 
     else:
         # Common workers
@@ -3058,6 +3078,8 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
 class DisaggLauncherEnvs(StrEnum):
     TLLM_DISAGG_INSTANCE_IDX = "TLLM_DISAGG_INSTANCE_IDX"
     TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT = "TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT"
+    # CUDA device the leader selected; the proxy it launches uses the same one.
+    TLLM_DISAGG_PROXY_CUDA_DEVICE = "TLLM_DISAGG_PROXY_CUDA_DEVICE"
     TLLM_DISAGG_DEPLOYMENT_ID = "TRTLLM_DISAGG_DEPLOYMENT_ID"
     TLLM_DISAGG_ROLE = "TRTLLM_DISAGG_ROLE"
 
@@ -3116,8 +3138,11 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
                   **launch_kwargs)
 
 
-def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
-                                 log_level: str):
+def _launch_disaggregated_leader(sub_comm,
+                                 instance_idx: int,
+                                 config_file: str,
+                                 log_level: str,
+                                 cuda_device: Optional[int] = None):
     global _child_p_global  # Declare usage of global variable
     # Assuming logger and mpi_rank are available from module imports or passed in
     from tensorrt_llm._utils import mpi_rank
@@ -3136,6 +3161,14 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT.
                value] = "1"
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] = str(instance_idx)
+    # The proxy cannot derive its GPU from the MPI rank (split_mpi_env() below
+    # strips those variables), so hand it the device this leader selected.
+    if cuda_device is None:
+        os.environ.pop(DisaggLauncherEnvs.TLLM_DISAGG_PROXY_CUDA_DEVICE.value,
+                       None)
+    else:
+        os.environ[DisaggLauncherEnvs.TLLM_DISAGG_PROXY_CUDA_DEVICE.
+                   value] = str(cuda_device)
 
     logger.debug(
         f"proxy controller address: {os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR]}"
