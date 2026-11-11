@@ -4904,6 +4904,13 @@ def create_py_executor_resources(
             context_starvation_iterations=scheduler_config.
             context_starvation_iterations
             if scheduler_config is not None else None,
+            context_demote_uncached_tokens=scheduler_config.
+            context_demote_uncached_tokens
+            if scheduler_config is not None else None,
+            context_demote_max_iters=scheduler_config.context_demote_max_iters
+            if scheduler_config is not None else None,
+            exact_context_demotion=runtime_hooks_of(
+                model_engine.model).exact_context_demotion,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):

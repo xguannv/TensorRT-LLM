@@ -4723,6 +4723,26 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
             "disables it."),
         status="prototype")
 
+    context_demote_uncached_tokens: Optional[NonNegativeInt] = Field(
+        default=None,
+        description=(
+            "KV cache manager V2 scheduler with chunked prefill: a context "
+            "request whose uncached prefill the attention-DP router estimates "
+            "above this many tokens goes to the tail of each iteration's "
+            "context order until no more than this many are left (reordered, "
+            "never capped). 0 disables it. None falls back to the "
+            "TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS environment variable."),
+        status="prototype")
+
+    context_demote_max_iters: Optional[NonNegativeInt] = Field(
+        default=None,
+        description=(
+            "With context_demote_uncached_tokens: a request demoted for this "
+            "many iterations is let through for good (0 = no bound). None "
+            "falls back to the TLLM_V2_CTX_DEMOTE_MAX_ITERS environment "
+            "variable."),
+        status="prototype")
+
     @model_validator(mode="after")
     def validate_context_starvation_iterations(self) -> 'SchedulerConfig':
         if (self.context_starvation_iterations is not None

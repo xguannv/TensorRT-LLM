@@ -1456,6 +1456,16 @@
       "path": "scheduler_config.context_chunking_policy"
     },
     {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "scheduler_config.context_demote_max_iters"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "scheduler_config.context_demote_uncached_tokens"
+    },
+    {
       "allowed_values": [
         "fcfs",
         "shortest_uncached_first"
