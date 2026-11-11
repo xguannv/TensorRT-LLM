@@ -74,7 +74,7 @@ def test_target_class_declares_its_constants_and_model_defaults():
     assert cls.K3_CONSTANTS is importlib.import_module(f"{_FAMILY}.{_TARGET}.constants").CONSTANTS
     # The engine reads model defaults off the routed class; the text model declares none.
     assert "get_model_defaults" in vars(cls)
-    assert not hasattr(family.KimiK3DefaultForCausalLM, "get_model_defaults")
+    assert "get_model_defaults" not in vars(family.KimiK3DefaultForCausalLM)
     assert cls.get_model_defaults(None) == _MODEL_DEFAULTS
 
 

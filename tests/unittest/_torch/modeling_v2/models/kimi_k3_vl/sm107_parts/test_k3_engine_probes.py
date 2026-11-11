@@ -534,7 +534,7 @@ def test_dspark_worker_takes_the_shared_slot_calls():
 # The FP8 block-scale projections of K3's MLA layer; ``KimiK3ForCausalLM._finalize_weight_load``
 # swaps each one for ``_Fp8BlockScaleWeightReadLinear``.
 _K3_MLA_PROJECTIONS = ("kv_a_proj_with_mqa", "q_b_proj", "kv_b_proj", "o_proj", "g_proj")
-_K3_MLA_MODULES = ("mla",)
+_K3_MLA_MODULES = ("sm107_parts.mla",)
 # Read through ``getattr(proj, name, None)``; the bias-free FP8 projection has none.
 _OPTIONAL_PROJECTION_READS = frozenset({"bias"})
 
