@@ -1222,6 +1222,20 @@ class K3DFlashWorker(SpecWorkerBase):
     def target_vocab_parallel_head(self) -> Optional[K3VocabParallelHead]:
         return None if self._vocab_parallel is None else self._vocab_parallel.head
 
+    def target_head_rows(self, hidden_states: torch.Tensor, attn_metadata, spec_metadata):
+        """On the ``tail_v2`` path a generation-only batch gathers every token in order (gather
+        ids 0..num_tokens-1), so the head reads ``hidden_states`` itself instead of an index copy
+        of it. The head only reads these rows, so the worker's forward still sees them unchanged."""
+        gather_ids = spec_metadata.gather_ids
+        if (
+            self._path.tail_v2
+            and attn_metadata.num_contexts == 0
+            and gather_ids is not None
+            and gather_ids.shape[0] == hidden_states.shape[0]
+        ):
+            return hidden_states
+        return super().target_head_rows(hidden_states, attn_metadata, spec_metadata)
+
     def target_logits(
         self,
         hidden_states: torch.Tensor,

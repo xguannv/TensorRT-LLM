@@ -248,7 +248,7 @@ class KimiK3SpecForCausalLM(DecoderModelForCausalLM[TModel, TConfig], Generic[TM
 
         # The target logits, in the layout the worker's acceptance reads.
         logits = self.spec_worker.target_logits(
-            hidden_states[spec_metadata.gather_ids],
+            self.spec_worker.target_head_rows(hidden_states, attn_metadata, spec_metadata),
             self.lm_head,
             self.logits_processor,
             attn_metadata,
