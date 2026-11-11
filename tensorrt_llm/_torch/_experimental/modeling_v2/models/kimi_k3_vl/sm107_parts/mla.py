@@ -12,7 +12,8 @@ This module holds the weights and the forward of every phase (``K3MLAAttention``
 and generation attention chains, K3's split-K context FMHA, the fused Helix tail and the layer's
 runtime (``K3MLARuntime``); ``ops/attention/_fp4_mla_decode`` holds K3's FP4 decode and
 ``kernels/mla/q_norm_pdl`` the PDL RMSNorm.
-``TrtllmAttention`` and the KV cache managers are the runtime.
+The engine owns the KV cache managers; the attention calls over them are the family ops of
+``ops/attention/k3_mla_{attention,cache}``, which read the pools from the attention metadata.
 
 Kimi K3 MLA: K3-owned weights and the explicit kernel chain of every phase.
 
@@ -23,8 +24,9 @@ Weights (``layers`` containers, the checkpoint loader's names): the fused q_a / 
 (``k_b_proj_trans`` / ``v_b_proj``, their FP8 scales and BF16 dequantized copies, and under Helix
 ``helix_v_b_proj_full``). FP8 projections are ``Fp8BlockScaleLinear`` until the loader swaps them
 for its FP8 weight-read GEMM; BF16 projections are ``Bf16Linear``. The context and generation
-attention runtime is ``TrtllmAttention`` (``mha``: 192-dim context heads, ``mqa``: the 576-dim
-absorbed latent head), whose RoPE table is an identity table owned here (K3 is NoPE).
+attention roles are ``K3MlaAttnState`` (``ops/attention/k3_mla_state``; ``mha``: 192-dim context
+heads, ``mqa``: the 576-dim absorbed latent head), whose RoPE table is an identity table (K3 is
+NoPE).
 
 One forward of ``T`` tokens (the first ``T_ctx`` context rows):
 
@@ -53,10 +55,11 @@ weights and attention backends. The chain of one generation batch of ``T`` token
 * **W_UK and the cache update** (:func:`forward_absorption_generation`): the absorption BMM of the
   query's NoPE half into the latent query (BF16 ``trtllm::bmm_out`` on ``k_b_proj_trans``, or
   ``torch.bmm`` on its dequantized copy for FP8 KV-B) beside
-  ``TrtllmAttention.mla_rope_generation`` (identity RoPE, the cache append and, on an FP4 cache,
-  the FP4 query quantization), on the attention aux stream for a BF16 cache.
+  ``mla_rope_generation`` (identity RoPE, the cache append and, on an FP4 cache, the FP4 query
+  quantization), on the attention aux stream for a BF16 cache.
 * **Attention** (:func:`gen_attention`): K3's packed FP4 decode (``ops/attention/_fp4_mla_decode``) on an FP4
-  cache with the CuTe DSL FP4 MLA backend, else ``TrtllmAttention.forward``.
+  cache with the CuTe DSL FP4 MLA backend; on an FP8 cache the CuTe DSL FP8 MLA decode where it serves
+  the batch, else the attention op's MLA generation (``mla_fp8_decode``).
 * **Helix CP** (:func:`attn_forward_gen`): the V up-projection of this rank's partials
   (``trtllm::bmm_out`` on ``helix_v_b_proj_full``), then the fifo-v2 MNNVL all-to-all
   (``HelixAllToAllNative.alltoall_native``, which zeroes the rows this rank holds no KV for) and
@@ -94,25 +97,26 @@ Sizes and features:
 Kimi K3 MLA context attention: one kernel chain per cache state.
 
 Every function takes the layer (:class:`~.kimi_k3_mla_attention.K3MLAAttention`) for its
-weights and its context attention backend ``mha`` (``TrtllmAttention``, ``H`` context heads of
+weights and its context attention role ``mha`` (``K3MlaAttnState``, ``H`` context heads of
 192 / 128 dims). :func:`forward_context` picks the chain:
 
 * **No cached prefix** (:func:`context_default`): kv_b over the batch's latent rows (a BF16 kv_b on
   SM100f: two per-head ``trtllm::bmm_out`` writing K-nope into the strided K buffer and V into a
   ``[K-nope | V]``-strided buffer; otherwise the kv_b GEMM and a copy of K-nope into K), then
-  ``TrtllmAttention.forward`` with ``latent_cache``, which applies the identity RoPE, appends the
-  cache and runs the context FMHA. Owner-only Helix prefill appends the KV it owns first
+  the context FMHA with ``latent_cache`` (``mla_context_attention``), which applies the identity
+  RoPE, appends the cache and attends; on an FP4 cache ``fp4_mla_context_attention`` (the FP8 context
+  FMHA over the step's FP8 scratch cache beside the FP4 scatter). Owner-only Helix prefill appends the KV it owns first
   (``mla_rope_append_paged_kv_assign_q``) and passes K with its K-pe and no ``latent_cache``.
 * **Chunked prefill over an FP8 / BF16 cache** (:func:`context_chunked_prefill`):
   ``mla_rope_append_paged_kv_assign_q``; then per cached-prefix partition
-  ``load_chunked_kv_cache_for_mla``, the K / V expansion and ``TrtllmAttention.forward`` with a full
+  ``load_chunked_kv_cache_for_mla``, the K / V expansion and ``mla_context_attention`` with a full
   mask into a temporary output merged with ``merge_attention_for_mla``; the current chunk last,
   causal. On an FP8 cache with the FP8 context FMHA (``fp8_cached_kv_context``) Q is quantized once
   (``static_quantize_e4m3_per_tensor``) and each expansion is kv_b + ``mla_kv_to_fp8`` (FP8 K / V in
   one pass), handed to the op as already-quantized inputs; otherwise kv_b and the BF16 K-nope /
   K-pe concat.
 * **Cached prefix without chunked prefill** (:func:`context_cached_kv`): the same expansion over the
-  whole paged cache (``load_paged_kv_cache_for_mla``) in one ``TrtllmAttention.forward``.
+  whole paged cache (``load_paged_kv_cache_for_mla``) in one ``mla_context_attention``.
 * **Chunked prefill over an FP4 cache**: the Rubin FP8 split-K context FMHA
   (``forward_context_split_k_fp4``).
 
@@ -122,7 +126,7 @@ The chunked prefill of an MLA layer with an NVFP4 latent cache (:func:`forward_c
 where :func:`uses_k3_split_k_context` holds: SM107, matching Q / KV heads, head dimensions
 128 / 64 / 128, the CuTe DSL kernel imports, BF16 Q and output without an output scale):
 
-* ``TrtllmAttention.append_fp4_mla_context_cache`` rotates Q and the current K (identity RoPE)
+* ``append_fp4_mla_context_cache`` rotates Q and the current K (identity RoPE)
   and appends the chunk to the FP4 cache;
 * each cached-prefix partition, and then the current chunk (causal), runs the Rubin FP8 split-K
   context FMHA (``ops/attention/k3_context_fmha``, ``kernels/k3_context_fmha.py``), which reads
@@ -136,9 +140,9 @@ where :func:`uses_k3_split_k_context` holds: SM107, matching Q / KV heads, head 
 * where kv_b is the FP8 block-scale GEMM with its weight scale in the SM107 CuTe MXFP8 layout
   (:func:`kv_b_takes_mxfp8`), each cached-prefix partition is gathered from the FP4 cache straight
   into MXFP8 (``ops/attention/fp4_mla_gather_mxfp8``), the current chunk is quantized with
-  ``fp8_quantize_1x128_packed_ue8m0``, and kv_b runs as ``cute_dsl_mxfp8_gemm_rubin`` (BF16
-  output); otherwise the BF16 gather and kv_b run. Either output is quantized with
-  ``static_quantize_e4m3_per_tensor``.
+  ``fp8_quantize_1x128_packed_ue8m0``, and kv_b runs as ``cute_dsl_mxfp8_gemm_rubin`` writing FP8
+  (the BF16 rounding at unit output scale); otherwise the BF16 gather and kv_b run and the output is
+  quantized with ``static_quantize_e4m3_per_tensor``.
 
 Kimi K3 NVFP4 on Rubin (SM107): the MLA layer.
 
@@ -158,13 +162,7 @@ import torch
 import triton
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import bmm_out
-from tensorrt_llm._torch.attention.backends import (
-    AttentionForwardArgs,
-    AttentionInputType,
-    AttentionMetadata,
-    TrtllmAttention,
-    TrtllmAttentionMetadata,
-)
+from tensorrt_llm._torch.attention.backends import AttentionMetadata, TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
     FP4_MLA_K_RESIDUAL_DIM,
     _fp4_mla_attention_backend,
@@ -177,7 +175,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.layout import (
 from tensorrt_llm._torch.attention.backends.fp4_mla.metadata import (
     _materialize_fp4_mla_device_page_table_for_forward,
 )
-from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.distributed import HelixAllToAllNative
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
@@ -190,7 +187,10 @@ from ..kernels.k3r_mla_ctx import fp8_static_quant
 from ..kernels.k3r_mla_ctx.mla_kv_fp8 import mla_kv_to_fp8
 from ..ops.attention import _fp4_mla_decode as fp4_mla_decode
 from ..ops.attention import k3_fp4_mla_decode as _decode_op
+from ..ops.attention import k3_mla_attention as mla_attn
+from ..ops.attention import k3_mla_cache as mla_cache
 from ..ops.attention.k3_context_fmha import k3_context_fmha
+from ..ops.attention.k3_mla_state import K3MlaAttnState
 from ..ops.attention.static_quantize_e4m3 import static_quantize_e4m3
 from .constants import K3Sm107Constants
 from .layers import fork_join, rms_norm
@@ -209,15 +209,12 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch import kimi_k3_cache_policy as _kimi_k3_cache_policy
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
-from tensorrt_llm._torch.attention.backends.utils import create_attention
 from tensorrt_llm._torch.custom_ops import BufferKind
 from tensorrt_llm._torch.distributed.mnnvl_memory import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import eager_on_graph
 from tensorrt_llm._torch.utils import AuxStreamType, get_model_extra_attrs
-from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -446,14 +443,13 @@ def load_fp4_mla_chunked_kv_cache_mxfp8(
 
 def uses_k3_split_k_context(layer, q: torch.Tensor, output: torch.Tensor) -> bool:
     """Whether the FP4-cache chunked prefill of ``layer`` runs on the split-K context FMHA: BF16 Q
-    and output, an NVFP4 latent cache on ``TrtllmAttention`` and
-    :func:`supports_k3_fp8_split_k_context`."""
+    and output, an NVFP4 latent cache and :func:`supports_k3_fp8_split_k_context`."""
     mha = layer.mha
     return (
         q.dtype == torch.bfloat16
         and output.dtype == torch.bfloat16
         and layer.out_scale is None
-        and isinstance(mha, TrtllmAttention)
+        and isinstance(mha, K3MlaAttnState)
         and mha.uses_fp4_mla_attention
         and supports_k3_fp8_split_k_context(mha)
     )
@@ -512,7 +508,7 @@ def forward_context_split_k_fp4(
 
     # Rotate Q and the current K in place and append the chunk to the FP4 cache; the current
     # chunk's rotated K-pe is then read from latent_cache.
-    mha.append_fp4_mla_context_cache(q, latent_cache, attn_metadata)
+    mla_cache.append_fp4_mla_context_cache(mha, q, latent_cache, attn_metadata)
     current_k_pe = latent_cache.reshape(-1, lora + rope)[:, lora:]
     fp8_unit_scale = mha.kv_cache_scaling_factor
     q_fp8 = static_quantize_e4m3(q.contiguous(), fp8_unit_scale)
@@ -537,15 +533,13 @@ def forward_context_split_k_fp4(
                 activation, activation_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
                     partition_compressed_kv.contiguous()
                 )
-            # The GEMM writes BF16 only; FP8 at unit scale from its BF16 rounding.
-            partition_kv, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
-                    activation,
-                    layer.kv_b_proj.weight,
-                    activation_scale,
-                    layer.kv_b_proj.weight_scale,
-                ),
-                fp8_unit_scale,
+            # The FP8 output keeps the GEMM's BF16 rounding (unit output scale).
+            partition_kv = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+                activation,
+                layer.kv_b_proj.weight,
+                activation_scale,
+                layer.kv_b_proj.weight_scale,
+                output_dtype=torch.float8_e4m3fn,
             )
         else:
             partition_kv, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
@@ -564,7 +558,7 @@ def forward_context_split_k_fp4(
         logger.info_once(
             "Kimi K3 MLA context expand: per-chunk kv_b_proj runs as "
             + (
-                "cute_dsl_mxfp8_gemm_rubin (MXFP8 in, BF16 out) + static_quantize_e4m3_per_tensor"
+                "cute_dsl_mxfp8_gemm_rubin (MXFP8 in, FP8 out)"
                 if kv_b_mxfp8
                 else "kv_b_proj (BF16) + static_quantize_e4m3_per_tensor"
             )
@@ -616,8 +610,9 @@ def forward_context_split_k_fp4(
                 qk_rope_head_dim=rope,
             )
         else:
-            chunked_compressed_kv, chunked_k_pe = mha.load_chunked_kv_cache_for_mla(
-                metadata=attn_metadata,
+            chunked_compressed_kv, chunked_k_pe = mla_cache.load_chunked_kv_cache_for_mla(
+                mha,
+                attn_metadata,
                 num_ctx_cached_tokens=total_chunked_tokens,
                 cu_chunked_seq_len=cu_chunked_seq_len,
                 chunked_global_offset=attn_metadata.chunked_global_offset[loop_idx],
@@ -671,7 +666,6 @@ __all__ = [
     "q_fused_applies",
     "tail_output_buffer",
     "K3MLAAttention",
-    "identity_rope_table",
 ]
 
 
@@ -809,7 +803,7 @@ def context_default(
     append_owned_kv = md.helix_context_local_slots is not None
     k_pe = None
     if append_owned_kv:
-        layer.mha.mla_rope_append_paged_kv_assign_q(q, latent_cache, md)
+        mla_cache.mla_rope_append_paged_kv_assign_q(layer.mha, q, latent_cache, md)
         k_pe = latent_cache[:, layer.kv_lora_rank :]
     k = torch.empty_like(q).view(-1, heads, layer.qk_head_dim)
     if _kv_b_strided_out(layer):
@@ -839,17 +833,11 @@ def context_default(
     if append_owned_kv:
         k[..., nope:] = k_pe.view(-1, 1, rope)
     k = k.view(-1, heads * layer.qk_head_dim)
-    return layer.mha.forward(
-        q,
-        k,
-        v,
-        md,
-        forward_args=AttentionForwardArgs(
-            attention_input_type=AttentionInputType.context_only,
-            latent_cache=None if append_owned_kv else latent_cache,
-            out_scale=None,
-            output=output,
-        ),
+    if layer.mha.uses_fp4_mla_attention:
+        # The FP8 context FMHA over the step's FP8 scratch cache beside the FP4 scatter.
+        return mla_cache.fp4_mla_context_attention(layer.mha, q, k, v, md, output, latent_cache)
+    return mla_attn.mla_context_attention(
+        layer.mha, q, k, v, md, output, latent_cache=None if append_owned_kv else latent_cache
     )
 
 
@@ -862,8 +850,8 @@ def context_cached_kv(
 ) -> torch.Tensor:
     """Context attention over the whole paged cache (cached prefix, no chunked prefill)."""
     mha = layer.mha
-    mha.mla_rope_append_paged_kv_assign_q(q, latent_cache, md)
-    full_compressed_kv, full_k_pe = mha.load_paged_kv_cache_for_mla(md, q.dtype)
+    mla_cache.mla_rope_append_paged_kv_assign_q(mha, q, latent_cache, md)
+    full_compressed_kv, full_k_pe = mla_cache.load_paged_kv_cache_for_mla(mha, md, q.dtype)
     assert full_compressed_kv.shape == (
         md.num_ctx_cached_tokens + md.num_ctx_tokens,
         layer.kv_lora_rank,
@@ -877,18 +865,8 @@ def context_cached_kv(
     else:
         full_k, full_v = _expand_kv_bf16(layer, full_compressed_kv, full_k_pe)
     full_compressed_kv = full_k_pe = None
-    return mha.forward(
-        q,
-        full_k,
-        full_v,
-        md,
-        forward_args=AttentionForwardArgs(
-            attention_input_type=AttentionInputType.context_only,
-            latent_cache=None,
-            out_scale=None,
-            output=output,
-            **_fp8_q_args(layer, q_fp8),
-        ),
+    return mla_attn.mla_context_attention(
+        mha, q, full_k, full_v, md, output, **_fp8_q_args(layer, q_fp8)
     )
 
 
@@ -903,7 +881,7 @@ def context_chunked_prefill(
     """Chunked-prefill context attention over an FP8 / BF16 cache (see the module docstring)."""
     mha = layer.mha
     heads = layer.num_context_heads
-    mha.mla_rope_append_paged_kv_assign_q(q, latent_cache, md)
+    mla_cache.mla_rope_append_paged_kv_assign_q(mha, q, latent_cache, md)
     fp8 = layer.fp8_cached_kv_context
     expand = _expand_kv_fp8 if fp8 else _expand_kv_bf16
     # With FP8 attention inputs, Q is quantized once for every partition.
@@ -923,8 +901,9 @@ def context_chunked_prefill(
 
     for loop_idx in range(md.chunked_loop_num):
         total_chunked_tokens = md.host_cu_chunked_seq_len[loop_idx, md.num_contexts]
-        chunked_compressed_kv, chunked_k_pe = mha.load_chunked_kv_cache_for_mla(
-            metadata=md,
+        chunked_compressed_kv, chunked_k_pe = mla_cache.load_chunked_kv_cache_for_mla(
+            mha,
+            md,
             num_ctx_cached_tokens=total_chunked_tokens,
             cu_chunked_seq_len=md.cu_chunked_seq_len[loop_idx],
             chunked_global_offset=md.chunked_global_offset[loop_idx],
@@ -939,23 +918,20 @@ def context_chunked_prefill(
         md.kv_lens_runtime = md.host_chunked_seq_len[loop_idx]
         md.kv_lens_cuda_runtime = md.chunked_seq_len[loop_idx]
         md.host_total_kv_lens[0] = total_chunked_tokens
-        temp_output = mha.forward(
+        temp_output = mla_attn.mla_context_attention(
+            mha,
             q,
             chunked_k,
             chunked_v,
             md,
-            forward_args=AttentionForwardArgs(
-                attention_input_type=AttentionInputType.context_only,
-                latent_cache=None,
-                out_scale=None,
-                attention_mask=PredefinedAttentionMask.FULL,
-                softmax_stats_tensor=temp_softmax_stats,
-                chunked_prefill_buffer_batch_size=buffer_batch_size,
-                output=temp_output,
-                **q_args,
-            ),
+            temp_output,
+            full_mask=True,
+            softmax_stats=temp_softmax_stats,
+            chunked_prefill_buffer_batch_size=buffer_batch_size,
+            **q_args,
         )
-        mha.merge_attention_for_mla(
+        mla_cache.merge_attention_for_mla(
+            mha,
             output,
             temp_output,
             softmax_stats,
@@ -972,22 +948,19 @@ def context_chunked_prefill(
     md.kv_lens_runtime = md.prompt_lens_cpu_runtime
     md.kv_lens_cuda_runtime = md.prompt_lens_cuda_runtime
     md.host_total_kv_lens[0] = md.prompt_lens_cpu_runtime[: md.num_contexts].sum().item()
-    temp_output = mha.forward(
+    temp_output = mla_attn.mla_context_attention(
+        mha,
         q,
         k,
         v,
         md,
-        forward_args=AttentionForwardArgs(
-            attention_input_type=AttentionInputType.context_only,
-            latent_cache=None,
-            out_scale=None,
-            softmax_stats_tensor=temp_softmax_stats,
-            chunked_prefill_buffer_batch_size=buffer_batch_size,
-            output=temp_output,
-            **q_args,
-        ),
+        temp_output,
+        softmax_stats=temp_softmax_stats,
+        chunked_prefill_buffer_batch_size=buffer_batch_size,
+        **q_args,
     )
-    mha.merge_attention_for_mla(
+    mla_cache.merge_attention_for_mla(
+        mha,
         output,
         temp_output,
         softmax_stats,
@@ -1352,8 +1325,11 @@ def helix_tail_applies(layer, num_tokens: int) -> bool:
 
 
 def gen_attention(layer, q: torch.Tensor, md: AttentionMetadata, **kwargs) -> torch.Tensor:
-    """The absorbed decode: K3's packed FP4 decode on an FP4 cache with the CuTe DSL FP4 MLA
-    backend (with the layer's ``constants``), ``TrtllmAttention.forward`` otherwise."""
+    """The absorbed decode of ``q`` (``[T, H * 576]``) into a new ``[T, H * kv_lora_rank]``: K3's
+    packed FP4 decode on an FP4 cache with the CuTe DSL FP4 MLA backend (with the layer's
+    ``constants``); on an FP8 cache the CuTe DSL FP8 MLA decode where it serves the batch, else the
+    attention op's MLA generation (``ops/attention/k3_mla_attention``). ``kwargs``: the buffers of
+    the generation cache update (``mla_rope_generation``) and ``softmax_stats_tensor``."""
     if fp4_mla_decode.applies(layer.mqa):
         assert kwargs.get("out_scale") is None
         return _decode_op.k3_fp4_mla_decode(
@@ -1364,7 +1340,16 @@ def gen_attention(layer, q: torch.Tensor, md: AttentionMetadata, **kwargs) -> to
             page_plan=layer.constants.fp4_mla_page_plan,
             reduce_pdl=layer.constants.fp4_mla_reduce_pdl,
         )
-    return layer.mqa.forward(q, None, None, md, forward_args=AttentionForwardArgs(**kwargs))
+    mqa = layer.mqa
+    if mqa.uses_fp4_mla_attention:
+        raise NotImplementedError(
+            "Kimi K3 MLA: an FP4 MLA cache decodes on the CuTe DSL FP4 MLA backend (SM107)"
+        )
+    assert kwargs.pop("out_scale", None) is None
+    softmax_stats = kwargs.pop("softmax_stats_tensor", None)
+    output = q.new_empty((q.shape[0], mqa.num_heads * mqa.kv_lora_rank))
+    decode = mla_attn.mla_fp8_decode if mqa.has_fp8_kv_cache else mla_attn.mla_generation_attention
+    return decode(mqa, q, md, output, softmax_stats=softmax_stats, **kwargs)
 
 
 def _helix_gen(
@@ -1515,7 +1500,8 @@ def forward_absorption_generation(
     rope_kwargs = {"fuse_fp4_q_quant": True} if layer.fp4_kv else {}
 
     def rope_and_cache_update():
-        layer.mqa.mla_rope_generation(
+        mla_cache.mla_rope_generation(
+            layer.mqa,
             fused_q,
             q_pe,
             latent_cache,
@@ -1559,7 +1545,6 @@ def forward_absorption_generation(
         helix_v_up=helix_v_up,
         output=output if helix_v_up else None,
         hooks=hooks,
-        attention_input_type=AttentionInputType.generation_only,
         out_scale=None,
         latent_cache=latent_cache,
         q_pe=q_pe,
@@ -1740,13 +1725,11 @@ def forward_gen_q_fused(
     separate q_a RMSNorm), which writes the FP4 query rows into the Q buffers the cache update
     recorded on the metadata. The decode joins both; it reads only those buffers (the BF16
     ``fused_q`` it is handed provides shapes)."""
-    from tensorrt_llm._torch.attention.backends.fp4_mla.cache_update import (
-        _prepare_fp4_mla_q_buffers,
-    )
     from tensorrt_llm._torch.attention.backends.fp4_mla.config import _fp4_mla_packed_rows_per_seq
     from tensorrt_llm._torch.attention.backends.fp4_mla.layout import _get_fp4_mla_q_global_scale
 
     from ..kernels.k3r_mla_q import k3_mla_q_fused as q_fused_kernel
+    from ..ops.attention._k3_fp4_mla_cache import _prepare_fp4_mla_q_buffers
     from ..ops.attention.fp4_mla_kv_append import fp4_mla_kv_append
     from ..ops.attention.k3_mla_q_fused import k3_mla_q_fused
 
@@ -1813,7 +1796,6 @@ def forward_gen_q_fused(
         md,
         helix_v_up=True,
         hooks=hooks,
-        attention_input_type=AttentionInputType.generation_only,
         out_scale=None,
         latent_cache=latent_cache,
         q_pe=q_pe,
@@ -1845,68 +1827,6 @@ def _gate_side_stream(device: torch.device) -> torch.cuda.Stream:
         stream = torch.cuda.Stream(device=index, priority=0)
         _GATE_SIDE_STREAMS[index] = stream
     return stream
-
-
-# ---------------------------------------------------------------------------------------------
-# Identity RoPE table.
-# ---------------------------------------------------------------------------------------------
-
-# Identity (cos, sin) = (1, 0) tables by (device index, float count), shared by every layer.
-_IDENTITY_ROPE_TABLES: dict[Tuple[int, int], torch.Tensor] = {}
-
-
-def identity_rope_table(num_floats: int, device: torch.device) -> torch.Tensor:
-    """A ``[1, num_floats]`` FP32 table of interleaved ``(cos, sin) = (1, 0)`` pairs: the MLA RoPE
-    kernels' ``rotary_cos_sin`` layout, with every rotation the identity."""
-    device = torch.device(device)
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    key = (index, num_floats)
-    table = _IDENTITY_ROPE_TABLES.get(key)
-    if table is None:
-        table = torch.zeros(1, num_floats, dtype=torch.float32, device=device)
-        table.view(-1)[0::2] = 1.0
-        if not torch.cuda.is_current_stream_capturing():
-            # Written before any kernel on another stream reads it.
-            torch.cuda.synchronize(device)
-        _IDENTITY_ROPE_TABLES[key] = table
-    return table
-
-
-def _install_identity_rope(backend: TrtllmAttention) -> None:
-    """Give ``backend`` the identity table in place of its sinusoid table (same shape), and grow
-    it as an identity table where the backend needs more positions."""
-    cos_sin = backend.rotary_cos_sin
-    if cos_sin is None:
-        raise RuntimeError("the MLA attention backend has no RoPE table to replace")
-    backend.rotary_cos_sin = identity_rope_table(cos_sin.numel(), cos_sin.device)
-    rope = backend.rope_params
-    floats_per_position = rope.dim * (2 if rope.duplicate_data else 1)
-
-    def ensure_table_size(required_max_positions: int) -> None:
-        table_positions = backend.rotary_cos_sin.numel() // floats_per_position
-        rope.max_positions = max(rope.max_positions, table_positions, required_max_positions)
-        if required_max_positions > table_positions:
-            backend.rotary_cos_sin = identity_rope_table(
-                rope.max_positions * floats_per_position, backend.rotary_cos_sin.device
-            )
-
-    backend._ensure_rope_table_size = ensure_table_size
-
-
-def _pos_embd_params(qk_rope_head_dim: int, max_position_embeddings: int):
-    """The RoPE configuration the MLA kernels index the table with: GPT-NeoX type, interleaved
-    (cos, sin) pairs duplicated over the rope dim (the FP4 MLA cache update requires it)."""
-    return PositionalEmbeddingParams(
-        type=PositionEmbeddingType.rope_gpt_neox,
-        rope=RopeParams(
-            dim=qk_rope_head_dim,
-            theta=10000.0,
-            max_positions=max_position_embeddings,
-            original_max_positions=max_position_embeddings,
-            duplicate_data=True,
-        ),
-        is_neox=False,
-    )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2121,49 +2041,30 @@ class K3MLAAttention(nn.Module):
 
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
-        pos_embd_params = _pos_embd_params(qk_rope_head_dim, max_position_embeddings)
-        mla_dims = dict(
-            pos_embd_params=pos_embd_params,
-            quant_config=quant_config,
-            q_scaling=1.0,
-            is_mla_enable=True,
+        # The two attention roles over the engine's KV cache (``ops/attention/k3_mla_state``): the
+        # absorbed generation (``mqa``: one 576-dim latent head per query head) and the context
+        # (``mha``: 192 / 128-dim heads), each with the identity RoPE table (K3 is NoPE).
+        role_dims = dict(
+            layer_idx=layer_idx,
             q_lora_rank=q_lora_rank,
-            kv_lora_rank=kv_lora_rank,
-            qk_nope_head_dim=qk_nope_head_dim,
             qk_rope_head_dim=qk_rope_head_dim,
-            predicted_tokens_per_seq=1,
-            skip_create_weights_in_init=True,
-            sparse_params=None,
+            max_position_embeddings=max_position_embeddings,
+            quant_config=quant_config,
             skip_correction_threshold=config.skip_correction_threshold,
         )
-        self.mqa = create_attention(
-            "TRTLLM",
-            layer_idx,
-            self.num_heads_tp,
-            head_dim=kv_lora_rank + qk_rope_head_dim,
-            num_kv_heads=1,
-            hidden_size=hidden_size,
-            v_head_dim=kv_lora_rank,
-            dtype=dtype,
-            aux_stream=self.aux_stream,
-            rope_append=True,
-            kv_cache_dtype=self.kv_cache_dtype,
-            **mla_dims,
+        self.mqa = K3MlaAttnState.generation(
+            num_heads=self.num_heads_tp,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            **role_dims,
         )
-        self.mha = create_attention(
-            "TRTLLM",
-            layer_idx,
-            self.num_context_heads,
-            head_dim=self.qk_head_dim,
-            num_kv_heads=self.num_context_heads,
+        self.mha = K3MlaAttnState.context(
+            num_context_heads=self.num_context_heads,
+            qk_nope_head_dim=qk_nope_head_dim,
             v_head_dim=v_head_dim,
-            **mla_dims,
+            kv_lora_rank=kv_lora_rank,
+            **role_dims,
         )
-        assert isinstance(self.mha, TrtllmAttention) and isinstance(self.mqa, TrtllmAttention)
-        if not self.mqa.support_fused_rope():
-            raise NotImplementedError("Kimi K3 MLA requires the RoPE fused in the MLA kernels")
-        _install_identity_rope(self.mha)
-        _install_identity_rope(self.mqa)
 
         # Set in create_weights() from the backends' KV cache quantization.
         self.quantized_kv = False
@@ -2233,7 +2134,7 @@ class K3MLAAttention(nn.Module):
             and self.quant_config is not None
             and self.quant_config.layer_quant_mode.has_fp4_kv_cache()
         )
-        if self.fp4_kv and not self.mqa.rope_params.duplicate_data:
+        if self.fp4_kv and not self.mqa.rope_duplicate_data:
             raise ValueError("FP4 MLA requires RopeParams.duplicate_data=True.")
         # Cached-prefix context on the FP8 context FMHA takes FP8 Q / K / V (plain conversions at
         # the op's unit KV scale).

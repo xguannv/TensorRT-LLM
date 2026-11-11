@@ -17,7 +17,6 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.attention.backends.fp4_mla.cache_update import _prepare_fp4_mla_q_buffers
 from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
     _FP4_MLA_CUTEDSL_BACKEND,
     _FP4_MLA_K_RESIDUAL_BACKENDS,
@@ -31,13 +30,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
     _fp4_mla_packed_rows_per_seq,
-)
-from tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_kernels import (
-    _fp4_mla_generation_q1_kv_tail8_update,
-    _fp4_mla_generation_q1_kv_tile_update,
-    _fp4_mla_q_sf_offset,
-    _fp4_mla_q_sf_offset_h128,
-    _fp4_mla_swizzled_sf_offset,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.layout import (
     _get_fp4_mla_global_scale,
@@ -60,11 +52,21 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.packed_plan import (
     _fp4_mla_helix_plan_bounds,
     _fp4_mla_packed_plan_geometry,
 )
-from tensorrt_llm._torch.attention.backends.fp4_mla.v_cache import (
+
+# The family copies of the FP4 MLA cache-update code outside the KV-cache-manager contract.
+from ...ops.attention._k3_fp4_mla_cache import (
     _get_cutedsl_persistent_v_packed_cache,
     _get_fp4_mla_v_packed_pool_base,
     _maybe_update_triton_v_packed_cache,
+    _prepare_fp4_mla_q_buffers,
     _repack_cutedsl_v_packed_cache,
+)
+from ...ops.attention._k3_fp4_mla_kernels import (
+    _fp4_mla_generation_q1_kv_tail8_update,
+    _fp4_mla_generation_q1_kv_tile_update,
+    _fp4_mla_q_sf_offset,
+    _fp4_mla_q_sf_offset_h128,
+    _fp4_mla_swizzled_sf_offset,
 )
 
 # ---------------------------------------------------------------------------

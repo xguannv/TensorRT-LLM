@@ -19,13 +19,15 @@ __extra_import_path__ = ["../../.."]
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx import (
     k3_context_fmha_op,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_state import (
+    K3MlaAttnState,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
     mla as context,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
     mla as ctx_split_k,
 )
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
 H, NOPE, ROPE, V, LORA = 96, 128, 64, 128, 512
 N_KVB = H * (NOPE + V)
@@ -101,13 +103,11 @@ def test_split_k_support_is_shape_gated(monkeypatch, info_once):
     assert "cannot attend a cached prefix" in info_once[-1][0]
 
 
-def _trtllm_backend(*, fp4=True, sparse=None):
-    attention = object.__new__(TrtllmAttention)
-    attention.is_mla_enable = True
-    attention.has_fp4_kv_cache = fp4
-    attention.has_fp8_kv_cache = not fp4
-    attention.sparse_params = sparse
-    return attention
+def _mla_state(*, fp4=True):
+    state = object.__new__(K3MlaAttnState)
+    state.has_fp4_kv_cache = fp4
+    state.has_fp8_kv_cache = not fp4
+    return state
 
 
 def _layer(mha, kv_b_proj=None):
@@ -135,16 +135,15 @@ def test_split_k_serves_bf16_fp4_cache_layers_only(monkeypatch):
     def uses(layer, q=bf16, output=bf16):
         return ctx_split_k.uses_k3_split_k_context(layer, q, output)
 
-    layer = _layer(_trtllm_backend())
+    layer = _layer(_mla_state())
     assert uses(layer)
     assert not uses(layer, q=bf16.half())
     assert not uses(layer, output=bf16.float())
     layer.out_scale = torch.ones(1)
     assert not uses(layer)
     layer.out_scale = None
-    # Only NVFP4 latent caches (not FP8 / sparse layers) and only a TrtllmAttention backend.
-    assert not uses(_layer(_trtllm_backend(fp4=False)))
-    assert not uses(_layer(_trtllm_backend(sparse=object())))
+    # Only NVFP4 latent caches (not FP8 layers) and only the family MLA state.
+    assert not uses(_layer(_mla_state(fp4=False)))
     assert not uses(_layer(SimpleNamespace(uses_fp4_mla_attention=True)))
     supported["value"] = False
     assert not uses(layer)
@@ -164,7 +163,7 @@ def _kv_b_proj(**overrides):
 def test_kv_b_takes_mxfp8_where_the_weight_is_in_the_cute_mxfp8_layout(monkeypatch):
     monkeypatch.setattr(ctx_split_k, "get_sm_version", lambda: 107)
     monkeypatch.setattr(ctx_split_k, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
-    mha = _trtllm_backend()
+    mha = _mla_state()
 
     def takes(**overrides):
         return ctx_split_k.kv_b_takes_mxfp8(_layer(mha, _kv_b_proj(**overrides)))
@@ -353,7 +352,8 @@ class _KvBProj:
 
 
 class _Mha:
-    """The attention backend calls of the split-K path, over the case's FP4 cache."""
+    """The MLA state and the family cache ops of the split-K path, over the case's FP4 cache
+    (:func:`_split_k_forward` routes ``mla_cache``'s calls here)."""
 
     layer_idx = 0
     num_heads = num_kv_heads = H
@@ -392,6 +392,18 @@ def _split_k_forward(monkeypatch, mha, kv_b_proj, mxfp8, case):
     """``ctx_split_k.forward_context_split_k_fp4`` of one case, with kv_b on the MXFP8 gather or
     not."""
     monkeypatch.setattr(ctx_split_k, "kv_b_takes_mxfp8", lambda layer: mxfp8)
+    monkeypatch.setattr(
+        ctx_split_k,
+        "mla_cache",
+        SimpleNamespace(
+            append_fp4_mla_context_cache=lambda state, *args: state.append_fp4_mla_context_cache(
+                *args
+            ),
+            load_chunked_kv_cache_for_mla=lambda state, metadata, **kwargs: (
+                state.load_chunked_kv_cache_for_mla(metadata, **kwargs)
+            ),
+        ),
+    )
     out = torch.empty(case.T, H * V, dtype=torch.bfloat16, device="cuda")
     ctx_split_k.forward_context_split_k_fp4(
         _layer(mha, kv_b_proj),

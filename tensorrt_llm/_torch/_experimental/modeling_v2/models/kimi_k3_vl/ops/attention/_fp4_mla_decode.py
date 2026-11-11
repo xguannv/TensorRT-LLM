@@ -58,13 +58,14 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.metadata import (
     materialize_fp4_mla_device_page_table,
     populate_fp4_mla_generation_lengths,
 )
-from tensorrt_llm._torch.attention.backends.fp4_mla.v_cache import (
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
+
+from ._k3_fp4_mla_cache import (
     _get_cutedsl_persistent_v_packed_cache,
     _get_fp4_mla_v_packed_pool_base,
     _get_fp4_mla_v_scale_pool_base,
 )
-from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.logger import logger
 
 
 def _ceil_div(lhs: int, rhs: int) -> int:

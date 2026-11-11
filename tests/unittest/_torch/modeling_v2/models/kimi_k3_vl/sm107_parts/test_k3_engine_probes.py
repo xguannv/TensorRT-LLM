@@ -239,12 +239,14 @@ def test_fp8_kv_layer_selector_on_the_cache_policy():
     assert "nvfp4_enabled" in inspect.signature(selector).parameters
 
 
-def test_fp4_mla_probe_on_trtllm_attention():
-    """The FP4 MLA paths (packed decode) key off
-    ``mqa.uses_fp4_mla_attention`` on main's ``TrtllmAttention``."""
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+def test_fp4_mla_probe_on_the_family_mla_state():
+    """The FP4 MLA paths (packed decode, split-K context) key off ``uses_fp4_mla_attention`` of
+    the layer's ``K3MlaAttnState`` roles."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_state import (  # noqa: E501
+        K3MlaAttnState,
+    )
 
-    assert _is_property(TrtllmAttention, "uses_fp4_mla_attention")
+    assert _is_property(K3MlaAttnState, "uses_fp4_mla_attention")
 
 
 def test_dspark_unified_draft_cache_probes_on_the_k3_hybrid_manager():
