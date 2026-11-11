@@ -147,33 +147,10 @@ PENDING: Dict[str, Tuple[object, str]] = {
         "fam_moe",
     ),
     "tensorrt_llm._torch.moe.kernels.blackwell": ({"kimi_k3_routing"}, "fam_moe"),
-    "tensorrt_llm._torch.moe.kernels.blackwell.kimi_k3_routing": (
-        {"sort_buffer_sizes"},
-        "fam_moe",
-    ),
-    # fam_misc: the target's call sites of the family's common/ glue, switched once the split
-    # line has landed (multi-stream, TP mode, text-only weights, no vision tower).
-    "tensorrt_llm._torch.models.modeling_kimi_k3_vl": ({"KimiK3VisionModel"}, "fam_misc"),
-    "tensorrt_llm._torch.models.modeling_kimi_k25": (
-        {"DISAGG", "_MEDIA_PLACEHOLDER_TOKEN_ID", "_has_meta_tensors"},
-        "fam_misc",
-    ),
-    "tensorrt_llm._torch.models.modeling_multimodal_utils": (
-        {"find_input_mm_embeds", "fuse_input_embeds", "get_multimodal_embeddings"},
-        "fam_misc",
-    ),
-    "tensorrt_llm._torch.modules.linear": ({"TensorParallelMode"}, "fam_misc"),
-    "tensorrt_llm._torch.modules.multi_stream_utils": (
-        {"do_multi_stream", "maybe_execute_in_parallel"},
-        "fam_misc",
-    ),
     # fam_spec: the drafter base class and its registry hack, the DSpark RoPE kernel class,
     # LogitsProcessor by name.
     "tensorrt_llm._torch.models.modeling_dflash": ({"DFlashForCausalLM"}, "fam_spec"),
-    "tensorrt_llm._torch.models.modeling_utils": (
-        {"MODEL_CLASS_MAPPING", "MetaInitException", "filter_weights", "run_concurrently"},
-        "fam_spec (MODEL_CLASS_MAPPING), fam_misc (the rest)",
-    ),
+    "tensorrt_llm._torch.models.modeling_utils": ({"MODEL_CLASS_MAPPING"}, "fam_spec"),
     "tensorrt_llm._torch.modules.logits_processor": ({"LogitsProcessor"}, "fam_spec"),
     "tensorrt_llm._torch.attention.kernels.blackwell.dspark_rmsnorm_rope": (
         {"DSparkRMSNormRoPEKernel"},

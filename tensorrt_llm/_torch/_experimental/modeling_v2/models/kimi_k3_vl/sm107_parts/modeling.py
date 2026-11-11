@@ -8,8 +8,9 @@ experts split MoE TP4 x EP4, and attention DP over 16 ranks. The layout comes fr
 ``Mapping``; the deployment's optimizations come from its target's ``K3Sm107Constants``
 (``K3_CONSTANTS`` of the target class, a subclass of this one).
 
-It is the vision-language model: the vision tower (MoonViT3d) and its projector, and the text
-model ``KimiK3DefaultForCausalLM``:
+The checkpoint is the vision-language model's; this target is text only. It builds no vision
+tower (its checkpoint tensors are never read, ``weights.py``) and refuses multimodal input. The
+text model ``KimiK3DefaultForCausalLM``:
 
 * 93 decoder layers (``KimiK3DefaultDecoderLayer``): 69 KDA (Kimi Delta Attention, linear
   attention) layers and 24 MLA (absorbed MQA, NoPE) layers, per the 1-indexed
@@ -63,23 +64,13 @@ from transformers import PretrainedConfig, PreTrainedModel
 
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_kimi_k3_vl import KimiK3VisionModel
-from tensorrt_llm._torch.models.modeling_kimi_k25 import (
-    _MEDIA_PLACEHOLDER_TOKEN_ID,
-    DISAGG,
-    _has_meta_tensors,
-)
-from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-    find_input_mm_embeds,
-    fuse_input_embeds,
-    get_multimodal_embeddings,
-)
-from tensorrt_llm._torch.models.modeling_utils import DecoderModel, MetaInitException
+from tensorrt_llm._torch.models.modeling_utils import DecoderModel
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 
+from ..common.weight_io import check_text_only
 from ..dspark.drafter import K3DSparkPath
 from ..dspark.shell import KimiK3SpecForCausalLM
 from ..kernels.k3r_spec.spec_decode_head import spec_decode_head
@@ -875,10 +866,10 @@ class KimiK3DefaultForCausalLM(
 class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel):
     """Kimi K3 NVFP4 on SM107, sharded as the engine's mapping says.
 
-    The vision-language model: the vision tower (``_VISION_MODEL_CLS``, built in
-    :meth:`load_weights` when meta init deferred it) and the text model
-    ``KimiK3DefaultForCausalLM`` as ``llm``. The speculative-decoding and weight-loading
-    attributes the engine reads off the outer model (``draft_model``, ``lm_head``,
+    The text model ``KimiK3DefaultForCausalLM`` as ``llm`` behind the vision-language model's
+    interface: text only, no vision tower (``mm_encoder`` is ``None``, as under multimodal
+    disaggregation), and a step carrying multimodal input is refused. The speculative-decoding
+    and weight-loading attributes the engine reads off the outer model (``draft_model``, ``lm_head``,
     ``runtime_hooks``, ...) are the text model's. Weight loading is the
     ``KimiK3DefaultWeights`` mixin's (``weights.py``).
 
@@ -890,7 +881,6 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
     K3_CONSTANTS: ClassVar[K3Sm107Constants]
 
     _LANG_PREFIX = "language_model."
-    _VISION_MODEL_CLS = KimiK3VisionModel
     mamba_metadata_cls = KimiK3DefaultForCausalLM.mamba_metadata_cls
 
     @classmethod
@@ -950,18 +940,8 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
         self.model_config = model_config
         self._vlm_pretrained_config = config
 
-        # --- Vision encoder (deferred under MetaInitMode, recreated in
-        # load_weights) ---
+        # Text only: no vision tower.
         self.mm_encoder = None
-        if not DISAGG:
-            try:
-                mm_encoder = self._VISION_MODEL_CLS(model_config)
-                if _has_meta_tensors(mm_encoder):
-                    logger.info("Vision encoder deferred to load_weights() (MetaInitMode active)")
-                else:
-                    self.mm_encoder = mm_encoder
-            except MetaInitException:
-                logger.info("Vision encoder deferred to load_weights() (MetaInitMode active)")
 
         text_model_config = copy.copy(model_config)
         assert hasattr(config, "text_config"), "Kimi K3 config must have text_config"
@@ -988,13 +968,6 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
         text_model_config._frozen = True
 
         self.llm = KimiK3DefaultForCausalLM(text_model_config, constants=constants)
-
-        self._media_placeholder_token_id = getattr(
-            config, "media_placeholder_token_id", _MEDIA_PLACEHOLDER_TOKEN_ID
-        )
-        # Backing storage for the ``mm_token_ids`` property below — built once
-        # here so the executor doesn't re-allocate per step.
-        self._mm_token_ids = torch.tensor([self._media_placeholder_token_id], dtype=torch.int32)
 
         # Point model_config at the text_config so the executor reads generation
         # params (eos_token_id, ...) from the text backbone, matching K2.5.
@@ -1041,26 +1014,6 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
     def set_guided_decoder(self, *args, **kwargs):
         return self.llm.set_guided_decoder(*args, **kwargs)
 
-    @property
-    def multimodal_data_device_paths(self) -> List[str]:
-        return [
-            "image.pixel_values",
-            "image.image_grid_thw",
-            "video.pixel_values_videos",
-            "video.video_grid_thw",
-            "multimodal_embedding",
-        ]
-
-    @property
-    def mm_token_ids(self) -> torch.Tensor:
-        """Surface the in-vocab media placeholder to the model engine so
-        ``runners.prepare_multimodal_indices`` selects the ``torch.isin`` predicate
-        instead of the OOV (``>= vocab_size``) fallback (which would miss
-        Kimi's placeholder and force ``fuse_input_embeds`` through the
-        ``torch.where`` host-sync path on GPU input_ids).
-        """
-        return self._mm_token_ids
-
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
@@ -1075,36 +1028,9 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
         multimodal_params: Optional[List[MultimodalParams]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        multimodal_params = multimodal_params or []
-        mm_embeds: List[torch.Tensor] = []
-        mm_token_ids = None
-
-        if len(multimodal_params) > 0:
-            if DISAGG:
-                raise NotImplementedError("Disaggregated inference not yet supported for K2.5.")
-            mm_ctx_params = multimodal_params[: attn_metadata.num_contexts]
-            mm_embeds = get_multimodal_embeddings(
-                encoder_forward_fn=self.mm_encoder.forward,
-                multimodal_params=mm_ctx_params,
-            )
-            mm_embeds = find_input_mm_embeds(mm_embeds, mm_ctx_params)
-
-            # ``runners.prepare_multimodal_indices`` sees Kimi's in-vocab
-            # placeholder via ``self.mm_token_ids`` and emits indices that match
-            # ``find_input_mm_embeds``'s active-chunk slice; a chunked-prefill /
-            # KV-reuse mismatch surfaces as a row-count error inside
-            # ``fuse_input_embeds`` itself.
-            if len(mm_embeds) > 0:
-                mm_token_ids = self.mm_token_ids.to(input_ids.device, dtype=input_ids.dtype)
-        input_ids, inputs_embeds = fuse_input_embeds(
-            self.llm.model.embed_tokens,
-            input_ids,
-            mm_embeds,
-            mm_token_ids=mm_token_ids,
-            mm_token_indices=kwargs.get("mm_token_indices"),
-            text_token_indices=kwargs.get("text_token_indices"),
-        )
-
+        check_text_only(multimodal_params)
+        # The text model embeds ``input_ids`` itself; the wrapper hands it no embeddings.
+        inputs_embeds = None
         return self.llm.forward(
             attn_metadata,
             input_ids,

@@ -4,9 +4,9 @@
 
 The model loads through two mixins, each the first base of the class it serves:
 
-* ``KimiK3DefaultWeights`` (of ``KimiK3Sm107ForConditionalGeneration``): builds the vision tower
-  if it was deferred, loads it, and hands the ``language_model.*`` keys, prefix stripped, to
-  the text model.
+* ``KimiK3DefaultWeights`` (of ``KimiK3Sm107ForConditionalGeneration``): hands the
+  ``language_model.*`` keys, prefix stripped, to the text model. The target is text only: the
+  vision tower's and projector's tensors (``vision_tower.*``, ``mm_projector.*``) are never read.
 * ``KimiK3DefaultTextWeights`` (of ``KimiK3DefaultForCausalLM``): the checkpoint name plan and
   its key check, the trunk parameters, the checkpoint FP8 attention projections, and the
   routed experts. The checkpoint is streamed, and every rank keeps only its share: its
@@ -21,7 +21,6 @@ of a tensor, and read FP8 block-scaled projections (dequantized for a BF16 param
 
 from __future__ import annotations
 
-import copy
 import json
 import math
 import os
@@ -34,13 +33,11 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
-from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
-from tensorrt_llm._torch.models.modeling_kimi_k25 import DISAGG, _has_meta_tensors
-from tensorrt_llm._torch.models.modeling_utils import filter_weights, run_concurrently
-from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
 
+from ..common.parallel import TensorParallelMode
+from ..common.weight_io import run_concurrently, text_model_weights
 from .fp8_weight_read import (
     _convert_moe_mlps_to_fp8_weight_read,
     _Fp8BlockScaleWeightReadLinear,
@@ -1137,7 +1134,7 @@ class KimiK3DefaultTextWeights:
 
 
 class KimiK3DefaultWeights:
-    """Checkpoint loading of the vision-language model: the vision tower, then the text model.
+    """Checkpoint loading of the text-only target from the vision-language checkpoint.
 
     The first base of ``KimiK3Sm107ForConditionalGeneration``.
     """
@@ -1146,30 +1143,5 @@ class KimiK3DefaultWeights:
         return self.llm.load_draft_weights(*args, **kwargs)
 
     def load_weights(self, weights) -> None:
-        """Load vision + projector + LLM weights from checkpoint."""
-        # Create vision encoder if it was skipped during meta init.
-        # Use the saved VLM config since model_config.pretrained_config
-        # has been overwritten with text_config by __init__.
-        if self.mm_encoder is not None and _has_meta_tensors(self.mm_encoder):
-            logger.info("Recreating deferred vision encoder after MetaInitMode")
-            self.mm_encoder = None
-
-        if self.mm_encoder is None and not DISAGG:
-            vision_model_config = copy.copy(self.model_config)
-            vision_model_config._frozen = False
-            vision_model_config.pretrained_config = self._vlm_pretrained_config
-            vision_model_config._frozen = True
-            self.mm_encoder = self._VISION_MODEL_CLS(vision_model_config)
-        if self.mm_encoder is not None:
-            self.mm_encoder.load_weights(weights)
-
-        if any(k.startswith(self._LANG_PREFIX) for k in weights):
-            lm_weights = filter_weights("language_model", weights)
-            lm_weights = ConsumableWeightsDict(lm_weights)
-            checkpoint_dir = getattr(weights, "checkpoint_dir", None)
-            if checkpoint_dir is not None:
-                lm_weights.checkpoint_dir = checkpoint_dir
-            lm_weights.checkpoint_prefix = self._LANG_PREFIX
-        else:
-            lm_weights = weights
-        self.llm.load_weights(lm_weights)
+        """Load the text model's weights; the vision tower's are left unread."""
+        self.llm.load_weights(text_model_weights(weights))

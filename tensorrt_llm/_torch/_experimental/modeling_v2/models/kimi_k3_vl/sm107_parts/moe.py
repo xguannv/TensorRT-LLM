@@ -72,13 +72,13 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quan
 )
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
-from tensorrt_llm._torch.modules.linear import TensorParallelMode
-from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.utils import ActivationType, Fp4QuantizedTensor
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..common.multi_stream import do_multi_stream
+from ..common.parallel import TensorParallelMode
 from .layers import load_weight_shard
 
 

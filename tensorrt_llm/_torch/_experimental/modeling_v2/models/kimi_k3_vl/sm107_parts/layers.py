@@ -202,12 +202,13 @@ from tensorrt_llm._torch.distributed.ops import (
     get_allreduce_workspace,
     get_or_scale_allreduce_mnnvl_workspace,
 )
-from tensorrt_llm._torch.modules.linear import TensorParallelMode
-from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._utils import get_sm_version, is_device_integrated
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+from ..common.multi_stream import do_multi_stream
+from ..common.parallel import TensorParallelMode
 
 MNNVL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 #: Fusions ``trtllm::mnnvl_fusion_allreduce`` runs (besides ``NONE``).

@@ -11,8 +11,9 @@ The mid-chunk interface with the cache manager (the runtime side is ``KimiK3Hybr
 * the plan becomes ``kda_snapshot`` with ``stage_rows`` None (the snapshot goes to a slot of its
   own); a manager without the method plans none; a step with an in-forward plan too fails.
 
-Everything else ``prepare`` computes is the target metadata's (``kimi_k3_nvfp4__sm_107__default``),
-compared field by field on the GPU.
+The SM107 glue (``sm107_parts.kda``) uses these very classes. On the GPU, ``prepare``'s FlashInfer
+prefill schedule is compared with main's ``KimiK3MambaMetadata`` and the CuTe DSL prefill's fields
+with their values.
 """
 
 import importlib
@@ -22,7 +23,7 @@ import pytest
 import torch
 
 _FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
-_TARGET_KDA = f"{_FAMILY}.kimi_k3_nvfp4__sm_107__default.kda"
+_SM107_KDA = f"{_FAMILY}.sm107_parts.kda"
 
 
 def _fam():
@@ -56,18 +57,24 @@ def test_constants():
 
 
 @pytest.mark.cpu_only
-def test_build_plan_matches_the_target():
-    fam, target = _fam(), importlib.import_module(_TARGET_KDA)
+def test_sm107_glue_uses_the_family_metadata():
+    fam, sm107 = _fam(), importlib.import_module(_SM107_KDA)
+    for name in ("K3MambaMetadata", "KDASnapshotPlan", "build_kda_snapshot_plan"):
+        assert getattr(sm107, name) is getattr(fam, name), name
+    assert sm107.KDA_PREFILL_CHUNK_SIZE == fam.KDA_PREFILL_CHUNK_SIZE
+
+
+@pytest.mark.cpu_only
+def test_build_plan():
+    fam = _fam()
     snapshots = [(2, 9, 64), (0, 5, 128)]
     lengths = [200, 70, 130]
     a = fam.build_kda_snapshot_plan(snapshots, lengths, torch.device("cpu"))
-    b = target.build_kda_snapshot_plan(snapshots, lengths, torch.device("cpu"))
-    for field in ("slots", "token_indices", "chunks", "pool_rows", "staged_rows"):
-        assert torch.equal(getattr(a, field), getattr(b, field)), field
     assert a.num_snapshots == 2 and a.stage_rows is None
     assert a.slots.tolist() == [5, 9]
     assert a.token_indices.tolist() == [128, 270 + 64]
     assert a.chunks.tolist() == [2, -1, 1]
+    assert a.pool_rows.tolist() == [5, -1, 9]
     assert a.staged_rows.tolist() == [3, -1, 4]
     assert fam.build_kda_snapshot_plan([], lengths, torch.device("cpu")) is None
     for bad in ([(0, 1, 100)], [(1, 1, 64)], [(0, 1, 64), (0, 2, 128)], [(3, 1, 64)]):
@@ -109,23 +116,28 @@ def test_midchunk_fetch():
 
 
 @pytest.mark.cpu_only
-def test_inforward_split_matches_the_target():
+def test_inforward_split():
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import InforwardSnapshotEntry
 
-    fam, target = _fam(), importlib.import_module(_TARGET_KDA)
+    fam = _fam()
     manager = SimpleNamespace(conv_state_shape=(12, 3), state_index={11: 7, 13: 2}.__getitem__)
     attn = SimpleNamespace(seq_lens=torch.tensor([200, 130, 96]), request_ids=[11, 12, 13])
     plan = {
         11: InforwardSnapshotEntry(row=1, point=1152, num_before=128, num_after=72),
         13: InforwardSnapshotEntry(row=0, point=64, num_before=64, num_after=32),
     }
-    got = []
-    for cls in (fam.K3MambaMetadata, target.K3MambaMetadata):
-        metadata = _bare_metadata(cls)
-        metadata._prepare_inforward_split(attn, manager, plan, 3, 3)
-        got.append(metadata.kda_snapshot)
-    for field in ("slots", "token_indices", "chunks", "pool_rows", "staged_rows", "stage_rows"):
-        assert torch.equal(getattr(got[0], field), getattr(got[1], field)), field
+    metadata = _bare_metadata(fam.K3MambaMetadata)
+    metadata._prepare_inforward_split(attn, manager, plan, 3, 3)
+    got = metadata.kda_snapshot
+    # (sequence, the request's live slot, the point inside the chunk) and the staging rows.
+    want = fam.build_kda_snapshot_plan(
+        [(0, 7, 128), (2, 2, 64)], [200, 130, 96], torch.device("cpu")
+    )
+    for field in ("slots", "token_indices", "chunks", "pool_rows", "staged_rows"):
+        assert torch.equal(getattr(got, field), getattr(want, field)), field
+    assert got.stage_rows.tolist() == [1, 0]
+    with pytest.raises(RuntimeError, match="generation requests"):
+        metadata._prepare_inforward_split(attn, manager, plan, 3, 4)
 
 
 def _fake_mamba_prepare(self, attn_metadata):
@@ -138,15 +150,16 @@ def _fake_mamba_prepare(self, attn_metadata):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the metadata buffers live on the GPU")
 @pytest.mark.parametrize("plans", [{}, {12: (7, 64)}, {11: (5, 128), 13: (6, 64)}])
-def test_prepare_matches_the_target_plus_the_midchunk_plan(plans, monkeypatch):
+def test_prepare(plans, monkeypatch):
+    from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
     from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 
-    fam, target = _fam(), importlib.import_module(_TARGET_KDA)
+    fam = _fam()
     monkeypatch.setattr(Mamba2Metadata, "prepare", _fake_mamba_prepare)
     seq_lens = torch.tensor([300, 130, 70, 1, 1], dtype=torch.int32)
     slots = torch.tensor([3, 1, 4, 0, 2], dtype=torch.int32, device="cuda")
     results = []
-    for cls in (fam.K3MambaMetadata, target.K3MambaMetadata):
+    for cls in (fam.K3MambaMetadata, KimiK3MambaMetadata):
         manager = _Manager(plans)
         attn = SimpleNamespace(
             seq_lens=seq_lens,
@@ -160,13 +173,30 @@ def test_prepare_matches_the_target_plus_the_midchunk_plan(plans, monkeypatch):
         metadata.prepare(attn)
         torch.cuda.synchronize()
         results.append((metadata, manager))
-    (fam_md, fam_manager), (tgt_md, _) = results
-    for field in ("kda_seq_order", "kda_cu_chunks", "state_indices_long", "kda_chunk_indices"):
-        assert torch.equal(getattr(fam_md, field), getattr(tgt_md, field)), field
-    for field in ("kda_max_seqlen", "kda_varlen_is_aligned", "kda_single_sequence_length"):
-        assert getattr(fam_md, field) == getattr(tgt_md, field), field
-    assert fam_manager.calls == [[11, 12, 13]]
-    assert tgt_md.kda_snapshot is None  # the target metadata never fetched the plan
+    (fam_md, fam_manager), (main_md, main_manager) = results
+    # main's FlashInfer prefill schedule (16-token chunks, longest first)
+    for field in ("kda_seq_order", "kda_cu_chunks", "state_indices"):
+        assert torch.equal(getattr(fam_md, field), getattr(main_md, field)), field
+    assert fam_md.kda_max_seqlen == main_md.kda_max_seqlen == 300
+    assert fam_md.kda_cu_chunks.tolist() == [0, 19, 28, 33]
+    # the CuTe DSL prefill's: the int64 slots and the 64-token chunk table
+    assert fam_md.state_indices_long.tolist() == [3, 1, 4, 0, 2]
+    assert fam_md.state_indices_long.dtype == torch.long
+    assert fam_md.kda_chunk_indices.tolist() == [
+        [0, 0],
+        [0, 1],
+        [0, 2],
+        [0, 3],
+        [0, 4],
+        [1, 0],
+        [1, 1],
+        [1, 2],
+        [2, 0],
+        [2, 1],
+    ]
+    assert fam_md.kda_varlen_is_aligned is False
+    assert fam_md.kda_single_sequence_length is None
+    assert fam_manager.calls == [[11, 12, 13]] and main_manager.calls == []
     if not plans:
         assert fam_md.kda_snapshot is None
         return

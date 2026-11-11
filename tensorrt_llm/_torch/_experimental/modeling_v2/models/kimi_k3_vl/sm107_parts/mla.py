@@ -178,11 +178,11 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.metadata import (
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.distributed import HelixAllToAllNative
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
-from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.utils import maybe_compiled_cat, maybe_compiled_copy_
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
 
+from ..common.multi_stream import do_multi_stream
 from ..kernels.k3r_mla_ctx import fp8_static_quant
 from ..kernels.k3r_mla_ctx.mla_kv_fp8 import mla_kv_to_fp8
 from ..ops.attention import _fp4_mla_decode as fp4_mla_decode
@@ -212,13 +212,13 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import
 from tensorrt_llm._torch.custom_ops import BufferKind
 from tensorrt_llm._torch.distributed.mnnvl_memory import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import eager_on_graph
 from tensorrt_llm._torch.utils import AuxStreamType, get_model_extra_attrs
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
+from ..common.parallel import TensorParallelMode
 from .layers import (
     Bf16Linear,
     Fp8BlockScaleLinear,
