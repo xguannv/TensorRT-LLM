@@ -85,8 +85,10 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     _promote_mamba_state_triton,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
+    MAMBA_MULTISEQ_WARMUP_TOKEN_CAP,
     MambaAcceptanceBatch,
     _stack_state_views,
+    split_tokens_evenly,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
@@ -3163,7 +3165,15 @@ def test_v2_hybrid_typical_batch_accounts_for_snapshot_retention(
 
         # Snapshot retention affects the typical batch, not the feasibility floors.
         assert BatchDesc([KVCacheDesc(capacity=0, history_length=0)] * 3) in config.constraints
-        assert len(config.constraints) == (2 if pool_ratio is None else 1)
+        # The multi-sequence warmup floor holds with or without pool_ratio.
+        assert (
+            BatchDesc(
+                [KVCacheDesc(capacity=64, history_length=0)] * 2
+                + [KVCacheDesc(capacity=0, history_length=0)]
+            )
+            in config.constraints
+        )
+        assert len(config.constraints) == (3 if pool_ratio is None else 2)
         assert mgr.all_ssm_states[0].shape[0] >= 3
 
         request = LlmRequest(
@@ -3175,6 +3185,169 @@ def test_v2_hybrid_typical_batch_accounts_for_snapshot_retention(
         )
         mgr.prepare_expect_snapshot_points([request])
         assert len(request.expect_snapshot_points) == runtime_snapshots
+    finally:
+        mgr.shutdown()
+
+
+def test_split_tokens_evenly():
+    assert split_tokens_evenly(5, 2) == [3, 2]
+    assert split_tokens_evenly(4096, 16) == [256] * 16
+    assert split_tokens_evenly(1000, 16) == [63] * 8 + [62] * 8
+    assert split_tokens_evenly(3, 3) == [1, 1, 1]
+    for num_tokens, num_requests in ((3, 4), (3, 0)):
+        with pytest.raises(ValueError, match="Cannot split"):
+            split_tokens_evenly(num_tokens, num_requests)
+
+
+def _v2_hybrid_warmup_floor_config(
+    *,
+    pool_ratio,
+    max_batch_size=16,
+    max_num_tokens=16384,
+    max_seq_len=1 << 20,
+    num_extra_kv_tokens=0,
+    gpu_max_tokens=None,
+):
+    """Build the cache config of a one-SSM, one-attention hybrid with 128-token blocks."""
+    tokens_per_block = 128
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_cache_type = CacheTypeCpp.SELF
+    mgr.head_dim_per_layer = [64, 64]
+    mgr.pp_layers = [0, 1]
+    mgr._mamba_layer_mask = [True, False]
+    mgr.ssm_bytes = 64
+    mgr.conv_bytes = 32
+    mgr.max_attention_window_vec = [max_seq_len, max_seq_len]
+    mgr.max_batch_size = max_batch_size
+    mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+    mgr.max_seq_len = max_seq_len
+    mgr.max_num_tokens = max_num_tokens
+    mgr._gpu_max_tokens = gpu_max_tokens
+    mgr.tokens_per_block = tokens_per_block
+    mgr.num_local_layers = 2
+    mgr.local_num_mamba_layers = 1
+    _install_default_v2_state(mgr)
+    mgr._num_reserved_dummy_slots = 1
+    mgr.dtype = DataType.HALF
+    mgr.enable_swa_scratch_reuse = False
+    mgr.enable_stats = False
+    mgr.num_extra_kv_tokens = num_extra_kv_tokens
+    mgr.get_layer_bytes_per_token = lambda **kwargs: 8
+    mgr._minimum_live_gpu_quota = lambda: 0
+    mgr.kv_cache_config = KvCacheConfig(
+        pool_ratio=pool_ratio, avg_seq_len=96, enable_partial_reuse=False
+    )
+    return mgr._build_cache_config(
+        KVCacheManagerConfig(
+            tokens_per_block=tokens_per_block,
+            cache_tiers=[GpuCacheTierConfig(quota=1 << 30)],
+            layers=_base_attention_layer_configs(2),
+            initial_pool_ratio=pool_ratio,
+        )
+    )
+
+
+@pytest.mark.parametrize("pool_ratio", [None, [0.5, 0.5]])
+@pytest.mark.parametrize(
+    "kwargs, lengths, num_extra_kv_tokens, warmup_blocks, one_request_blocks",
+    [
+        # 4096 tokens over 16 requests of two whole 128-token blocks: the split
+        # costs no more than one request of the whole budget.
+        (dict(max_num_tokens=4096), [256] * 16, 0, 32, 32),
+        # Seven extra KV tokens push every 256-token request onto a third
+        # block: 48 blocks, against 33 for one request of the whole budget.
+        (dict(max_num_tokens=4096), [256] * 16, 7, 48, 33),
+        # A 16384-token budget is capped to the warmup's 4096.
+        (dict(max_num_tokens=16384), [256] * 16, 7, 48, 33),
+        # max_tokens bounds the budget: 2048 tokens of 128-token requests, each
+        # one block of prompt and one of the seven extra tokens.
+        (dict(gpu_max_tokens=2048 + 7), [128] * 16, 7, 32, 17),
+        # Uneven split, one block per request.
+        (dict(gpu_max_tokens=1000 + 7), [63] * 8 + [62] * 8, 7, 16, 8),
+        # max_batch_size * (max_seq_len - 1) bounds the budget.
+        (dict(max_seq_len=129), [128] * 16, 0, 16, 16),
+        # Fewer requests than max_batch_size when the budget is that small.
+        (dict(gpu_max_tokens=10 + 7), [1] * 10, 7, 10, 1),
+        (dict(max_batch_size=4), [1024] * 4, 7, 36, 33),
+    ],
+)
+def test_v2_hybrid_floor_holds_the_multiseq_warmup_batch(
+    pool_ratio, kwargs, lengths, num_extra_kv_tokens, warmup_blocks, one_request_blocks
+):
+    config = _v2_hybrid_warmup_floor_config(
+        pool_ratio=pool_ratio, num_extra_kv_tokens=num_extra_kv_tokens, **kwargs
+    )
+    warmup_requests = [
+        KVCacheDesc(capacity=length + num_extra_kv_tokens, history_length=0) for length in lengths
+    ]
+    # Padded with the reserved dummy slot like every other constraint.
+    assert (
+        BatchDesc(warmup_requests + [KVCacheDesc(capacity=0, history_length=0)])
+        in config.constraints
+    )
+    # Every request rounds up to whole blocks on its own.
+    assert sum(math.ceil(kv.capacity / 128) for kv in warmup_requests) == warmup_blocks
+    assert math.ceil((sum(lengths) + num_extra_kv_tokens) / 128) == one_request_blocks
+
+
+@pytest.mark.parametrize("pool_ratio", [None, [0.5, 0.5]])
+@pytest.mark.parametrize(
+    "kwargs, warmup_enabled",
+    [
+        (dict(), "0"),
+        (dict(max_num_tokens=None), "1"),
+        # The warmup skips budgets below four tokens.
+        (dict(gpu_max_tokens=3), "1"),
+    ],
+)
+def test_v2_hybrid_has_no_multiseq_warmup_floor_without_the_warmup(
+    monkeypatch, pool_ratio, kwargs, warmup_enabled
+):
+    monkeypatch.setenv("TLLM_MAMBA_MULTISEQ_WARMUP", warmup_enabled)
+    config = _v2_hybrid_warmup_floor_config(pool_ratio=pool_ratio, **kwargs)
+    # Only the zero-capacity SSM floor is left.
+    assert all(kv.capacity == 0 for batch in config.constraints for kv in batch.kv_caches)
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("pool_ratio", [None, [0.99, 0.01]])
+def test_v2_hybrid_multiseq_warmup_batch_builds(pool_ratio):
+    """The batch the multi-sequence warmup builds fits the attention pool even when a pool_ratio
+    gives that pool a sliver of the quota."""
+    max_batch_size, max_num_tokens, max_draft_len = 16, 4096, 4
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=max_batch_size,
+        max_num_tokens=max_num_tokens,
+        max_seq_len=1024,
+        spec_config=MTPDecodingConfig(max_draft_len=max_draft_len),
+        kv_cache_config=KvCacheConfig(
+            max_gpu_total_bytes=32 << 20,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            pool_ratio=pool_ratio,
+        ),
+    )
+    try:
+        assert mgr._kv_alloc_extra_tokens == max_draft_len - 1
+        # The budget and split of _run_mamba_hybrid_warmup / create_warmup_request.
+        num_tokens = min(
+            mgr.get_num_available_tokens(
+                token_num_upper_bound=min(max_num_tokens, max_batch_size * (mgr.max_seq_len - 1)),
+                max_num_draft_tokens=max_draft_len,
+            ),
+            MAMBA_MULTISEQ_WARMUP_TOKEN_CAP,
+        )
+        lengths = split_tokens_evenly(num_tokens, min(num_tokens, max_batch_size))
+        assert len(lengths) == max_batch_size
+        requests = mgr.add_dummy_requests(
+            list(range(len(lengths))),
+            token_nums=lengths,
+            is_gen=False,
+            max_num_draft_tokens=max_draft_len,
+        )
+        assert requests is not None
+        for request in requests:
+            mgr.free_resources(request)
     finally:
         mgr.shutdown()
 
@@ -3758,6 +3931,7 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_d_state: int = 8,
     mamba_head_dim: int = 8,
     max_num_tokens: int = 8192,
+    max_seq_len: int = 128,
 ) -> MambaHybridCacheManagerV2:
     """Construct a real MambaHybridCacheManagerV2."""
     # Draft layers of a combined speculative manager follow the model's layers in both masks.
@@ -3842,7 +4016,7 @@ def _build_v2_hybrid_with_mamba_layer(
         num_kv_heads=num_kv_heads,
         head_dim=64,
         tokens_per_block=32,
-        max_seq_len=128,
+        max_seq_len=max_seq_len,
         max_num_tokens=max_num_tokens,
         max_batch_size=max_batch_size,
         mapping=mapping,

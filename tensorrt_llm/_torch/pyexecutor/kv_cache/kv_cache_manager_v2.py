@@ -1854,6 +1854,11 @@ class KVCacheManagerV2(BaseResourceManager):
     # Staging rows per batch for recurrent-state snapshots taken inside the
     # forward (MambaHybridCacheManagerV2); 0 = none.
     inforward_snapshot_rows: int = 0
+    # Cache-config inputs as seen by instances built without __init__, which
+    # assigns both before the cache config is built. None = no per-iteration
+    # token budget / no GPU token cap (kv_cache_config.max_tokens).
+    max_num_tokens: Optional[int] = None
+    _gpu_max_tokens: Optional[int] = None
     # Block width of a drafter whose layers share this manager, else 0.
     _shared_draft_block_width: int = 0
 

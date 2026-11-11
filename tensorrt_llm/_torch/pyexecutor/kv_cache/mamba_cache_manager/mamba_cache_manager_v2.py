@@ -77,6 +77,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheMa
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 
 from .common import (
+    MAMBA_MULTISEQ_WARMUP_TOKEN_CAP,
     MambaAcceptanceBatch,
     MambaHybridCacheManager,
     MambaLayerCache,
@@ -90,6 +91,8 @@ from .common import (
     _mamba_regular_snapshot_interval,
     _mamba_snapshot_rule_counts,
     _PrefixReuseDiagnostics,
+    mamba_multiseq_warmup_enabled,
+    split_tokens_evenly,
 )
 
 if TYPE_CHECKING:
@@ -810,6 +813,35 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             state_quota + attention_block_quota,
         )
 
+    def _multiseq_warmup_batch(self) -> BatchDesc | None:
+        """Largest batch the multi-sequence Mamba hybrid warmup can build, if it runs.
+
+        The warmup splits its token budget evenly over up to ``max_batch_size``
+        context requests, and each request is allocated its length plus
+        :attr:`_kv_alloc_extra_tokens`, rounded up to whole blocks per life
+        cycle. Many short requests can need more blocks than one request of
+        the whole budget. A smaller budget never needs more blocks, so the
+        largest one the warmup can be given is the floor to hold.
+        """
+        if not mamba_multiseq_warmup_enabled() or self.max_num_tokens is None:
+            return None
+        num_tokens = min(
+            self.max_num_tokens,
+            MAMBA_MULTISEQ_WARMUP_TOKEN_CAP,
+            self.max_batch_size * (self.max_seq_len - 1),
+        )
+        if self._gpu_max_tokens is not None:
+            num_tokens = min(num_tokens, self._gpu_max_tokens - self._kv_alloc_extra_tokens)
+        # The warmup skips budgets this small.
+        if num_tokens < 4:
+            return None
+        return BatchDesc(
+            [
+                KVCacheDesc(capacity=length + self._kv_alloc_extra_tokens, history_length=0)
+                for length in split_tokens_evenly(num_tokens, min(num_tokens, self.max_batch_size))
+            ]
+        )
+
     @override
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         kv_cache_config = self.kv_cache_config
@@ -873,6 +905,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 BatchDesc(
                     [KVCacheDesc(capacity=0, history_length=0) for _ in range(ssm_floor_slots)]
                 ),
+            ]
+        # A floor, so it applies with and without pool_ratio: the ratio only
+        # splits the quota, and a pool group left fewer slots than this batch
+        # needs cannot build it.
+        warmup_batch = self._multiseq_warmup_batch()
+        if warmup_batch is not None:
+            constraints = [
+                *constraints,
+                replace(warmup_batch, kv_caches=[*warmup_batch.kv_caches, *dummy_requests]),
             ]
         result = replace(
             config,

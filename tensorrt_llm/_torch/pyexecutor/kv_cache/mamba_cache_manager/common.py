@@ -50,6 +50,26 @@ if TYPE_CHECKING:
 GB = 1 << 30
 _mamba_effective_tp_size = mamba_effective_tp_size
 
+# Token budget of the multi-sequence Mamba hybrid warmup. A modest budget
+# compiles the num_seqs > 1 kernel variants while leaving the KV cache room.
+MAMBA_MULTISEQ_WARMUP_TOKEN_CAP = 4096
+
+
+def mamba_multiseq_warmup_enabled() -> bool:
+    """Whether the multi-sequence Mamba hybrid warmup runs (``TLLM_MAMBA_MULTISEQ_WARMUP``)."""
+    return os.environ.get("TLLM_MAMBA_MULTISEQ_WARMUP", "1") == "1"
+
+
+def split_tokens_evenly(num_tokens: int, num_requests: int) -> List[int]:
+    """Split ``num_tokens`` over ``num_requests`` requests whose lengths differ by at most one.
+
+    Longer requests come first: five tokens over two requests are ``[3, 2]``.
+    """
+    if not 0 < num_requests <= num_tokens:
+        raise ValueError(f"Cannot split {num_tokens} tokens over {num_requests} requests.")
+    base_length, remainder = divmod(num_tokens, num_requests)
+    return [base_length + 1] * remainder + [base_length] * (num_requests - remainder)
+
 
 @dataclass(frozen=True, kw_only=True)
 class MambaLayerCache:

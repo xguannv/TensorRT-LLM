@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import split_tokens_evenly
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
@@ -183,10 +184,7 @@ class DummyRequestFactory:
             if num_context_requests is not None:
                 if not 0 < num_context_requests <= min(num_ctx_tokens, max_context_requests):
                     return None
-                base_length, remainder = divmod(num_ctx_tokens, num_context_requests)
-                ctx_token_nums = [base_length + 1] * remainder + [base_length] * (
-                    num_context_requests - remainder
-                )
+                ctx_token_nums = split_tokens_evenly(num_ctx_tokens, num_context_requests)
                 if ctx_token_nums[0] > max_seq_len:
                     return None
             elif least_requests:
@@ -195,13 +193,13 @@ class DummyRequestFactory:
                 if remainder:
                     ctx_token_nums.append(remainder)
             else:
-                max_bs = min(num_ctx_tokens, max_context_requests)
                 # Keep every admitted request row while balancing lengths.
                 # This covers the largest batch without exceeding max_seq_len
                 # on uneven totals (five tokens in two rows become [3, 2]).
-                base_length, remainder = divmod(num_ctx_tokens, max_bs)
-                ctx_token_nums = [base_length + 1] * remainder + [base_length] * (
-                    max_bs - remainder
+                # MambaHybridCacheManagerV2 sizes its warmup slot floor from
+                # this same split.
+                ctx_token_nums = split_tokens_evenly(
+                    num_ctx_tokens, min(num_ctx_tokens, max_context_requests)
                 )
             num_ctx_requests = len(ctx_token_nums)
 

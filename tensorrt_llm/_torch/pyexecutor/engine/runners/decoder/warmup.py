@@ -23,6 +23,10 @@ from tensorrt_llm._torch.models.modeling_utils import timing_metric
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
+    MAMBA_MULTISEQ_WARMUP_TOKEN_CAP,
+    mamba_multiseq_warmup_enabled,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
@@ -1341,7 +1345,7 @@ class DecoderWarmup:
         the autotuner is enabled so op-level (M,N,K) caches also get primed
         for these shapes. Set ``TLLM_MAMBA_MULTISEQ_WARMUP=0`` to disable.
         """
-        if os.environ.get("TLLM_MAMBA_MULTISEQ_WARMUP", "1") != "1":
+        if not mamba_multiseq_warmup_enabled():
             return
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
@@ -1378,9 +1382,9 @@ class DecoderWarmup:
         # pool and crashes with "Can't allocate new blocks for window size N".
         # The point of this warmup is only to trigger ``num_seqs > 1`` +
         # ``HAS_INITSTATES=True`` kernel variants — a modest token budget
-        # achieves that with plenty of block headroom.
-        WARMUP_TOKEN_CAP = 4096
-        capped_num_tokens = min(curr_max_num_tokens, WARMUP_TOKEN_CAP)
+        # achieves that with plenty of block headroom. MambaHybridCacheManagerV2
+        # sizes a slot floor for this batch from the same cap.
+        capped_num_tokens = min(curr_max_num_tokens, MAMBA_MULTISEQ_WARMUP_TOKEN_CAP)
 
         logger.info("Running Mamba hybrid warmup (multi-seq + HAS_INITSTATES=True)...")
 
