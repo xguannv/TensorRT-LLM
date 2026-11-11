@@ -216,10 +216,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_kimi_k3_route_b_moe.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/norm/test_modeling_v2_rms_norm_gated_token_major.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/activation/test_modeling_v2_situ_and_mul.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_situ/test_k3r_situ.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_rms_norm_gated/test_k3r_rms_norm_gated.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/moe/test_modeling_v2_k3r_experts.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/common/test_k3_kda_metadata.py
   - accuracy/modeling_v2/gpt_oss/gpt_oss_120b__sm_10x__default/test_accuracy.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp1]
   # qwen4_exp target at tp1, pre-merge: gsm8k without speculation; one MTP engine for gsm8k
   # with its acceptance-length floor, mmmu (the vision tower) and synthetic videos; and one
