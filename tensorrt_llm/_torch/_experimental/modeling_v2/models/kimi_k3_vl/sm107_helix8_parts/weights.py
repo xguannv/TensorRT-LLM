@@ -1094,7 +1094,7 @@ class KimiK3DefaultTextWeights:
             backend._weights_transformed = False
 
     def _finalize_weight_load(self, num_params: int, num_moe_layers: int) -> None:
-        """Finalize checkpoint-loaded attention and optional BF16 MLP conversion."""
+        """Finalize checkpoint-loaded attention and the BF16 MLP conversion."""
         for layer in self.model.layers:
             if not _has_weights(layer):
                 continue
@@ -1106,9 +1106,7 @@ class KimiK3DefaultTextWeights:
                 attention = layer.self_attn.mixer
             for name, linear in attention.named_children():
                 if _is_fp8_block_projection(linear):
-                    _swap_linear_to_fp8_weight_read(
-                        attention, name, (type(linear),), constants=self.k3_constants
-                    )
+                    _swap_linear_to_fp8_weight_read(attention, name, (type(linear),))
             fused = getattr(attention, "qkvg_proj", None)
             if isinstance(fused, _Fp8BlockScaleWeightReadLinear):
                 offset = 0
@@ -1124,11 +1122,12 @@ class KimiK3DefaultTextWeights:
         logger.info(
             f"Kimi K3: loaded {num_params} parameters and expert slices of {num_moe_layers} layers"
         )
-        if self._fp8_weight_read_moe_mlp and is_sm_100f():
+        # The BF16 shared and latent MoE MLP weights are read as block-scaled FP8 (quantized once
+        # here; checkpoint-native attention FP8 is independent of this lossy conversion). Without
+        # attention DP the fused gate_up projection stays BF16.
+        if is_sm_100f():
             converted = _convert_moe_mlps_to_fp8_weight_read(
-                self.model,
-                include_fused_gate_up=self.model_config.mapping.enable_attention_dp,
-                constants=self.k3_constants,
+                self.model, include_fused_gate_up=False
             )
             logger.info(f"Kimi K3: quantized {converted} BF16 shared/latent MLP projections to FP8")
 

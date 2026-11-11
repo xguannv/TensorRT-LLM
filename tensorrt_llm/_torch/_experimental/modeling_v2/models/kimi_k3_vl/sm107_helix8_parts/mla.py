@@ -32,7 +32,7 @@ One forward of ``T`` tokens (the first ``T_ctx`` context rows):
 
 1. **Front**: the fused q_a / kv_a projection (on the MXFP8 layer input the decoder layer hands
    over, where its GEMM takes it; a BF16 one is ``trtllm::cublas_mm``), the q_a RMSNorm
-   (FlashInfer, or with ``K3Sm107Constants.mla_q_norm_pdl`` its PDL-at-launch variant) beside the kv_a
+   (FlashInfer; with PDL its release-at-launch variant) beside the kv_a
    RMSNorm on the attention aux stream, then q_b (the context rows of a Helix rank: its head range
    only) beside the latent row ``concat(kv_a_norm, k_pe)``.
 2. **Context** rows: ``forward_context``.
@@ -192,7 +192,6 @@ from ..ops.attention import k3_mla_cache as mla_cache
 from ..ops.attention.k3_context_fmha import k3_context_fmha
 from ..ops.attention.k3_mla_state import K3MlaAttnState
 from ..ops.attention.static_quantize_e4m3 import static_quantize_e4m3
-from ..sm107_parts.constants import K3Sm107Constants
 from ..sm107_parts.layers import fork_join, rms_norm
 
 try:
@@ -1325,8 +1324,8 @@ def helix_tail_applies(layer, num_tokens: int) -> bool:
 
 def gen_attention(layer, q: torch.Tensor, md: AttentionMetadata, **kwargs) -> torch.Tensor:
     """The absorbed decode of ``q`` (``[T, H * 576]``) into a new ``[T, H * kv_lora_rank]``: K3's
-    packed FP4 decode on an FP4 cache with the CuTe DSL FP4 MLA backend (with the layer's
-    ``constants``); on an FP8 or BF16 cache the CuTe DSL MLA decode where it serves the batch, else
+    packed FP4 decode on an FP4 cache with the CuTe DSL FP4 MLA backend (page plan and PDL
+    reduction on); on an FP8 or BF16 cache the CuTe DSL MLA decode where it serves the batch, else
     the attention op's MLA generation (``ops/attention/k3_mla_attention``). ``kwargs``: the buffers of
     the generation cache update (``mla_rope_generation``) and ``softmax_stats_tensor``."""
     if fp4_mla_decode.applies(layer.mqa):
@@ -1336,8 +1335,8 @@ def gen_attention(layer, q: torch.Tensor, md: AttentionMetadata, **kwargs) -> to
             q,
             md,
             softmax_stats_tensor=kwargs.get("softmax_stats_tensor"),
-            page_plan=layer.constants.fp4_mla_page_plan,
-            reduce_pdl=layer.constants.fp4_mla_reduce_pdl,
+            page_plan=True,
+            reduce_pdl=True,
         )
     mqa = layer.mqa
     if mqa.uses_fp4_mla_attention:
@@ -1894,13 +1893,9 @@ class K3MLAAttention(nn.Module):
         model_config: ModelConfig,
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
         mapping_with_cp: Optional[Mapping] = None,
-        constants: K3Sm107Constants,
     ) -> None:
         super().__init__()
         config = model_config
-        # The target's constants: ``mla_q_norm_pdl`` (q_a_norm) and the FP4 decode's
-        # ``fp4_mla_page_plan`` / ``fp4_mla_reduce_pdl`` (gen_attention).
-        self.constants = constants
         self.layer_idx = layer_idx
         self.layer_idx_str = str(layer_idx)
         self.dtype = dtype
@@ -1949,32 +1944,29 @@ class K3MLAAttention(nn.Module):
             suffix += 1
         registry[self.layer_idx_str] = weakref.ref(self)
 
-        # Head sharding: q_b / kv_b over TP (attention DP: none), the post-exchange heads of
-        # o_proj / g_proj over TP x CP.
+        # Head sharding: q_b / kv_b over TP, the post-exchange heads of o_proj / g_proj over
+        # TP x CP (no attention DP: _reject_unsupported).
         self.mapping = mapping_with_cp if mapping_with_cp is not None else config.mapping
         tp_size, pp_size, cp_size = self.mapping.tp_size, self.mapping.pp_size, self.mapping.cp_size
-        dp_size = 1
-        if self.mapping.enable_attention_dp:
-            dp_size, tp_size = tp_size, 1
-        world_size = pp_size * dp_size * tp_size * cp_size
+        world_size = pp_size * tp_size * cp_size
         mapping = Mapping(
             world_size=world_size,
             tp_size=tp_size,
-            pp_size=pp_size * dp_size,
+            pp_size=pp_size,
             cp_size=cp_size,
             cp_config=self.mapping.cp_config,
             rank=self.mapping.rank,
             gpus_per_node=self.mapping.gpus_per_node,
-            enable_attention_dp=self.mapping.enable_attention_dp,
+            enable_attention_dp=False,
         )
         self.mapping_o = Mapping(
             world_size=world_size,
             tp_size=tp_size * cp_size,
-            pp_size=pp_size * dp_size,
+            pp_size=pp_size,
             cp_size=1,
             rank=self.mapping.rank,
             gpus_per_node=self.mapping.gpus_per_node,
-            enable_attention_dp=self.mapping.enable_attention_dp,
+            enable_attention_dp=False,
         )
         assert num_heads % (tp_size * cp_size) == 0
         self.num_heads_tp = num_heads // tp_size
@@ -2112,9 +2104,9 @@ class K3MLAAttention(nn.Module):
             unsupported.append("Ulysses CP")
         if mapping.cp_size > 1 and not mapping.has_cp_helix():
             unsupported.append(f"CP type {mapping.cp_config.get('cp_type')}")
+        if mapping.enable_attention_dp:
+            unsupported.append("attention DP (the helix8 targets run none)")
         if mapping.has_cp_helix():
-            if mapping.enable_attention_dp:
-                unsupported.append("Helix CP with attention DP")
             if mapping.cp_config.get("use_nccl_for_alltoall", True):
                 unsupported.append("the NCCL Helix all-to-all (use_nccl_for_alltoall: false)")
             elif mapping.cp_config.get("fifo_version", 2) != 2:
@@ -2294,11 +2286,10 @@ class K3MLAAttention(nn.Module):
         return proj(hidden_states)
 
     def q_a_norm(self, q: torch.Tensor) -> torch.Tensor:
-        """The q_a RMSNorm (FlashInfer); with ``constants.mla_q_norm_pdl`` and PDL the same kernel
-        releasing its dependent (q_b) at launch instead of after its store, so q_b streams its
-        weights while q_a and the norm run."""
+        """The q_a RMSNorm (FlashInfer); with PDL the same kernel releasing its dependent (q_b) at
+        launch instead of after its store, so q_b streams its weights while q_a and the norm run."""
         norm = self.q_a_layernorm
-        if self.constants.mla_q_norm_pdl and IS_FLASHINFER_AVAILABLE and get_env_enable_pdl():
+        if IS_FLASHINFER_AVAILABLE and get_env_enable_pdl():
             from ..kernels.k3r_mla_q.q_norm_pdl import can_use
             from ..ops.attention.rmsnorm_release_at_launch import rmsnorm_release_at_launch
 
@@ -2587,8 +2578,6 @@ class K3MLARuntime(nn.Module):
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
         mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
-        *,
-        constants: K3Sm107Constants,
     ) -> None:
         super().__init__()
 
@@ -2604,7 +2593,9 @@ class K3MLARuntime(nn.Module):
         # mapping sums the base o_proj's tp*cp partials. reduce_output=False
         # leaves that reduction to the caller (helix_a2a reduce-scatter).
         mapping = model_config.mapping.mapping_for_full_rows()
-        reduce_output = reduce_output and not mapping.enable_attention_dp and mapping.tp_size > 1
+        if mapping.enable_attention_dp:
+            raise NotImplementedError("Kimi K3 helix8 MLA: attention DP (the targets run none)")
+        reduce_output = reduce_output and mapping.tp_size > 1
         self._o_allreduce = (
             TpAllReduce(mapping, torch.bfloat16, model_config.allreduce_strategy)
             if reduce_output
@@ -2663,7 +2654,6 @@ class K3MLARuntime(nn.Module):
             model_config=attention_config,
             aux_stream_dict=aux_stream_dict,
             mapping_with_cp=mapping_with_cp,
-            constants=constants,
         )
 
     def forward(

@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi K3 NVFP4 on Rubin (SM107): the model.
+"""Kimi K3 NVFP4 on Rubin (SM107), the helix8 generation targets: the model.
 
-``KimiK3Sm107ForConditionalGeneration`` serves every deployment ``routing.py`` admits on SM107:
-one-rank DWDP context servers, generation over Helix CP8, over Helix CP16 with the routed
-experts split MoE TP4 x EP4, and attention DP over 16 ranks. The layout comes from the engine's
-``Mapping``; the deployment's optimizations come from its target's ``K3Sm107Constants``
-(``K3_CONSTANTS`` of the target class, a subclass of this one).
+``KimiK3Sm107ForConditionalGeneration`` serves generation over Helix CP8 (tp 1, no attention DP)
+for the two helix8 targets, ``helix8_moeep8`` (routed experts MoE EP8) and ``helix8_moetp2ep4``
+(MoE TP2 x EP4). The layout, the MoE split included, comes from the engine's ``Mapping``. The
+targets' optimizations (``HELIX8_CONSTANTS``) are built into this code; a target class declares
+them as its ``K3_CONSTANTS`` and the class refuses any other set.
 
 The checkpoint is the vision-language model's; this target is text only. It builds no vision
 tower (its checkpoint tensors are never read, ``weights.py``) and refuses multimodal input. The
@@ -29,14 +29,13 @@ state ``[num_heads, head_dim, head_dim]`` (fp32, ``[H, V, K]``) in ``KimiK3Hybri
 ``kv_lora_rank + qk_rope_head_dim`` (576).
 
 Parallelism: attention is head-split over the TP group, its KV sequence split over the CP
-group under Helix, or data-parallel under attention DP. The routed experts are split MoE TP x
-EP over the TP group (EP only unless ``moe_tensor_parallel_size`` /
-``moe_expert_parallel_size`` are set). Routing is computed on every rank, and the routed
-partial sums are all-reduced in the latent space, before ``routed_expert_norm`` /
-``routed_expert_up_proj``. Without attention DP the shared experts are tensor-parallel over
-the TP group and reduce on an auxiliary stream while the routed experts run on the main
-stream; under attention DP they are replicated. ``lm_head`` is vocab-parallel with a gather,
-so every rank has the full logits.
+group under Helix; there is no attention DP. The routed experts are split MoE TP x EP over the
+TP group (EP only unless ``moe_tensor_parallel_size`` / ``moe_expert_parallel_size`` are set).
+Routing is computed on every rank, and the routed partial sums are all-reduced in the latent
+space, before ``routed_expert_norm`` / ``routed_expert_up_proj``. The shared experts are
+tensor-parallel over the TP group and reduce on an auxiliary stream while the routed experts run
+on the main stream. ``lm_head`` is vocab-parallel with a gather, so every rank has the full
+logits.
 
 Speculative decoding: one-engine DSpark with the family's standalone MLA drafter and worker
 (``dspark/``); KDA and MLA verify several tokens per step and keep the accepted state. Chunked
@@ -83,7 +82,6 @@ from ..sm107_parts.layers import (
     subgroup_mapping,
 )
 from .attn_res import (
-    AttnResPdl,
     _apply_attn_res,
     _apply_attn_res_add_and_rmsnorm,
     _apply_attn_res_and_rmsnorm,
@@ -121,11 +119,42 @@ _K3_SHARED_STREAM_PRIORITY = 0
 # would score lower here with nothing raised (K3 + RadixArk: AR 71.4% -> 66.9% the other way).
 
 
-def _attn_res_pdl(constants: K3Sm107Constants) -> Optional[AttnResPdl]:
-    """How the target runs the K3 PDL attention-residual kernels (``None``: it does not)."""
-    if not constants.attn_res_pdl:
-        return None
-    return AttnResPdl(constants.attn_res_pdl_max_m, constants.attn_res_early_trigger)
+# The constants the helix8 targets declare (their ``constants.py``), which this code is built for.
+HELIX8_CONSTANTS = K3Sm107Constants(
+    spec_head_fusion=True,
+    fuse_moe_residual=True,
+    fp8w_lowm_gemm=True,
+    ld_fused=True,
+    shared_sm=16,
+    fc12_die_major=True,
+    megamoe_experts=None,
+    router_exact_kda=True,
+    router_bf16_gate=True,
+    fp8_weight_read_moe_mlp=True,
+    latent_ar_own_ws=True,
+    attn_res_pdl=True,
+    attn_res_pdl_max_m=128,
+    attn_res_mxfp8=True,
+    attn_res_early_trigger=True,
+    kda_prepad_prefill=False,
+    kda_fused_conv_prefill=False,
+    kda_l2_prefetch=True,
+    mla_q_norm_pdl=True,
+    fp4_mla_page_plan=True,
+    fp4_mla_reduce_pdl=True,
+    spec_tail_fusion=True,
+    dspark_tail_v2=True,
+    dspark_context_kv_only=False,
+    torch_mem_safety_margin=4 * 1024**3,
+)
+
+
+def _refuse_attention_dp(mapping) -> None:
+    """The helix8 targets run without attention DP; the code has no attention-DP paths."""
+    if mapping.enable_attention_dp:
+        raise NotImplementedError(
+            "The Kimi K3 helix8 targets run without attention DP (enable_attention_dp=False)."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -140,12 +169,8 @@ class KimiK3DefaultDecoderLayer(nn.Module):
         cfg,
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
-        *,
-        constants: K3Sm107Constants,
     ):
         super().__init__()
-        self._constants = constants
-        self._attn_res_pdl = _attn_res_pdl(constants)
         self.layer_idx = layer_idx
         self.hidden_size = cfg.hidden_size
         dtype = torch.bfloat16
@@ -176,7 +201,6 @@ class KimiK3DefaultDecoderLayer(nn.Module):
                 allreduce_strategy=model_config.allreduce_strategy,
                 aux_stream=aux_stream_dict[AuxStreamType.Attention],
                 model_config=attention_config,
-                constants=constants,
             )
         else:
             self.self_attn = K3MLARuntime(
@@ -186,25 +210,18 @@ class KimiK3DefaultDecoderLayer(nn.Module):
                 aux_stream_dict=aux_stream_dict,
                 # CP original stashed by _setup_helix_mappings; None outside helix.
                 mapping_with_cp=getattr(model_config, "_helix_mapping_with_cp", None),
-                constants=constants,
             )
 
         if self.is_moe:
-            self.block_sparse_moe = K3MoERuntime(
-                model_config, cfg, layer_idx, aux_stream_dict, constants=constants
-            )
+            self.block_sparse_moe = K3MoERuntime(model_config, cfg, layer_idx, aux_stream_dict)
         else:
             # The dense MLP (layer 0): BF16 gate_up GEMM, SiTU-and-mul, down GEMM and, on a TP
-            # group, the down projection's all-reduce. Attention DP replicates it (ranks own
-            # different tokens); otherwise it is TP over the largest group of consecutive ranks
-            # that divides the intermediate size and stays within one node.
+            # group, the down projection's all-reduce. It is TP over the largest group of
+            # consecutive ranks that divides the intermediate size and stays within one node.
             mlp_mapping = model_config.mapping.mapping_for_full_rows()
-            if mlp_mapping.enable_attention_dp:
-                self.mlp_tp_size = 1
-            else:
-                self.mlp_tp_size = math.gcd(cfg.intermediate_size, mlp_mapping.tp_size)
-                if self.mlp_tp_size > mlp_mapping.gpus_per_node:
-                    self.mlp_tp_size = math.gcd(self.mlp_tp_size, mlp_mapping.gpus_per_node)
+            self.mlp_tp_size = math.gcd(cfg.intermediate_size, mlp_mapping.tp_size)
+            if self.mlp_tp_size > mlp_mapping.gpus_per_node:
+                self.mlp_tp_size = math.gcd(self.mlp_tp_size, mlp_mapping.gpus_per_node)
             self.mlp = GatedMlp(
                 cfg.hidden_size,
                 cfg.intermediate_size,
@@ -238,14 +255,14 @@ class KimiK3DefaultDecoderLayer(nn.Module):
 
     def _attn_takes_mxfp8(self, num_rows: int, attn_metadata: AttentionMetadata) -> bool:
         """Whether the pre-attention mix should also emit its MXFP8 form for the attention mixer
-        (the target's ``attn_res_mxfp8``; generation-only batches): the KDA fused QKVG projection
+        (generation-only batches): the KDA fused QKVG projection
         (``qkvg_takes_mxfp8``) or the MLA fused q_a / kv_a projection (``q_a_takes_mxfp8``).
 
         The mix that folds in the previous MoE residual (k3_attn_res_moe_add_rmsnorm_mx) then also
         stores the MXFP8 form of its output, and that projection runs the low-M GEMM on it
         (k3_fp8w_lowm_mxfp8) instead of quantizing the BF16 rows itself: bitwise the same
         projection."""
-        if not self._constants.attn_res_mxfp8 or attn_metadata.num_contexts != 0:
+        if attn_metadata.num_contexts != 0:
             return False
         if self.is_kda:
             return self.linear_attn.qkvg_takes_mxfp8(num_rows)
@@ -279,7 +296,7 @@ class KimiK3DefaultDecoderLayer(nn.Module):
         ``block_residual`` is a preallocated snapshot bank in kernel-native
         ``[K_max, M, H]`` layout. Returns the running prefix sum and the
         number of valid bank rows. The prefix sum (input and output) can be a
-        ``_DeferredMoEResidual`` or ``_DeferredRpTail`` (the target's ``attn_res_pdl``).
+        ``_DeferredMoEResidual`` or ``_DeferredRpTail``.
 
         ``capture`` is ``(spec_metadata, layer_id)`` and taps the DSpark aux
         stream for the layer BEFORE this one: the aggregated stream for layer j
@@ -305,7 +322,6 @@ class KimiK3DefaultDecoderLayer(nn.Module):
                     self.self_attention_res_norm,
                     self.input_layernorm,
                     mxfp8=mxfp8,
-                    pdl=self._attn_res_pdl,
                 )
                 if fused is not None:
                     hidden_states, normed, *attn_input_mxfp8 = fused
@@ -328,7 +344,6 @@ class KimiK3DefaultDecoderLayer(nn.Module):
                     and self.is_kda
                     and self.linear_attn.qkvg_stages_weights(rows),
                     mx_atom=mxfp8 and self._attn_mx_atom(rows),
-                    pdl=self._attn_res_pdl,
                 )
                 if fused is not None:
                     hidden_states, normed, *attn_input_mxfp8 = fused
@@ -362,7 +377,6 @@ class KimiK3DefaultDecoderLayer(nn.Module):
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
                 self.input_layernorm,
-                pdl=self._attn_res_pdl,
             )
         else:
             hidden_states = rms_norm(
@@ -389,7 +403,6 @@ class KimiK3DefaultDecoderLayer(nn.Module):
             self.mlp_res_proj,
             self.mlp_res_norm,
             self.post_attention_layernorm,
-            pdl=self._attn_res_pdl,
         )
         if self.is_kda:
             if attn_input_mxfp8:
@@ -409,7 +422,6 @@ class KimiK3DefaultDecoderLayer(nn.Module):
                 self.mlp_res_proj,
                 self.mlp_res_norm,
                 self.post_attention_layernorm,
-                pdl=self._attn_res_pdl,
             )
         else:
             prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
@@ -419,22 +431,19 @@ class KimiK3DefaultDecoderLayer(nn.Module):
                 self.mlp_res_proj,
                 self.mlp_res_norm,
                 self.post_attention_layernorm,
-                pdl=self._attn_res_pdl,
             )
-        if self.is_moe and self._constants.fuse_moe_residual:
+        if self.is_moe:
+            # The MoE adds its output to the prefix sum itself (or defers that add).
             prefix_sum = self.block_sparse_moe(
                 hidden_states,
                 all_rank_num_tokens,
                 residual=prefix_sum,
-                defer_residual=_defer_moe_residual(prefix_sum.shape[0], self._attn_res_pdl),
+                defer_residual=_defer_moe_residual(prefix_sum.shape[0]),
                 # The row-parallel tail serves generation-only batches.
                 rp_tail_ok=getattr(attn_metadata, "num_contexts", 1) == 0,
             )
             return prefix_sum, num_snapshots
-        if self.is_moe:
-            hidden_states = self.block_sparse_moe(hidden_states, all_rank_num_tokens)
-        else:
-            hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states)
 
         prefix_sum = prefix_sum + hidden_states
         return prefix_sum, num_snapshots
@@ -460,10 +469,8 @@ class KimiK3DefaultDecoderLayer(nn.Module):
 
 
 class KimiK3DefaultModelingV2(DecoderModel):
-    def __init__(self, model_config: ModelConfig, *, constants: K3Sm107Constants):
+    def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
-        self._constants = constants
-        self._attn_res_pdl = _attn_res_pdl(constants)
         cfg = _get_text_config(model_config.pretrained_config)
         self._text_cfg = cfg
         dtype = torch.bfloat16
@@ -481,14 +488,12 @@ class KimiK3DefaultModelingV2(DecoderModel):
             AuxStreamType.MoeOutputMemset: aux_stream_list[3],
         }
 
-        # The whole vocabulary on every rank: a row gather (``gather_embedding`` with the target's
-        # ``spec_head_fusion``, ``F.embedding`` otherwise).
+        # The whole vocabulary on every rank: a row gather (``gather_embedding`` of 1-D ids on a
+        # contiguous table, ``F.embedding`` otherwise).
         self.embed_tokens = EmbeddingTable(cfg.vocab_size, cfg.hidden_size, dtype=dtype)
         self.layers = nn.ModuleList(
             [
-                KimiK3DefaultDecoderLayer(
-                    model_config, cfg, layer_idx, self.aux_stream_dict, constants=constants
-                )
+                KimiK3DefaultDecoderLayer(model_config, cfg, layer_idx, self.aux_stream_dict)
                 for layer_idx in range(cfg.num_hidden_layers)
             ]
         )
@@ -522,7 +527,7 @@ class KimiK3DefaultModelingV2(DecoderModel):
 
         if inputs_embeds is None:
             weight = self.embed_tokens.weight
-            if self._constants.spec_head_fusion and input_ids.dim() == 1 and weight.is_contiguous():
+            if input_ids.dim() == 1 and weight.is_contiguous():
                 # The F.embedding rows, copied with 16-byte accesses.
                 inputs_embeds = gather_embedding(input_ids, weight)
             else:
@@ -596,7 +601,6 @@ class KimiK3DefaultModelingV2(DecoderModel):
             self.output_attn_res_proj,
             self.output_attn_res_norm,
             self.norm,
-            pdl=self._attn_res_pdl,
         )
         return output
 
@@ -610,39 +614,22 @@ class KimiK3DefaultForCausalLM(
     is the ``KimiK3DefaultTextWeights`` mixin's (``weights.py``).
 
     Speculative decoding: one-engine DSpark with a standalone MLA drafter, built by the family's
-    ``KimiK3SpecForCausalLM`` (``dspark/``) on the target's constants: the deployment path
-    (``spec_tail_fusion`` / ``dspark_tail_v2``), the context-KV-only drafter of a context server
-    (``dspark_context_kv_only``) and the decode step's head in one kernel (``spec_head_fusion``,
-    ``RuntimeHooks.decode_prologue``)."""
+    ``KimiK3SpecForCausalLM`` (``dspark/``): the fused spec-tail v2 deployment path, the full
+    generation-side drafter (not the context-KV-only one of a context server) and the decode
+    step's head in one kernel (``RuntimeHooks.decode_prologue``)."""
 
     mamba_metadata_cls = K3MambaMetadata
+    # The fused spec tail, v2.
+    dspark_path = K3DSparkPath(spec_tail_fusion=True, tail_v2=True)
+    # A generation server: its drafter is the full one.
+    dspark_context_kv_only = False
+    # The speculative decode step's head in one kernel.
+    spec_decode_prologue = staticmethod(spec_decode_head)
 
-    @property
-    def dspark_path(self) -> K3DSparkPath:
-        """The DSpark deployment path of the target's ``spec_tail_fusion`` / ``dspark_tail_v2``."""
-        return K3DSparkPath(
-            spec_tail_fusion=self.k3_constants.spec_tail_fusion,
-            tail_v2=self.k3_constants.dspark_tail_v2,
-        )
-
-    @property
-    def dspark_context_kv_only(self) -> bool:
-        """Whether the target is a context server whose drafter only writes the context KV."""
-        return self.k3_constants.dspark_context_kv_only
-
-    @property
-    def spec_decode_prologue(self):
-        """The speculative decode step's head in one kernel, with the target's ``spec_head_fusion``."""
-        return spec_decode_head if self.k3_constants.spec_head_fusion else None
-
-    def __init__(self, model_config: ModelConfig, *, constants: K3Sm107Constants):
-        # The target's constants (``K3Sm107Constants``); every layer gets the same instance.
-        self.k3_constants = constants
-        # BF16 shared/latent MLP weights quantized once after loading (checkpoint-native attention
-        # FP8 is independent of this lossy conversion).
-        self._fp8_weight_read_moe_mlp = constants.fp8_weight_read_moe_mlp
+    def __init__(self, model_config: ModelConfig):
         cfg = _get_text_config(model_config.pretrained_config)
         assert model_config.mapping.pp_size == 1, "Kimi K3 does not support pipeline parallelism"
+        _refuse_attention_dp(model_config.mapping)
         spec_config = getattr(model_config, "spec_config", None)
 
         # Helix: swap in the repurposed mapping; restored after super().__init__.
@@ -651,7 +638,7 @@ class KimiK3DefaultForCausalLM(
         # KimiK3SpecForCausalLM rejects every other speculative config. The target side is the
         # hidden-state capture in KimiK3DefaultModelingV2.forward.
         super().__init__(
-            KimiK3DefaultModelingV2(model_config, constants=constants),
+            KimiK3DefaultModelingV2(model_config),
             model_config,
             hidden_size=cfg.hidden_size,
             vocab_size=cfg.vocab_size,
@@ -819,11 +806,11 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
     ``runtime_hooks``, ...) are the text model's. Weight loading is the
     ``KimiK3DefaultWeights`` mixin's (``weights.py``).
 
-    Abstract: a target subclasses it and sets ``K3_CONSTANTS``, the constants the whole model
-    runs with.
+    Abstract: a target subclasses it and sets ``K3_CONSTANTS``, which must be
+    ``HELIX8_CONSTANTS`` (the code is built for them).
     """
 
-    # The target's constants; set by every target class, read once in ``__init__``.
+    # The target's constants; set by every target class, checked once in ``__init__``.
     K3_CONSTANTS: ClassVar[K3Sm107Constants]
 
     _LANG_PREFIX = "language_model."
@@ -866,6 +853,11 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
                 f"{type(self).__name__} has no K3_CONSTANTS: build a Kimi K3 SM107 target class "
                 "(a subclass that sets K3_CONSTANTS to its K3Sm107Constants), not "
                 "KimiK3Sm107ForConditionalGeneration itself"
+            )
+        if constants != HELIX8_CONSTANTS:
+            raise ValueError(
+                f"{type(self).__name__}.K3_CONSTANTS differ from the helix8 constants this code is "
+                "built for (sm107_helix8_parts/modeling.py HELIX8_CONSTANTS)"
             )
         config = model_config.pretrained_config
         # PreTrainedModel.__init__ resolves config._attn_implementation and
@@ -913,7 +905,7 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
             text_model_config.skip_create_weights_in_init = True
         text_model_config._frozen = True
 
-        self.llm = KimiK3DefaultForCausalLM(text_model_config, constants=constants)
+        self.llm = KimiK3DefaultForCausalLM(text_model_config)
 
         # Point model_config at the text_config so the executor reads generation
         # params (eos_token_id, ...) from the text backbone, matching K2.5.
@@ -947,10 +939,11 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
     @property
     def runtime_hooks(self) -> RuntimeHooks:
         """The text model's step-loop hooks (the engine reads them off the outer model) and the
-        target's ``torch_mem_safety_margin``. A target class adds its own declarations to these."""
+        4 GiB the engine leaves outside the PyTorch memory cap. A target class adds its own
+        declarations to these."""
         return replace(
             self.llm.runtime_hooks or DEFAULT_RUNTIME_HOOKS,
-            torch_mem_safety_margin=self.llm.k3_constants.torch_mem_safety_margin,
+            torch_mem_safety_margin=HELIX8_CONSTANTS.torch_mem_safety_margin,
         )
 
     def set_guided_decoder(self, *args, **kwargs):
@@ -983,4 +976,4 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
         )
 
 
-__all__ = ["KimiK3DefaultForCausalLM", "KimiK3Sm107ForConditionalGeneration"]
+__all__ = ["HELIX8_CONSTANTS", "KimiK3DefaultForCausalLM", "KimiK3Sm107ForConditionalGeneration"]
