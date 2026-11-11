@@ -83,7 +83,7 @@ def _run_rank(world_size):
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec.k3_draft_gemm_push import (  # noqa: E501
         k3_draft_gemm_push,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.layers import (  # noqa: E501  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_common.layers import (  # noqa: E501  # noqa: E501
         TpAllReduce,
         lamport_push_target,
         lamport_push_tensor,
@@ -251,7 +251,7 @@ def _run_rank_embed(world_size):
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec.k3_vocab_shard_embedding import (  # noqa: E501
         k3_vocab_shard_embedding,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.layers import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_common.layers import (  # noqa: E501
         EmbeddingTable,
     )
 
@@ -334,7 +334,7 @@ def _run_rank_mlp(world_size):
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_spec.dspark_draft_gemm_push import (  # noqa: E501
         run_gemm,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.layers import (  # noqa: E501  # noqa: E501  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_common.layers import (  # noqa: E501  # noqa: E501  # noqa: E501
         GatedMlp,
         RMSNormWeight,
         TpAllReduce,

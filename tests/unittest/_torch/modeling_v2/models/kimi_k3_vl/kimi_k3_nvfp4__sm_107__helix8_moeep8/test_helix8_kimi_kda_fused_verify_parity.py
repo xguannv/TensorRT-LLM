@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Runtime-level parity: K3KDALinearAttention fused verify vs a sequential FLA reference.
+"""Runtime-level parity: the helix8 glue's K3KDALinearAttention fused verify vs a sequential FLA
+reference.
 
 Simulates two chained speculative-verification rounds in both worlds:
 
@@ -24,8 +25,10 @@ Simulates two chained speculative-verification rounds in both worlds:
   ``kda_mtp_decode`` entry), in-place state commit after the golden token, and
   only the accepted-draft count recorded between rounds.
 
-Both worlds share the layer's FP8 projections (the fused QKVG and o_proj weight-read GEMMs) and
-take identical hidden states; the fused world runs its gate projection on the aux stream. With
+Both worlds share the layer's FP8 projections (the fused QKVG and o_proj weight-read GEMMs, the K3
+low-M GEMM on the low-M rows as the helix8 glue always runs them) and take identical hidden states;
+the fused world runs its gate projection on the aux stream (and, helix8 folding in the L2
+prefetch, the prefetch hints there; with one KDA layer there is no next layer to prefetch). With
 mixed per-request acceptance between rounds, matching round-2 outputs proves the packed row/slot
 bookkeeping, conv-window seeding and the in-kernel gated RMSNorm epilogue reproduce the
 promoted-state semantics.
@@ -33,7 +36,6 @@ promoted-state semantics.
 Requires 1 Blackwell GPU, fla-core, nvidia-cutlass-dsl. Skips otherwise.
 """
 
-import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -47,13 +49,10 @@ try:
     import cutlass  # noqa: F401
     from fla.ops.kda import fused_recurrent_kda  # noqa: F401
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.constants import (  # noqa: E501
-        K3Sm107Constants,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.fp8_weight_read import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_helix8_parts.fp8_weight_read import (  # noqa: E501
         _Fp8BlockScaleWeightReadLinear,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.kda import (
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_helix8_parts.kda import (  # noqa: E501
         K3KDALinearAttention,
     )
 
@@ -87,18 +86,10 @@ M = 2  # draft tokens per round
 LB = -5.0
 
 
-@torch.no_grad()
-def _plain_constants() -> "K3Sm107Constants":
-    """Every switch off: the plain code path."""
-    values = {field.name: False for field in dataclasses.fields(K3Sm107Constants)}
-    values.update(shared_sm=0, attn_res_pdl_max_m=64, torch_mem_safety_margin=0)
-    return K3Sm107Constants(**values)
-
-
-def _make_runtime(seed, aux_stream=None, *, num_heads=H, fp8w_lowm_gemm=False):
+def _make_runtime(seed, aux_stream=None, *, num_heads=H):
     """A finalized layer on seeded FP8 checkpoint-like weights, with its fused QKVG and o_proj
-    swapped to the K3 FP8 weight-read GEMM as the model loader does (``fp8w_lowm_gemm``: the
-    target's K3 low-M GEMM on those projections)."""
+    swapped to the helix8 FP8 weight-read GEMM (the K3 low-M GEMM on the low-M rows) as the model
+    loader does."""
     # A real KimiLinearConfig (not a SimpleNamespace) so the runtime sees the
     # same config surface it does in production. ``linear_attn_config`` carries
     # the per-layer KDA params the runtime reads plus the (unused here)
@@ -126,7 +117,6 @@ def _make_runtime(seed, aux_stream=None, *, num_heads=H, fp8w_lowm_gemm=False):
         layer_idx=0,
         aux_stream=aux_stream,
         model_config=model_config,
-        constants=_plain_constants(),
     ).to("cuda")
     gen = torch.Generator(device="cuda").manual_seed(seed)
     for name, p in rt.named_parameters():
@@ -152,7 +142,6 @@ def _make_runtime(seed, aux_stream=None, *, num_heads=H, fp8w_lowm_gemm=False):
     rt._build_mtp_conv_weights()
     for name in ("qkvg_proj", "o_proj"):
         module = _Fp8BlockScaleWeightReadLinear.from_linear(getattr(rt, name))
-        module.fp8w_lowm_gemm = fp8w_lowm_gemm
         setattr(rt, name, module)
         module.post_load_weights()
     return rt
@@ -420,7 +409,7 @@ def test_fused_vs_sequential_two_rounds(request, num_heads, large_state_stride, 
     verify kernel (``kda_mtp_decode`` with ``fa`` / ``w_fb``, launched with PDL), where that kernel
     takes the head count (up to 16 heads), else through ``F.linear`` [f_a | b] -> f_b and
     ``kda_mtp_decode`` with the fused output norm."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_helix8_parts import (  # noqa: E501
         kda as kimi_kda_mixer,
     )
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
@@ -694,8 +683,8 @@ def test_fused_verify_with_fp8_weight_read_o_proj(bf16_rows, monkeypatch):
         (HIDDEN, H * K),
         B * T if bf16_rows else 0,
     )
-    rt_seq = _make_runtime(seed=1, fp8w_lowm_gemm=True)
-    rt_fused = _make_runtime(seed=1, aux_stream=torch.cuda.Stream(), fp8w_lowm_gemm=True)
+    rt_seq = _make_runtime(seed=1)
+    rt_fused = _make_runtime(seed=1, aux_stream=torch.cuda.Stream())
     assert rt_fused.o_proj.lowm_weight_scale is not None
     assert rt_fused.o_proj.takes_prequantized_input(B * T) != bf16_rows
     mtp_calls = _capture_mtp_verify(rt_fused)

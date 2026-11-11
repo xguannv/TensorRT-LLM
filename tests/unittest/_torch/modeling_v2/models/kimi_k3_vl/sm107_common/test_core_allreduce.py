@@ -53,10 +53,10 @@ def _run_rank(world_size, mnnvl):
     from tensorrt_llm.functional import AllReduceStrategy
     from tensorrt_llm.mapping import Mapping
 
-    core_ar = importlib.import_module(f"{_K3}.sm107_parts.layers")
-    core_mlp = importlib.import_module(f"{_K3}.sm107_parts.layers")
-    core_emb = importlib.import_module(f"{_K3}.sm107_parts.layers")
-    core_linear = importlib.import_module(f"{_K3}.sm107_parts.layers")
+    core_ar = importlib.import_module(f"{_K3}.sm107_common.layers")
+    core_mlp = importlib.import_module(f"{_K3}.sm107_common.layers")
+    core_emb = importlib.import_module(f"{_K3}.sm107_common.layers")
+    core_linear = importlib.import_module(f"{_K3}.sm107_common.layers")
     rank = MPI.COMM_WORLD.Get_rank()
     torch.cuda.set_device(rank)
     bad = {}
@@ -107,7 +107,7 @@ def _run_rank(world_size, mnnvl):
                 bad[f"fp32/none/{m}x{h}"] = _same(prim(x), want)
 
             # The pushed all-reduce (layers.py) on the primitive's handle.
-            lamport = importlib.import_module(f"{_K3}.sm107_parts.layers")
+            lamport = importlib.import_module(f"{_K3}.sm107_common.layers")
             ref = AllReduce(mapping=mapping, strategy=AllReduceStrategy.AUTO, dtype=torch.bfloat16)
             prim = core_ar.TpAllReduce(mapping, torch.bfloat16)
             for m in (1, 8, 100):

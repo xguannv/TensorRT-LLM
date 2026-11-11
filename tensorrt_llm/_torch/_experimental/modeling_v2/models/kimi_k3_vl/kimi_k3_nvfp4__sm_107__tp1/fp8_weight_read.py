@@ -22,7 +22,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 from ..ops.gemm.k3_mxfp8_gemm import k3_mxfp8_gemm as k3_mxfp8_gemm_op
-from ..sm107_parts.layers import (
+from ..sm107_common.layers import (
     Bf16Linear,
     Fp8BlockScaleLinear,
     fp8_block_scale_gemm,

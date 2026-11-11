@@ -39,7 +39,7 @@ def _mods():
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm import (  # noqa: E501
         _mxfp8_gemm as mxfp8_gemm,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_common import (
         layers as linear,
     )
     from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as cdo

@@ -45,7 +45,7 @@ from ..ops.moe.k3_route_tail import k3_route_tail as k3_route_tail_op
 from ..ops.moe.k3_router_logits import k3_router_logits as k3_router_logits_op
 from ..ops.moe.k3r_experts import KERNEL_SETS as _K3_ROUTED_KERNEL_SETS
 from ..ops.moe.k3r_experts import K3RoutedExperts, SortedRouting, SortTables, zero_on_side_stream
-from ..sm107_parts.layers import (
+from ..sm107_common.layers import (
     Bf16Linear,
     GatedMlp,
     RMSNormWeight,
@@ -55,7 +55,7 @@ from ..sm107_parts.layers import (
     gated_activation,
     lamport_push_target,
 )
-from ..sm107_parts.layers import mnnvl_workspace_mpi_comm as _k3_mnnvl_mpi_comm
+from ..sm107_common.layers import mnnvl_workspace_mpi_comm as _k3_mnnvl_mpi_comm
 from .attn_res import _DeferredMoEResidual, _DeferredRpTail
 from .fp8_weight_read import _Fp8BlockScaleWeightReadLinear, _k3_lowm_gemm_can_run
 from .text_config import _is_kda_layer, _resolve_kimi_situ_betas

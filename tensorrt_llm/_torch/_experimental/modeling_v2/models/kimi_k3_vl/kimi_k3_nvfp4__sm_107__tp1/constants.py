@@ -5,7 +5,7 @@
 Taken from every recipe's context servers (c383 977198, c240 977200, c24 932149 @ 69055f20a9): profile ``tp1``.
 """
 
-from ..sm107_parts.constants import K3Sm107Constants
+from ..sm107_common.constants import K3Sm107Constants
 
 CONSTANTS = K3Sm107Constants(
     spec_head_fusion=False,

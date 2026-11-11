@@ -34,7 +34,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 from ..common.multi_stream import do_multi_stream
 from ..ops.moe.k3_moe_residual_add import k3_moe_residual_add as k3_moe_residual_add_op
 from ..ops.moe.k3r_experts import K3RoutedExperts, SortedRouting
-from ..sm107_parts.layers import (
+from ..sm107_common.layers import (
     GatedMlp,
     RMSNormWeight,
     fork_join,

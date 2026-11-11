@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The KDA q/k/v/g FP8 views and their fused qkvg projection share codes and scale grids.
+"""sm107_helix8_parts: the KDA q/k/v/g FP8 views and their fused qkvg projection share codes and
+scale grids.
 
 Resmoothing to UE8M0 is in place and not idempotent, so the shared storage must be
 resmoothed exactly once (by the fused owner) whichever module is prepared first.
@@ -23,14 +24,14 @@ import pytest
 import torch
 from utils.util import getSMVersion
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.fp8_weight_read import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_common.layers import (
+    Fp8BlockScaleLinear,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_helix8_parts.fp8_weight_read import (  # noqa: E501
     _Fp8BlockScaleWeightReadLinear,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.kda import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_helix8_parts.kda import (  # noqa: E501
     K3KDALinearAttention,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.layers import (
-    Fp8BlockScaleLinear,
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 

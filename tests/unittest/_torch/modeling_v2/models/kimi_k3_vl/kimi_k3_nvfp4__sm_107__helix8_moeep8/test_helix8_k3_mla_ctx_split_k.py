@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi K3 MLA cached-prefix context on the Rubin FP8 split-K context FMHA
-(k3_rubin/mla/ctx_split_k.py).
+"""sm107_helix8_parts: the K3 MLA cached-prefix context on the Rubin FP8 split-K context FMHA
+(the helix8 glue's mla.py; the helix8 GEN servers' warmup and autotune run context batches).
 
 CPU: which layers and calls take the split-K path and when kv_b_proj takes the MXFP8 cache
 gather. GPU (SM89+): the partition schedule handed to the FMHA. SM107: the MXFP8 gather against
@@ -22,10 +22,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_state import (
     K3MlaAttnState,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_helix8_parts import (  # noqa: E501
     mla as context,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_helix8_parts import (  # noqa: E501
     mla as ctx_split_k,
 )
 

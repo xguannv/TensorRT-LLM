@@ -38,10 +38,10 @@ def _k3_sm107(name: str) -> bool:
     """Whether a test path under the family's unit directory is an SM107 Kimi K3 test.
 
     They are the SM107 targets' tests and those of the family code the SM107 targets share:
-    ``sm107_parts/``, ``kernels/k3r_*/`` and the SM107 operations' tests in ``ops/``, whose names
+    ``sm107_common/``, ``kernels/k3r_*/`` and the SM107 operations' tests in ``ops/``, whose names
     do not start with ``test_modeling_v2_`` (the SM100 operations' do).
     """
-    if name.startswith(("kimi_k3_nvfp4__sm_107__", "sm107_parts/", "kernels/k3r_")):
+    if name.startswith(("kimi_k3_nvfp4__sm_107__", "sm107_common/", "kernels/k3r_")):
         return True
     return (
         name.startswith("ops/")

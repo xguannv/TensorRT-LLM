@@ -27,7 +27,7 @@ from tensorrt_llm.logger import logger
 from ..ops.comm.k3_attn_res_lamport import k3_attn_res_lamport
 from ..ops.moe.k3_moe_residual_add import k3_moe_residual_add as k3_moe_residual_add_op
 from ..ops.norm.k3_attn_res_norm import k3_attn_res_norm
-from ..sm107_parts.layers import LamportPending, RMSNormWeight, rms_norm
+from ..sm107_common.layers import LamportPending, RMSNormWeight, rms_norm
 
 # ---------------------------------------------------------------------------
 # attn_res: per-token snapshot mixing (HF `_apply_attn_res`).

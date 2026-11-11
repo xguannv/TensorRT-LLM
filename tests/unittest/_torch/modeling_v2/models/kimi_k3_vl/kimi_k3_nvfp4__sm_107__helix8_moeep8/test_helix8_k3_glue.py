@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The decoder glue of the Kimi K3 target against main's helpers it replaced: bitwise.
+"""The helix8 targets' decoder glue (``sm107_helix8_parts``) against main's helpers it replaced:
+bitwise.
 
 * ``_Fp8BlockScaleWeightReadLinear.from_linear`` on a ``core.Fp8BlockScaleLinear`` (loaded, or
   loaded and prepared; one rank or a COLUMN / ROW shard) gives the projection built from the codes
@@ -12,7 +13,7 @@ import pytest
 import torch
 from utils.util import getSMVersion
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_common import (
     layers as linear,
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
@@ -33,7 +34,7 @@ requires_block_fp8 = pytest.mark.skipif(
 
 
 def _fp8_weight_read():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_helix8_parts import (  # noqa: E501
         fp8_weight_read,
     )
 
@@ -41,7 +42,9 @@ def _fp8_weight_read():
 
 
 def _weights():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import weights
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_helix8_parts import (  # noqa: E501
+        weights,
+    )
 
     return weights
 
@@ -83,14 +86,11 @@ def _assert_same_projection(got, ref, k):
     assert got.quant_config.quant_algo == ref.quant_config.quant_algo
     assert torch.equal(got.weight.view(torch.uint8), ref.weight.view(torch.uint8))
     assert torch.equal(got.weight_scale, ref.weight_scale)
-    assert got._low_m_max == ref._low_m_max
-    for a, b in (
-        (got._low_m_weight_scale, ref._low_m_weight_scale),
-        (got.lowm_weight_scale, ref.lowm_weight_scale),
-    ):
-        assert (a is None) == (b is None)
-        if a is not None:
-            assert torch.equal(a, b)
+    # The helix8 glue has no generic low-M GEMM: the K3 low-M GEMM reads ``lowm_weight_scale``.
+    a, b = got.lowm_weight_scale, ref.lowm_weight_scale
+    assert (a is None) == (b is None)
+    if a is not None:
+        assert torch.equal(a, b)
     for m in ROWS:
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         assert torch.equal(got(x), ref(x)), m

@@ -18,7 +18,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvf
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__dep16.kda import (  # noqa: E501
     K3KDALinearAttention,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.layers import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_common.layers import (
     Fp8BlockScaleLinear,
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE

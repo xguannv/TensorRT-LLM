@@ -163,7 +163,7 @@ class DraftArSites:
         from ..kernels.k3r_spec.dspark_draft_ar import ar_norm_config
         from ..ops.spec.k3_draft_ar_norm import k3_draft_ar_norm
         from ..ops.spec.k3_draft_gemm_push import k3_draft_gemm_push
-        from ..sm107_parts.layers import lamport_push_target
+        from ..sm107_common.layers import lamport_push_target
 
         if (
             x.dim() != 2
@@ -218,7 +218,7 @@ def draft_embed_site(embedding, ids: torch.Tensor) -> Optional[torch.Tensor]:
 
     from ..kernels.k3r_spec.dspark_draft_ar import ELTS, EMBED_THREADS
     from ..ops.spec.k3_draft_embed import k3_draft_embed
-    from ..sm107_parts.layers import mnnvl_lamport_push_target
+    from ..sm107_common.layers import mnnvl_lamport_push_target
 
     if (
         weight.dtype != torch.bfloat16

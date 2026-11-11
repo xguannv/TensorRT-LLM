@@ -28,7 +28,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvf
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__dep16.kda import (
     K3KDALinearAttention,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.layers import (  # noqa: E402, E501  # noqa: E402, E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_common.layers import (  # noqa: E402, E501  # noqa: E402, E501
     Bf16Linear,
     Fp8BlockScaleLinear,
     ShortConvWeight,

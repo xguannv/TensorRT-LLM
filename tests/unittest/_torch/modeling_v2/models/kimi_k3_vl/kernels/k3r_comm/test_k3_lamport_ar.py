@@ -231,7 +231,7 @@ def _run_rank_api(world_size):
     from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
     from tensorrt_llm.mapping import Mapping
 
-    api = importlib.import_module(f"{_K3}.sm107_parts.layers")
+    api = importlib.import_module(f"{_K3}.sm107_common.layers")
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     torch.cuda.set_device(rank)

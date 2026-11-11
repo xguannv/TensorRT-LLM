@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The family ``sm107_parts/layers.py`` (linear) dep16 builds on, and dep16's FP8 weight read,
+"""The family ``sm107_common/layers.py`` (linear) dep16 builds on, and dep16's FP8 weight read,
 against the module chains K3 runs today: bitwise.
 
 * BF16: main's ``Linear`` (unquantized, F.linear) on the same weight.
@@ -17,7 +17,7 @@ import pytest
 import torch
 from utils.util import getSMVersion
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_common import (
     layers as linear,
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE

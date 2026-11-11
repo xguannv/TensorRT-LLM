@@ -11,9 +11,9 @@ The mid-chunk interface with the cache manager (the runtime side is ``KimiK3Hybr
 * the plan becomes ``kda_snapshot`` with ``stage_rows`` None (the snapshot goes to a slot of its
   own); a manager without the method plans none; a step with an in-forward plan too fails.
 
-The SM107 glue (``sm107_parts.kda``) uses these very classes. On the GPU, ``prepare``'s FlashInfer
-prefill schedule is compared with main's ``KimiK3MambaMetadata`` and the CuTe DSL prefill's fields
-with their values.
+The SM107 glue (each target's ``kda``: tp1, dep16, ``sm107_helix8_parts``) uses these very
+classes. On the GPU, ``prepare``'s FlashInfer prefill schedule is compared with main's
+``KimiK3MambaMetadata`` and the CuTe DSL prefill's fields with their values.
 """
 
 import importlib
@@ -23,7 +23,11 @@ import pytest
 import torch
 
 _FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
-_SM107_KDA = f"{_FAMILY}.sm107_parts.kda"
+# The KDA glue of each SM107 target (the two helix8 targets share sm107_helix8_parts).
+_SM107_KDA = tuple(
+    f"{_FAMILY}.{glue}.kda"
+    for glue in ("kimi_k3_nvfp4__sm_107__tp1", "kimi_k3_nvfp4__sm_107__dep16", "sm107_helix8_parts")
+)
 
 
 def _fam():
@@ -57,11 +61,17 @@ def test_constants():
 
 
 @pytest.mark.cpu_only
-def test_sm107_glue_uses_the_family_metadata():
-    fam, sm107 = _fam(), importlib.import_module(_SM107_KDA)
-    for name in ("K3MambaMetadata", "KDASnapshotPlan", "build_kda_snapshot_plan"):
-        assert getattr(sm107, name) is getattr(fam, name), name
-    assert sm107.KDA_PREFILL_CHUNK_SIZE == fam.KDA_PREFILL_CHUNK_SIZE
+@pytest.mark.parametrize("glue", _SM107_KDA)
+def test_sm107_glue_uses_the_family_metadata(glue):
+    """Each glue's KDA takes the family's plan class, and whatever else of the metadata it names is
+    the family's (tp1 imports only the plan class)."""
+    fam, sm107 = _fam(), importlib.import_module(glue)
+    assert sm107.KDASnapshotPlan is fam.KDASnapshotPlan
+    for name in ("K3MambaMetadata", "build_kda_snapshot_plan"):
+        if hasattr(sm107, name):
+            assert getattr(sm107, name) is getattr(fam, name), name
+    if hasattr(sm107, "KDA_PREFILL_CHUNK_SIZE"):
+        assert sm107.KDA_PREFILL_CHUNK_SIZE == fam.KDA_PREFILL_CHUNK_SIZE
 
 
 @pytest.mark.cpu_only

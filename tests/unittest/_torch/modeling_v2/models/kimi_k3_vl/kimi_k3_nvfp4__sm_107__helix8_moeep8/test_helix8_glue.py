@@ -61,7 +61,7 @@ def test_target_class_refuses_other_constants():
 
 # Every field of K3Sm107Constants: none is read in the glue except off HELIX8_CONSTANTS.
 def _constant_fields():
-    constants = importlib.import_module(f"{_FAMILY}.sm107_parts.constants")
+    constants = importlib.import_module(f"{_FAMILY}.sm107_common.constants")
     return {f.name for f in dataclasses.fields(constants.K3Sm107Constants)}
 
 
@@ -119,7 +119,7 @@ def test_glue_takes_no_constants(module, name):
 
 def test_glue_shares_the_family_layers_module():
     """The MNNVL workspace caches of ``layers`` are shared with ``dspark/``: one module."""
-    layers = importlib.import_module(f"{_FAMILY}.sm107_parts.layers")
+    layers = importlib.import_module(f"{_FAMILY}.sm107_common.layers")
     assert _glue("moe_runtime").lamport_push_target is layers.lamport_push_target
     assert _glue("attn_res").LamportPending is layers.LamportPending
     assert not (_GLUE_DIR / "layers.py").exists()

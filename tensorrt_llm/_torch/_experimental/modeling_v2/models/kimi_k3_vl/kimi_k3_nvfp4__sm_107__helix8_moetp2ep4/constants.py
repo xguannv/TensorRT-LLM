@@ -5,7 +5,7 @@
 Taken from 084745cde4's ``helix8`` profile (c240 977200, post arm).
 """
 
-from ..sm107_parts.constants import K3Sm107Constants
+from ..sm107_common.constants import K3Sm107Constants
 
 CONSTANTS = K3Sm107Constants(
     spec_head_fusion=True,

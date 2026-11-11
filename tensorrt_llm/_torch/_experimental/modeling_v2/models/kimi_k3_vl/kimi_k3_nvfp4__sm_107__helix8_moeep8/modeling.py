@@ -18,8 +18,8 @@ from typing import ClassVar
 
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 
+from ..sm107_common.constants import K3Sm107Constants
 from ..sm107_helix8_parts.modeling import KimiK3Sm107ForConditionalGeneration
-from ..sm107_parts.constants import K3Sm107Constants
 from .constants import CONSTANTS
 
 

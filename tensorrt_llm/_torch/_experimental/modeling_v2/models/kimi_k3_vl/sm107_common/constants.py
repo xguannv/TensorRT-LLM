@@ -1,11 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The constants a Kimi K3 SM107 target hands to the family's SM107 code.
+"""The record of what a Kimi K3 SM107 target runs: one field per optimization of the reference.
 
 Each target (``kimi_k3_nvfp4__sm_107__<layout>/constants.py``) writes every field out; there are
-no defaults. The family code reads them from the instance it is given, never from the environment
-or a process-wide selection, so two targets can be imported in one process. Kernels and
-operations do not read this class: their callers pass the values they need as arguments.
+no defaults. The values are folded into the target's own code (``kimi_k3_nvfp4__sm_107__tp1/``,
+``kimi_k3_nvfp4__sm_107__dep16/``, and ``sm107_helix8_parts/`` for the two helix8 targets), which
+does not branch on them. The record stays as the target class's ``K3_CONSTANTS``: the targets'
+tests check it against the reference profile, and the helix8 model refuses a target whose record
+differs from the set its code is built for. Nothing reads it from the environment or a
+process-wide selection, and kernels and operations take their arguments from the caller.
 """
 
 from __future__ import annotations

@@ -385,7 +385,7 @@ def test_tail_output_buffer_is_the_generation_output():
     """The fused tail writes ``forward_absorption_generation``'s output in place: it is given that
     output viewed as ``[T, H / P * v_head_dim]`` (the same storage, so the copy into ``output`` is
     skipped), and nothing it could not write as is (no output, another dtype, size or layout)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.mla import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_helix8_parts.mla import (  # noqa: E501
         tail_output_buffer,
     )
 

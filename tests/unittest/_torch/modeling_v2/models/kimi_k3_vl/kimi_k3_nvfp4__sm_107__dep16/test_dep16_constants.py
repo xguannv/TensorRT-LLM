@@ -77,8 +77,13 @@ def test_target_class_declares_its_constants_and_no_model_defaults():
 
     module = importlib.import_module(f"{_FAMILY}.{_TARGET}.modeling")
     cls = getattr(module, _CLASS)
-    # The target owns its model: no class of the family's sm107_parts glue in its bases.
-    assert not any(".sm107_parts." in base.__module__ for base in cls.__mro__), cls.__mro__
+    # The target owns its model: no class of another SM107 target's glue in its bases.
+    others = (
+        ".sm107_helix8_parts.",
+        ".kimi_k3_nvfp4__sm_107__tp1.",
+        ".kimi_k3_nvfp4__sm_107__helix8_",
+    )
+    assert not any(o in base.__module__ for base in cls.__mro__ for o in others), cls.__mro__
     assert cls.K3_CONSTANTS is importlib.import_module(f"{_FAMILY}.{_TARGET}.constants").CONSTANTS
     # The model loader applies the model defaults of the checkpoint's built-in class before it
     # routes a Modeling V2 target, so a target's get_model_defaults would never run: the recipe

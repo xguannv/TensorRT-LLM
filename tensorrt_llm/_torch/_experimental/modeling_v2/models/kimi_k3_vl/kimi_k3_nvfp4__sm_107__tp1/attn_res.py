@@ -22,7 +22,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.at
 from tensorrt_llm._torch.cute_dsl_utils import sm_reserve
 from tensorrt_llm.logger import logger
 
-from ..sm107_parts.layers import RMSNormWeight, rms_norm
+from ..sm107_common.layers import RMSNormWeight, rms_norm
 
 # ---------------------------------------------------------------------------
 # attn_res: per-token snapshot mixing (HF `_apply_attn_res`).

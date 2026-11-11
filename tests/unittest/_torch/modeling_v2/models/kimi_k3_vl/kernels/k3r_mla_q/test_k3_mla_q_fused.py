@@ -555,7 +555,7 @@ def test_forward_gen_q_fused_matches_default_chain(n, monkeypatch):
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_q.q_norm_pdl import (  # noqa: E501
         rmsnorm_release_at_launch,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_helix8_parts import (
         mla as generation,
     )
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream

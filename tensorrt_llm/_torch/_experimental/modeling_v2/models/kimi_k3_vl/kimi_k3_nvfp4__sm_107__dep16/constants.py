@@ -6,7 +6,7 @@ Taken from 084745cde4's ``dep16`` profile (c383 977198, post arm). The c383 refe
 the speculative decode head (``spec_head_fusion`` off, unlike the helix8 targets).
 """
 
-from ..sm107_parts.constants import K3Sm107Constants
+from ..sm107_common.constants import K3Sm107Constants
 from .megamoe import K3MegaMoE
 
 CONSTANTS = K3Sm107Constants(

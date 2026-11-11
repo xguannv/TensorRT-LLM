@@ -72,8 +72,8 @@ from ..dspark.drafter import K3DSparkPath
 from ..dspark.shell import KimiK3SpecForCausalLM
 from ..kernels.k3r_spec.spec_decode_head import spec_decode_head
 from ..ops.attention import _fp4_mla_decode as fp4_mla_decode
-from ..sm107_parts.constants import K3Sm107Constants
-from ..sm107_parts.layers import (
+from ..sm107_common.constants import K3Sm107Constants
+from ..sm107_common.layers import (
     EmbeddingTable,
     GatedMlp,
     RMSNormWeight,

@@ -87,7 +87,7 @@ from ..kernels.k3r_kda._kda_kernels import (
     reset_recurrent_state_rows,
 )
 from ..ops.norm.rms_norm_gated_token_major import rms_norm_gated_token_major
-from ..sm107_parts.layers import (
+from ..sm107_common.layers import (
     Bf16Linear,
     Fp8BlockScaleLinear,
     RMSNormWeight,

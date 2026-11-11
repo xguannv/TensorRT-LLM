@@ -193,7 +193,7 @@ from ..ops.attention.k3_context_fmha import k3_context_fmha
 from ..ops.attention.k3_mla_state import K3MlaAttnState
 from ..ops.attention.static_quantize_e4m3 import static_quantize_e4m3
 from ..ops.gemm.k3_mxfp8_gemm_fp8_out import k3_mxfp8_gemm_fp8_out
-from ..sm107_parts.layers import fork_join, rms_norm
+from ..sm107_common.layers import fork_join, rms_norm
 
 try:
     from cuda.bindings import driver as cuda
@@ -218,7 +218,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..common.parallel import TensorParallelMode
-from ..sm107_parts.layers import (
+from ..sm107_common.layers import (
     Bf16Linear,
     Fp8BlockScaleLinear,
     LamportPending,

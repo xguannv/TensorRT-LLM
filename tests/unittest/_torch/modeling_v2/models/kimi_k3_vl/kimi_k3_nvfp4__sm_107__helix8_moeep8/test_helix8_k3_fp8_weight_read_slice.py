@@ -1,16 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Output slices of K3's FP8 weight-read projection (the Helix context heads of the shared MLA)."""
+"""Output slices of the helix8 glue's FP8 weight-read projection (the Helix context heads of its
+MLA)."""
 
 import pytest
 import torch
 from utils.util import getSMVersion
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.fp8_weight_read import (  # noqa: E501
-    _Fp8BlockScaleWeightReadLinear,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.layers import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_common.layers import (
     Fp8BlockScaleLinear,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_helix8_parts.fp8_weight_read import (  # noqa: E501
+    _Fp8BlockScaleWeightReadLinear,
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 

@@ -151,7 +151,7 @@ from ..ops.spec.k3_store_context_latents import k3_store_context_latents
 from ..ops.spec.k3_vocab_local_select import k3_vocab_local_select
 from ..ops.spec.k3_vocab_reduce_pairs import k3_vocab_reduce_pairs
 from ..ops.spec.k3_vocab_shard_embedding import k3_vocab_shard_embedding
-from ..sm107_parts.layers import TpAllReduce, mnnvl_serves, mnnvl_workspace_bytes
+from ..sm107_common.layers import TpAllReduce, mnnvl_serves, mnnvl_workspace_bytes
 from .drafter import K3DSparkPath, _MLABlockFixup
 from .primitives import HelixDraftShard, draft_embed_site, to_draft_fp8
 

@@ -6,19 +6,19 @@ modules (one GPU, one rank): bitwise."""
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_common import (
     layers as conv,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_common import (
     layers as embedding,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_common import (
     layers as mlp,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_common import (
     layers as norm,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_common import (
     layers as streams,
 )
 from tensorrt_llm._torch.model_config import ModelConfig

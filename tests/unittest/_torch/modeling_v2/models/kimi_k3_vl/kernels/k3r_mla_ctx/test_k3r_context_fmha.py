@@ -221,12 +221,12 @@ def test_k3_context_fmha_cu_kv_dtypes(q_len: int, is_causal: bool, heads: int) -
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_mla_ctx.k3_context_fmha_op import (  # noqa: E501
         CuteDSLK3ContextFmhaRunner,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_context_fmha import (  # noqa: E501
-        k3_context_fmha,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.mla import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__tp1.mla import (  # noqa: E501
         run_k3_split_k_context_partition,
         supports_k3_fp8_split_k_context,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_context_fmha import (  # noqa: E501
+        k3_context_fmha,
     )
 
     torch.manual_seed(q_len)

@@ -7,7 +7,7 @@ against its start_server_cmds.sh, see notes lines/split.md); the two helix8 targ
 the MoE split.
 """
 
-from ..sm107_parts.constants import K3Sm107Constants
+from ..sm107_common.constants import K3Sm107Constants
 
 CONSTANTS = K3Sm107Constants(
     spec_head_fusion=True,

@@ -28,7 +28,7 @@ from ..ops.gemm.k3_fp8w_lowm_mxfp8_push import k3_fp8w_lowm_mxfp8_push as k3_fp8
 from ..ops.gemm.k3_fp8w_mid_gemm import k3_fp8w_mid_gemm as k3_fp8w_mid_gemm_op
 from ..ops.gemm.k3_fp8w_mid_gemm_push import k3_fp8w_mid_gemm_push as k3_fp8w_mid_gemm_push_op
 from ..ops.gemm.k3_mxfp8_gemm import k3_mxfp8_gemm as k3_mxfp8_gemm_op
-from ..sm107_parts.layers import (
+from ..sm107_common.layers import (
     Bf16Linear,
     Fp8BlockScaleLinear,
     fp8_block_scale_gemm,

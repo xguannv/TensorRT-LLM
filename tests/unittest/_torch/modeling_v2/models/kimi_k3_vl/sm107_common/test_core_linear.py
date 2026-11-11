@@ -4,8 +4,8 @@
 
 * BF16: main's ``Linear`` (unquantized, F.linear) on the same weight.
 * FP8 block scales: main's ``Linear(FP8_BLOCK_SCALES)`` loaded from the checkpoint codes and grid,
-  swapped into K3's FP8 weight-read projection (``_Fp8BlockScaleWeightReadLinear``, as K3 swaps its
-  attention projections) and post-loaded; the primitive loads the same full tensors itself.
+  swapped into the tp1 target's FP8 weight-read projection (``_Fp8BlockScaleWeightReadLinear``,
+  without the K3 low-M GEMM) and post-loaded; the primitive loads the same full tensors itself.
 * Shards: main's ``Linear.load_shard`` for COLUMN / ROW over 1..8 ranks.
 """
 
@@ -13,7 +13,7 @@ import pytest
 import torch
 from utils.util import getSMVersion
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_common import (
     layers as linear,
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
@@ -134,7 +134,7 @@ def test_bf16_linear_matches_main(n, k):
 def _weight_read(codes, scale):
     """K3's decode chain: the checkpoint loaded into an unprepared ``Fp8BlockScaleLinear``, swapped to
     the weight-read projection, which prepares the codes and scales itself."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.fp8_weight_read import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__tp1.fp8_weight_read import (  # noqa: E501
         _Fp8BlockScaleWeightReadLinear,
     )
 

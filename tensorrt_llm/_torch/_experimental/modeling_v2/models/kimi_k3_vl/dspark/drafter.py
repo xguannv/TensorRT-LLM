@@ -81,7 +81,7 @@ from tensorrt_llm.mapping import CpType, Mapping
 
 from ..kernels.k3r_spec.spec_tail_kernels import DraftBlockPlacement
 from ..ops.spec.k3_scatter_rows_to_pool import k3_scatter_rows_to_pool
-from ..sm107_parts.layers import (
+from ..sm107_common.layers import (
     Bf16Linear,
     EmbeddingTable,
     GatedMlp,

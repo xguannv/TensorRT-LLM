@@ -1,13 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The helix8 glue's FP8 weight read (the K3 low-M GEMM folded in) against the family one swapped
-in with the helix8 constants: the same scales and, on every row count, the same bits.
+"""The helix8 glue's FP8 weight read (the K3 low-M GEMM folded in) against the kernel calls it
+stands for: the same operands and, on every row count, the same bits.
 
-The attention projections and the MoE MLPs of the helix8 targets all run through it, so the folded
-dispatch (no generic low-M GEMM, ``lowm_weight_scale`` wherever the Rubin MXFP8 path is) must pick
-the kernels the family module picks with ``fp8w_lowm_gemm`` (and, on ``routed_expert_down_proj``,
-``ld_fused``) set.
+The attention projections and the MoE MLPs of the helix8 targets all run through it. With the
+K3 low-M GEMM folded in (no generic low-M GEMM), a swapped and post-loaded projection must hold:
+
+* ``layers.prepare_fp8_block_weight`` of the checkpoint codes and grid (``weight``,
+  ``weight_scale``);
+* on SM107, ``lowm_weight_scale`` = ``k3_fp8w_lowm_gemm.pack_block_scale_from_mxfp8_layout`` of
+  that scale (None elsewhere, where the low-M GEMM reads ``weight_scale``);
+
+and its forward on BF16 rows must be ``ops.gemm.k3_fp8w_lowm_gemm`` on that low-M scale wherever
+``k3_fp8w_lowm_gemm.can_run`` accepts the rows, else ``layers.fp8_block_scale_gemm`` without a
+generic low-M GEMM. Until the glue was retired this compared against the family module with the
+helix8 constants (``fp8w_lowm_gemm`` set), which made exactly these calls.
 """
+
+import importlib
 
 import pytest
 import torch
@@ -38,15 +48,11 @@ SHAPES = [
 
 
 def _modules():
-    import importlib
-
-    layers = importlib.import_module(f"{_FAMILY}.sm107_parts.layers")
-    family = importlib.import_module(f"{_FAMILY}.sm107_parts.fp8_weight_read")
+    layers = importlib.import_module(f"{_FAMILY}.sm107_common.layers")
     helix8 = importlib.import_module(f"{_FAMILY}.sm107_helix8_parts.fp8_weight_read")
-    constants = importlib.import_module(
-        f"{_FAMILY}.kimi_k3_nvfp4__sm_107__helix8_moeep8.constants"
-    ).CONSTANTS
-    return layers, family, helix8, constants
+    lowm_kernel = importlib.import_module(f"{_FAMILY}.kernels.k3r_gemm.k3_fp8w_lowm_gemm")
+    lowm_op = importlib.import_module(f"{_FAMILY}.ops.gemm.k3_fp8w_lowm_gemm").k3_fp8w_lowm_gemm
+    return layers, helix8, lowm_kernel, lowm_op
 
 
 def _checkpoint_fp8(n, k, seed):
@@ -60,37 +66,46 @@ def _checkpoint_fp8(n, k, seed):
     return (weight / expanded).to(torch.float8_e4m3fn), scale
 
 
-@pytest.mark.parametrize("attr", ["o_proj", "routed_expert_down_proj"])
 @pytest.mark.parametrize("n,k", SHAPES)
 @torch.inference_mode()
-def test_folded_weight_read_matches_family_with_helix8_constants(n, k, attr):
-    layers, family, helix8, constants = _modules()
+def test_folded_weight_read_matches_its_kernel_calls(n, k):
+    layers, helix8, lowm_kernel, lowm_op = _modules()
     codes, scale = _checkpoint_fp8(n, k, seed=n * 7 + k)
-    built = {}
-    for name, module in (("family", family), ("helix8", helix8)):
-        parent = nn.Module()
-        source = layers.Fp8BlockScaleLinear(k, n, device="cuda")
-        source.load(codes.clone(), scale.clone())
-        setattr(parent, attr, source)
-        if name == "family":
-            module._swap_linear_to_fp8_weight_read(
-                parent, attr, (layers.Fp8BlockScaleLinear,), constants=constants
-            )
-        else:
-            module._swap_linear_to_fp8_weight_read(parent, attr, (layers.Fp8BlockScaleLinear,))
-        proj = getattr(parent, attr)
-        proj.post_load_weights()
-        built[name] = proj
-    ref, got = built["family"], built["helix8"]
-    assert ref.fp8w_lowm_gemm and ref._low_m_max == 0 and ref._low_m_weight_scale is None
-    assert torch.equal(got.weight.view(torch.uint8), ref.weight.view(torch.uint8))
-    assert torch.equal(got.weight_scale, ref.weight_scale)
-    assert (got.lowm_weight_scale is None) == (ref.lowm_weight_scale is None)
-    if ref.lowm_weight_scale is not None:
-        assert torch.equal(got.lowm_weight_scale, ref.lowm_weight_scale)
+
+    parent = nn.Module()
+    source = layers.Fp8BlockScaleLinear(k, n, device="cuda")
+    source.load(codes.clone(), scale.clone())
+    parent.o_proj = source
+    assert helix8._swap_linear_to_fp8_weight_read(parent, "o_proj", (layers.Fp8BlockScaleLinear,))
+    got = parent.o_proj
+    got.post_load_weights()
+    assert not hasattr(got, "_low_m_max") and not hasattr(got, "_low_m_weight_scale")
+
+    weight, weight_scale = layers.prepare_fp8_block_weight(codes.clone(), scale.clone())
+    rubin = helix8._rubin_mxfp8_is_available()
+    lowm_weight_scale = None
+    if rubin and n % lowm_kernel.N_ALIGN == 0 and k % 128 == 0:
+        lowm_weight_scale = lowm_kernel.pack_block_scale_from_mxfp8_layout(weight_scale, n, k)
+    assert torch.equal(got.weight.view(torch.uint8), weight.view(torch.uint8))
+    assert torch.equal(got.weight_scale, weight_scale)
+    assert (got.lowm_weight_scale is None) == (lowm_weight_scale is None)
+    if lowm_weight_scale is not None:
+        assert torch.equal(got.lowm_weight_scale, lowm_weight_scale)
+    lowm_scale = lowm_weight_scale if rubin else weight_scale
+
     gen = torch.Generator(device="cuda").manual_seed(n + k)
+    served_low_m = 0
     for m in ROWS:
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, generator=gen)
-        assert got._runs_low_m_kernel(m) == ref._runs_low_m_kernel(m), m
-        assert got.mid_operand_tactic(m) == ref.mid_operand_tactic(m), m
-        assert torch.equal(got(x), ref(x)), m
+        low_m = lowm_scale is not None and lowm_kernel.can_run(x, weight, lowm_scale)
+        if low_m:
+            served_low_m += 1
+            want = lowm_op(x, weight, lowm_scale)
+        else:
+            want = layers.fp8_block_scale_gemm(x, weight, weight_scale)
+        # The low-M kernel the glue reports for these rows is the one forward runs.
+        assert not got._runs_low_m_kernel(m) or low_m, m
+        assert torch.equal(got(x), want), m
+    # A full last row tile (N % 128 == 0): the low-M GEMM serves the small row counts.
+    if n % 128 == 0:
+        assert served_low_m > 0

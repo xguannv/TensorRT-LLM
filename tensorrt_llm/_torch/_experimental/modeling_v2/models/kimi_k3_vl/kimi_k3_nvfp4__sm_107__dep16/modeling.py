@@ -72,8 +72,14 @@ from ..common.weight_io import check_text_only
 from ..dspark.drafter import K3DSparkPath
 from ..dspark.shell import KimiK3SpecForCausalLM
 from ..ops.attention import _fp4_mla_decode as fp4_mla_decode
-from ..sm107_parts.constants import K3Sm107Constants
-from ..sm107_parts.layers import EmbeddingTable, GatedMlp, RMSNormWeight, rms_norm, subgroup_mapping
+from ..sm107_common.constants import K3Sm107Constants
+from ..sm107_common.layers import (
+    EmbeddingTable,
+    GatedMlp,
+    RMSNormWeight,
+    rms_norm,
+    subgroup_mapping,
+)
 from .attn_res import (
     _apply_attn_res,
     _apply_attn_res_add_and_rmsnorm,
