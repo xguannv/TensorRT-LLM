@@ -13,8 +13,7 @@ K3 low-M GEMM folded in (no generic low-M GEMM), a swapped and post-loaded proje
 
 and its forward on BF16 rows must be ``ops.gemm.k3_fp8w_lowm_gemm`` on that low-M scale wherever
 ``k3_fp8w_lowm_gemm.can_run`` accepts the rows, else ``layers.fp8_block_scale_gemm`` without a
-generic low-M GEMM. Until the glue was retired this compared against the family module with the
-helix8 constants (``fp8w_lowm_gemm`` set), which made exactly these calls.
+generic low-M GEMM.
 """
 
 import importlib
