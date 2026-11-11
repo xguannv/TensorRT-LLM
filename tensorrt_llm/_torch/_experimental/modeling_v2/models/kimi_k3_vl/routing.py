@@ -205,9 +205,9 @@ def route(
     """
     if compute_capability == _SM107:
         parallel = _check_sm107(model_config, llm_args)
-        from .kimi_k3_nvfp4__sm_107__default import features
+        from .sm107_parts import features
 
-        # The target's modules read the deployment's feature profile when imported.
+        # The family SM107 modules read the deployment's feature profile when imported.
         features.select(parallel)
         from .kimi_k3_nvfp4__sm_107__default.modeling import ModelingV2KimiK3Nvfp4Sm107Default
 
