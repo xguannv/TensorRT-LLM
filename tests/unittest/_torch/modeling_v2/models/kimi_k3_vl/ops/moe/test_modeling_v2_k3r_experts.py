@@ -128,8 +128,11 @@ class _Layer:
         torch.cuda.synchronize()
 
     def route(self, logits, offset, num_local):
-        del logits, offset, num_local
-        return kx.SortedRouting(self.ids, self.weights, None)
+        """The fixed top-k of the tokens whose index :func:`_token_logits` wrote in column 0 (the
+        module routes each chunk on its slice of the logits)."""
+        del offset, num_local
+        rows = logits[:, 0].long()
+        return kx.SortedRouting(self.ids[rows], self.weights[rows], None)
 
     def reference(self, module) -> torch.Tensor:
         """FP32 MoE on the module's own NVFP4 input, the FC1 output requantized to NVFP4."""
@@ -172,8 +175,15 @@ def _family(kernels: str = "CUTEDSL", max_chunk_tokens: int = 8192, **fc12) -> t
     ).to(DEV)
 
 
+def _token_logits(num_tokens: int) -> torch.Tensor:
+    """Router logits that carry each token's index in column 0, for :meth:`_Layer.route`."""
+    logits = torch.zeros(num_tokens, NUM_EXPERTS, device=DEV)
+    logits[:, 0] = torch.arange(num_tokens, device=DEV)
+    return logits
+
+
 def _forward(module, layer, **kwargs) -> torch.Tensor:
-    logits = torch.empty(layer.x.shape[0], NUM_EXPERTS, device=DEV)
+    logits = _token_logits(layer.x.shape[0])
     with torch.inference_mode():
         out = module(layer.x, logits, route=layer.route, **kwargs)
     torch.cuda.synchronize()
@@ -251,7 +261,7 @@ def test_fc12_prezeroed_output(num_tokens):
         fork = torch.cuda.Event()
         fork.record()
         kx.zero_on_side_stream(zeroed, fork)
-        logits = torch.empty(num_tokens, NUM_EXPERTS, device=DEV)
+        logits = _token_logits(num_tokens)
         out = module(layer.x, logits, route=layer.route, zeroed_output=zeroed)
     torch.cuda.synchronize()
     assert out.data_ptr() == zeroed.output.data_ptr()
