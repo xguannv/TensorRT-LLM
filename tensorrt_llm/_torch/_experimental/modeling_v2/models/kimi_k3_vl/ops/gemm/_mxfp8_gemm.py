@@ -9,7 +9,8 @@ the agentic recipes:
 
 * no 1-CTA b-reuse tile (``mma_tiler_m, mma_inst_m == 256, 128``);
 * prefetch only on the unswapped 2-CTA b-reuse tile (``512, 256``);
-* split-K (atomic BF16 accumulation, so not run-to-run deterministic) only up to M = 256.
+* no split-K (:data:`K3_SPLIT_K`): split-K partials add with BF16 atomics, so a split-K bucket
+  is not run-to-run deterministic.
 
 ``get_valid_tactics`` keeps exactly those tactics of main's list, in main's order; the tactic tuples
 and the launch are main's. Inputs: FP8 E4M3 ``[M, K]`` activation and ``[N, K]`` weight, their
@@ -31,8 +32,11 @@ from tensorrt_llm._utils import get_sm_version
 K3_MMA_M = ((128, 128), (256, 256), (512, 256))
 #: The tile whose unswapped tactics also tune with prefetch.
 K3_PREFETCH_MMA_M = (512, 256)
-#: The largest (bucket) M that tunes split-K > 1.
-K3_SPLIT_K_MAX_M = 256
+#: The split-K factors K3 tunes over: none but 1.
+K3_SPLIT_K = (1,)
+#: The ``unique_id`` suffix of a runner restricted to :data:`K3_SPLIT_K`, so an AutoTuner cache
+#: entry of main's unrestricted runner never hands it a split-K tactic (or the reverse).
+SPLIT_K_KEY = (("split_k", K3_SPLIT_K),)
 
 OP_NAME = "trtllm::k3_mxfp8_gemm_rubin"
 
@@ -81,9 +85,7 @@ def keeps_tactic(tactic, m: int) -> bool:
         return False
     if use_prefetch and (swap_ab or mma_m != K3_PREFETCH_MMA_M):
         return False
-    if variant == "base" and tactic[8] > 1 and m > K3_SPLIT_K_MAX_M:
-        return False
-    return True
+    return variant != "base" or tactic[8] in K3_SPLIT_K
 
 
 if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
@@ -92,6 +94,11 @@ if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
 
     class K3MXFP8RubinRunner(CuteDSLKimiK3MXFP8RubinLinear):
         """Main's K3 MXFP8 runner with K3's tactic set (see the module docstring)."""
+
+        split_k_candidates = K3_SPLIT_K
+
+        def unique_id(self):
+            return super().unique_id() + SPLIT_K_KEY
 
         def get_valid_tactics(
             self, inputs: List[torch.Tensor], profile: OptimizationProfile, **kwargs

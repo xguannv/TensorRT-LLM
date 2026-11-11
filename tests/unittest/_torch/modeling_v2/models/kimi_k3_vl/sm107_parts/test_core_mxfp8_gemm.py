@@ -8,6 +8,7 @@
 * With one tactic, its launch is bitwise main's runner with that tactic.
 * The op asks the autotuner under its own name with that runner, and untuned it is bitwise main's
   ``cute_dsl_mxfp8_gemm_rubin(fine_grained_m=True)``.
+* The runner does not share an AutoTuner cache entry with main's (split-K) runner.
 * ``k3_mxfp8_gemm.CELLS`` under ``validating`` against the entry's FP64 ``reference``.
 """
 
@@ -59,7 +60,11 @@ def _tactic_inputs(m, n, k):
     return [a, b, None, None, None]
 
 
-def _k3_rules_hold(tactic, m):
+def _split_k(tactic):
+    return tactic[8] if tactic[0] == "base" else 1
+
+
+def _k3_rules_hold(tactic):
     if tactic[0] == "base":
         _, tiler, inst, _cluster, swap_ab, use_prefetch, _sched, _raster, split_k = tactic
     else:
@@ -69,7 +74,7 @@ def _k3_rules_hold(tactic, m):
     return (
         mma_m != (256, 128)
         and (not use_prefetch or (not swap_ab and mma_m == (512, 256)))
-        and (split_k == 1 or m <= 256)
+        and split_k == 1
     )
 
 
@@ -84,7 +89,7 @@ def test_tactics_are_main_list_under_k3_rules():
             inputs = _tactic_inputs(m, n, k)
             main = main_runner.get_valid_tactics(inputs, None)
             got = k3_runner.get_valid_tactics(inputs, None)
-            want = [t for t in main if _k3_rules_hold(t, m)]
+            want = [t for t in main if _k3_rules_hold(t)]
             assert got == want, (n, k, m)
             assert got, (n, k, m)
             assert all(len(t) == 9 for t in got if t[0] == "base"), (n, k, m)
@@ -122,10 +127,9 @@ def test_each_tactic_matches_main_runner():
             tactics = mxfp8_gemm.K3MXFP8RubinRunner(output_dtype=torch.bfloat16).get_valid_tactics(
                 _tactic_inputs(bucket, n, k), None
             )
-            # Split-K accumulates with BF16 atomics: not run-to-run deterministic on either side.
-            serial = [t for t in tactics if t[0] != "base" or t[8] == 1]
-            step = max(1, len(serial) // RUN_TACTICS)
-            for tactic in [None, *serial[::step][:RUN_TACTICS]]:
+            assert all(_split_k(t) == 1 for t in tactics), (n, k, m)
+            step = max(1, len(tactics) // RUN_TACTICS)
+            for tactic in [None, *tactics[::step][:RUN_TACTICS]]:
                 got = mxfp8_gemm.run_with_tactic(act, weight, act_scale, weight_scale, tactic)
                 want = main_runner(inputs, tactic=-1 if tactic is None else tactic)
                 assert torch.equal(got, want), (n, k, m, tactic)
@@ -164,21 +168,23 @@ def test_op_tunes_k3_runner_and_matches_main_untuned(monkeypatch):
     ]
 
 
+def test_runner_does_not_share_main_cache_entries():
+    _, mxfp8_gemm, cdo = _mods()
+    got = mxfp8_gemm.K3MXFP8RubinRunner(output_dtype=torch.bfloat16).unique_id()
+    want = cdo.CuteDSLKimiK3MXFP8RubinLinear(output_dtype=torch.bfloat16).unique_id()
+    assert got == want + (("split_k", (1,)),)
+
+
 @pytest.mark.parametrize("cell", _entry().CELLS, ids=lambda c: c.why[:48])
 @torch.inference_mode()
 def test_k3_mxfp8_gemm_cells(cell):
     """Both operands are E4M3 with power-of-two scales, so every product is exact; the kernel
-    sums them in FP32 (split-K tactics, up to M = 256, add their BF16-rounded partials with BF16
-    atomics). Serial tactics: one BF16 rounding, at most 2 units of ``ULP`` of the row maximum.
-    Split-K: one rounding per partial plus one per atomic add; 8 units element-wise and 2 in RMS
-    allow a few of them (not yet measured on SM107)."""
+    sums them in FP32 (no split-K tactic) and rounds once to BF16: at most 2 units of ``ULP`` of
+    the row maximum element-wise, 1 in RMS."""
     k3_mxfp8_gemm = _entry()
     n, k, m = cell.spec["n"], cell.spec["k"], cell.spec["m"]
     act, weight, act_scale, weight_scale = _operands(m, n, k, seed=2)
     with validating(k3_mxfp8_gemm):
         got = k3_mxfp8_gemm(act, weight, act_scale, weight_scale)
     want = k3_mxfp8_gemm.reference(act, weight, act_scale, weight_scale)
-    if m <= 256:
-        assert_within_ulp(got, want, 8, 2)
-    else:
-        assert_within_ulp(got, want, 2, 1)
+    assert_within_ulp(got, want, 2, 1)

@@ -25,7 +25,7 @@ class K3Mxfp8Gemm(OpWrapper):
             spec={"n": 2112, "k": 7168, "m": 1000},
         ),
         Cell(
-            why="o_proj-like K = 1024 weight on 48 rows: a split-K bucket (BF16 atomics)",
+            why="o_proj-like K = 1024 weight on 48 rows (a split-K bucket in main's tactic set)",
             spec={"n": 7168, "k": 1024, "m": 48},
         ),
         Cell(
@@ -41,9 +41,9 @@ class K3Mxfp8Gemm(OpWrapper):
     note = """
     Main's CuTe DSL persistent block-scaled GEMM (``CuteDSLKimiK3MXFP8RubinLinear``) with K3's
     tactic subset (``ops.gemm._mxfp8_gemm.keeps_tactic``); the AutoTuner picks the tactic per bucket of
-    M under the cache key ``ops.gemm._mxfp8_gemm.OP_NAME``. Split-K tactics accumulate BF16 atomically
-    (up to M = 256), so those buckets are not run-to-run deterministic. The output is a new
-    contiguous BF16 ``[M, N]`` tensor; the current stream is used. Raises on any GPU but SM107.
+    M under the cache key ``ops.gemm._mxfp8_gemm.OP_NAME``. No split-K tactic is tuned, so every
+    bucket is run-to-run deterministic. The output is a new contiguous BF16 ``[M, N]`` tensor; the
+    current stream is used. Raises on any GPU but SM107.
     """
 
     def __call__(
