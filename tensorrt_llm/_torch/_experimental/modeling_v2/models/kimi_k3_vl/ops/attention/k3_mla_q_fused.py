@@ -81,24 +81,16 @@ class K3MlaQFused(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_107})
     # Spec: `requests` x `gen_len` tokens (T <= 16), `norm` (the q_a RMSNorm fused: FlashInfer's
-    # CuTe DSL norm is the one replaced), `early_trigger` (features.ull2_mla_decode_pdl). The
-    # rotary table is K3's identity table and the query global scale the FP4 MLA backend's.
+    # CuTe DSL norm is the one replaced). The rotary table is K3's identity table and the query
+    # global scale the FP4 MLA backend's.
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="helix16 ULL c1: one request of 4 tokens, fused norm, decode released at entry",
-            spec=dict(requests=1, gen_len=4, norm=True, early_trigger=True),
-        ),
-        Cell(
-            why="helix16 ULL c4: four requests of 4 tokens (T = 16, the 16-token compile)",
-            spec=dict(requests=4, gen_len=4, norm=True, early_trigger=True),
-        ),
-        Cell(
-            why="helix8: two requests of 8 tokens, decode released after the query stores",
-            spec=dict(requests=2, gen_len=8, norm=True, early_trigger=False),
+            why="helix8: two requests of 8 tokens (T = 16, the 16-token compile), fused norm",
+            spec=dict(requests=2, gen_len=8, norm=True),
         ),
         Cell(
             why="one token, q_a already normalized (FlashInfer's CUDA norm ran before)",
-            spec=dict(requests=1, gen_len=1, norm=False, early_trigger=False),
+            spec=dict(requests=1, gen_len=1, norm=False),
         ),
     )
 
@@ -116,8 +108,8 @@ class K3MlaQFused(OpWrapper):
     BF16 MMA with FP32 accumulation; RoPE and the FP4 quantization repeat the FP4 MLA cache
     update's operations (`div.full` / `rcp.approx`). Bitwise the production chain in the kernel's
     own tests. Writes only the rows of the given tokens. A process cache holds one compiled
-    kernel per (T padded to 8 / 16, use_pdl, norm, early_trigger). `early_trigger` releases the
-    dependent decode at entry (it reads only the query after its own wait).
+    kernel per (T padded to 8 / 16, use_pdl, norm). With `use_pdl` the dependent grid is released
+    after the query stores.
     """
 
     def __call__(
@@ -135,7 +127,6 @@ class K3MlaQFused(OpWrapper):
         rows_per_seq: int,
         use_pdl: bool,
         norm: tuple[torch.Tensor, float] | None,
-        early_trigger: bool,
     ) -> None:
         _kernels.k3_mla_q_fused(
             x,
@@ -151,7 +142,6 @@ class K3MlaQFused(OpWrapper):
             rows_per_seq=rows_per_seq,
             use_pdl=use_pdl,
             norm=norm,
-            early_trigger=early_trigger,
         )
 
     def reference(
@@ -169,7 +159,6 @@ class K3MlaQFused(OpWrapper):
         rows_per_seq: int,
         use_pdl: bool,
         norm: tuple[torch.Tensor, float] | None,
-        early_trigger: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The post-state ``(q_fp4, q_sf)`` (``q_sf`` as uint8): the rows of the given tokens
         rewritten, every other byte as passed. FP64 q_b product of the MXFP8 activation
@@ -177,8 +166,8 @@ class K3MlaQFused(OpWrapper):
         absorption rounded to BF16; GPT-J RoPE in FP32 with the pair-``p`` table values
         ``cos_sin[pos, 2p]``, ``[2p + 1]``, rounded to BF16; then FP4 groups of 16 of the values
         times ``q_global_scale`` (exact division where the kernel uses ``div.full`` /
-        ``rcp.approx``), the RoPE groups with their residual. ``use_pdl`` / ``early_trigger``
-        do not change the result; the cells use positions >= 0."""
+        ``rcp.approx``), the RoPE groups with their residual. ``use_pdl`` does not change the
+        result; the cells use positions >= 0."""
         from ...kernels.k3r_gemm.k3_fp8w_lowm_mxfp8 import mxfp8_quantize_reference
 
         heads, nope, rope, lora = (
@@ -253,7 +242,6 @@ class K3MlaQFused(OpWrapper):
         rows_per_seq: int,
         use_pdl: bool,
         norm: tuple[torch.Tensor, float] | None,
-        early_trigger: bool,
     ) -> None:
         # The launcher checks only positions, q_fp4 and cos_sin; the weights and x are read by
         # TMA / 16-byte loads in the geometry the kernel is built for, whatever their shapes.

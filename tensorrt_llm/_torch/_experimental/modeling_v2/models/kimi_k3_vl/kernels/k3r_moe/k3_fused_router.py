@@ -4,7 +4,7 @@
 
 The router shape (896 experts, hidden size 7168, top 16), the ``mma.sync`` router GEMM tiling
 (eight groups of 112 experts, 64-wide K chunks), inline PTX helpers and the ``noaux_tc_op``
-weight renormalization that :mod:`k3_route_tail`, :mod:`k3_router_exact` and :mod:`k3_ull_front`
+weight renormalization that :mod:`k3_route_tail` and :mod:`k3_router_exact`
 build on, and :func:`sort_buffer_sizes`. The renormalization uses FP32
 division, which equals the reference's FP64 expression whenever the scale is 1 and the sum is
 >= 2^-12, and the FP64 expression otherwise.

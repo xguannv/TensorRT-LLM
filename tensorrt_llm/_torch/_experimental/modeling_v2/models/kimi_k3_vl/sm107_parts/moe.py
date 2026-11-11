@@ -30,11 +30,10 @@
 
     routing, fp4_quantize, moe_sort (as above)
     cute_dsl_nvfp4_fc12_fused_rubin                  memset + FC1 + SiTU + FC2 + scatter-add
-    k3r_nvfp4_small_batch_moe                        instead, up to 32 rows (K3SmallBatchExperts)
 
-The routing is the caller's (:class:`SortedRouting`, or a ``route`` callable run per chunk): the
-experts only run the kernels. The output is this rank's partial sum (its experts, its slice of the
-intermediate dim); the caller reduces it.
+The routing is the caller's (a ``route`` callable run per chunk, returning a
+:class:`SortedRouting`): the experts only run the kernels. The output is this rank's partial sum
+(its experts, its slice of the intermediate dim); the caller reduces it.
 
 Kimi K3's NVFP4 routed-expert weights on one rank, in the layout the CuTe DSL MoE kernels read.
 
@@ -53,27 +52,17 @@ DWDP once the setup widened the range) as the kernels take them:
 The checkpoint streams in expert by expert (:meth:`load_expert`); :meth:`finalize` runs once the
 last of the rank's experts is in. The parameter names are the ones DWDP rebinds and exchanges.
 
-Kimi K3's routed experts at small token counts: the small-batch NVFP4 kernel
-(``ops.moe.k3_small_batch_moe``) on the expert weights of a ``CUTEDSL_FC12`` layer.
-
-:class:`K3SmallBatchExperts` serves the forwards of 1 to ``SMALL_BATCH_MOE_MAX_TOKENS`` tokens of a
-:class:`K3RoutedExperts` that runs the FC12 kernels; the experts route and quantize the input, this
-runs the kernel on their weights. Besides this rank's ``moe_sort`` tables the kernel takes a top-k
-a routing kernel published token by token (:class:`PublishedSortTables`) and pushes its output into a
-one-shot MNNVL all-reduce (:class:`LamportWorkspaceView`).
-
 What the Kimi K3 MoE routing hands to the routed experts of the same forward.
 
 ``SortTables``: the six ``moe_sort`` outputs of this rank's experts at one tile size.
 ``SortedRouting``: the routing a kernel computed (ids, weights) together with this rank's
-``SortTables``, or ``PublishedSortTables`` where the routing kernel published the routed ids token by
-token and the experts build the tables themselves.
+``SortTables`` where the routing kernel wrote them.
 """
 
 import os
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -90,14 +79,6 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..kernels.k3r_moe.k3_small_batch_moe_op import (
-    SMALL_BATCH_MOE_MAX_TOKENS,
-    new_small_batch_moe_counters,
-    small_batch_moe_route_word,
-    small_batch_moe_supports,
-    small_batch_moe_takes_published,
-)
-from ..ops.moe.k3_small_batch_moe import k3_small_batch_moe
 from .layers import load_weight_shard
 
 
@@ -113,20 +94,13 @@ class SortTables:
 
 
 @dataclass(frozen=True)
-class PublishedSortTables:
-    """In place of :class:`SortTables`: the routing kernel published the routed ids token by
-    token into the experts' published-routing word, and the experts build this rank's tables
-    themselves."""
-
-
-@dataclass(frozen=True)
 class SortedRouting:
     """The routing of one forward: the top-k ids and weights, with this rank's ``moe_sort`` tables
     where the routing kernel wrote them (``None``: the experts run ``moe_sort``)."""
 
     token_selected_experts: torch.Tensor  # int32 [num_tokens, top_k]
     token_final_scales: torch.Tensor  # fp32 [num_tokens, top_k]
-    sort_tables: Optional[Union[SortTables, PublishedSortTables]]
+    sort_tables: Optional[SortTables]
 
 
 #: Values per NVFP4 block scale.
@@ -394,133 +368,6 @@ class K3Nvfp4Experts(nn.Module):
             scale.copy_(swizzled.view(scale.dtype))
 
 
-if TYPE_CHECKING:
-    from .layers import LamportWorkspaceView
-
-
-class K3SmallBatchExperts:
-    """The small-batch path of one MoE layer's routed experts (``experts``)."""
-
-    def __init__(self, experts: "K3RoutedExperts") -> None:
-        self.experts = experts
-        weights = experts.backend
-        self.max_tokens = 0
-        if experts.kernels == "CUTEDSL_FC12" and small_batch_moe_supports(
-            weights.intermediate_size_per_partition, weights.hidden_size
-        ):
-            self.max_tokens = SMALL_BATCH_MOE_MAX_TOKENS
-        self._takes_published = bool(self.max_tokens) and small_batch_moe_takes_published(
-            weights.expert_size_per_partition
-        )
-        # Created after loading (or by the first launch, before any graph capture); every launch
-        # leaves it zero.
-        self.counters: Optional[torch.Tensor] = None
-
-    def post_load_weights(self) -> None:
-        if self.max_tokens and self.counters is None:
-            self.counters = new_small_batch_moe_counters(self.experts.backend.w3_w1_weight.device)
-
-    def applies(self, num_tokens: int) -> bool:
-        """Whether a forward of ``num_tokens`` tokens runs here."""
-        return 1 <= num_tokens <= self.max_tokens
-
-    def published_routing_word(self, num_tokens: int) -> Optional[torch.Tensor]:
-        """The kernel's routing word where it serves ``num_tokens`` tokens in the token-indexed
-        layout (MoE-TP slices): a routing kernel publishes the top-k there
-        (:class:`PublishedSortTables`) and the kernel builds its tables from it."""
-        if (
-            not self.applies(num_tokens)
-            or not self._takes_published
-            or self.experts.backend.tp_size <= 1
-            or self.counters is None
-        ):
-            return None
-        return small_batch_moe_route_word(self.counters)
-
-    def run(
-        self,
-        x: torch.Tensor,
-        x_sf: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        sort_tables: Optional[Union[SortTables, PublishedSortTables]],
-        push: Optional["LamportWorkspaceView"],
-    ) -> torch.Tensor:
-        """The kernel on the experts' weights; writes every element of the output (and pushes it
-        into ``push``). ``sort_tables``: this rank's tables at tile 128 (else ``moe_sort`` runs
-        here), or the published top-k."""
-        experts = self.experts
-        weights = experts.backend
-        assert token_final_scales.dtype == torch.float32, (
-            f"the small-batch kernel requires float32 routing scales, got {token_final_scales.dtype}"
-        )
-        published = isinstance(sort_tables, PublishedSortTables)
-        if published and weights.tp_size <= 1:
-            raise RuntimeError("published routing needs the token-indexed layout (MoE-TP)")
-        if published:
-            tile_idx_to_expert_idx = tile_idx_to_mn_limit = permuted_idx_to_expanded_idx = None
-            num_non_exiting_tiles = None
-            expanded_idx_to_permuted_idx = token_selected_experts.reshape(-1)
-        else:
-            if sort_tables is not None and sort_tables.tile_size == 128:
-                sort_outputs = sort_tables.outputs
-            else:
-                sort_outputs = torch.ops.trtllm.moe_sort(
-                    token_selected_experts=token_selected_experts,
-                    token_final_scales=token_final_scales,
-                    num_experts=weights.num_slots,
-                    top_k=token_selected_experts.size(1),
-                    local_expert_offset=weights.slot_start,
-                    local_num_experts=weights.expert_size_per_partition,
-                    tile_tokens_dim=128,
-                )
-            (
-                tile_idx_to_expert_idx,
-                tile_idx_to_mn_limit,
-                expanded_idx_to_permuted_idx,
-                permuted_idx_to_expanded_idx,
-                _total_num_padded_tokens,
-                num_non_exiting_tiles,
-            ) = sort_outputs
-        if self.counters is None:
-            self.counters = new_small_batch_moe_counters(x.device)
-        out = torch.empty(
-            (token_final_scales.size(0), weights.hidden_size), dtype=torch.bfloat16, device=x.device
-        )
-        k3_small_batch_moe(
-            input=x.view(torch.float4_e2m1fn_x2),
-            input_scale=x_sf.view(torch.uint8),
-            fc1_weight=weights.w3_w1_weight.view(torch.float4_e2m1fn_x2),
-            fc1_weight_scale=weights.w3_w1_weight_scale.view(torch.uint8),
-            fc1_alpha=weights.fc31_alpha,
-            fc2_weight=weights.w2_weight.view(torch.float4_e2m1fn_x2),
-            fc2_weight_scale=weights.w2_weight_scale.view(torch.uint8),
-            fc2_alpha=weights.fc2_alpha,
-            output=out,
-            tile_idx_to_group_idx=tile_idx_to_expert_idx,
-            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-            num_non_exiting_tiles=num_non_exiting_tiles,
-            global_sf=weights.fc2_input_scale,
-            token_final_scales=token_final_scales,
-            counters=self.counters,
-            top_k=token_selected_experts.size(1),
-            situ_beta=experts.situ_beta,
-            situ_linear_beta=experts.situ_linear_beta,
-            token_indexed=weights.tp_size > 1,
-            die_major=False,
-            published_routing=published,
-            expert_offset=weights.slot_start,
-            push_mc=push.mc_base if push is not None else 0,
-            push_flags=push.flags if push is not None else None,
-            push_rank=push.rank if push is not None else 0,
-            push_world=push.world if push is not None else 0,
-            sm_reserve=experts.sm_reserve,
-        )
-        return out
-
-
 #: The kernel sets :class:`K3RoutedExperts` runs, by ``moe_config.backend``.
 KERNEL_SETS = ("CUTEDSL", "CUTEDSL_FC12")
 
@@ -553,7 +400,9 @@ class K3RoutedExperts(nn.Module):
 
     ``mapping``: the routed experts' mapping (``moe_tp_size`` x ``moe_ep_size`` over the TP
     group). ``aux_stream``: the stream the CUTEDSL output memset and input quantization fork to.
-    ``max_chunk_tokens``: rows per launch chain (``moe_max_num_tokens``).
+    ``max_chunk_tokens``: rows per launch chain (``moe_max_num_tokens``). ``fc12_die_major``: the
+    target's die-major FC12 expert layout and schedule (``K3Sm107Constants.fc12_die_major``; not
+    run yet, see :meth:`_run`).
     """
 
     def __init__(
@@ -570,6 +419,7 @@ class K3RoutedExperts(nn.Module):
         situ_linear_beta: float,
         aux_stream: Optional[torch.cuda.Stream],
         max_chunk_tokens: int,
+        fc12_die_major: bool,
     ) -> None:
         super().__init__()
         if kernels not in KERNEL_SETS:
@@ -590,6 +440,7 @@ class K3RoutedExperts(nn.Module):
         self.situ_beta, self.situ_linear_beta = float(situ_beta), float(situ_linear_beta)
         self.moe_ep_size = mapping.moe_ep_size
         self.max_chunk_tokens = max(1, int(max_chunk_tokens))
+        self.fc12_die_major = bool(fc12_die_major)
         self.backend = K3Nvfp4Experts(
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -609,7 +460,6 @@ class K3RoutedExperts(nn.Module):
         self._main_event = torch.cuda.Event()
         self._memset_event = torch.cuda.Event()
         self._quant_event = torch.cuda.Event()
-        self.small_batch = K3SmallBatchExperts(self)
 
     def _decide_dwdp(self) -> None:
         """Under a DWDP manager, store only this rank's range of its expert partition and register
@@ -629,9 +479,6 @@ class K3RoutedExperts(nn.Module):
     def consumes_sort_tables(self) -> bool:
         """Whether the kernels can run on tables a routing kernel wrote (no slot remap)."""
         return self.backend.num_slots == self.backend.num_experts
-
-    def post_load_weights(self) -> None:
-        self.small_batch.post_load_weights()
 
     # ------------------------------------------------------------------
     # Input quantization.
@@ -678,73 +525,40 @@ class K3RoutedExperts(nn.Module):
         router_logits: torch.Tensor,
         *,
         route: Route,
-        routing: Optional[SortedRouting] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
-        output_push=None,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """This rank's routed output ``[M, hidden]`` (BF16) of ``x`` (``[M, hidden]`` BF16 or
-        NVFP4), routed by ``routing`` or else by ``route`` on ``router_logits``.
+        NVFP4), routed by ``route`` on ``router_logits``.
 
         ``input_ready_event``: ``x`` is written on another stream, joined before its first read.
-        ``output_push``: also push the rows into that one-shot all-reduce's slots (small-batch
-        kernel only).
         """
-        num_tokens = router_logits.shape[0]
-        if (
-            routing is not None
-            and routing.sort_tables is not None
-            and not self.consumes_sort_tables
-        ):
-            raise ValueError("sort tables of a routing need experts without a slot remap")
         if self.enable_dwdp:
             self.dwdp_manager.wait_and_bind(self.backend, self.layer_idx)
-        if self.small_batch.applies(num_tokens):
-            x_q, x_sf, routing = self._prologue(x, router_logits, route, routing, input_ready_event)
-            out = self.small_batch.run(
-                x_q,
-                x_sf,
-                routing.token_selected_experts,
-                routing.token_final_scales,
-                routing.sort_tables,
-                output_push,
-            )
-        else:
-            if output_push is not None:
-                raise RuntimeError(
-                    f"an output push needs the small-batch kernel, not {num_tokens} rows"
-                )
-            out = self._forward_chunked(
-                x, router_logits, route, routing, input_ready_event, all_rank_num_tokens
-            )
+        out = self._forward_chunked(x, router_logits, route, input_ready_event, all_rank_num_tokens)
         if self.enable_dwdp:
             self.dwdp_manager.finish_layer(self.layer_idx)
         return out
 
-    def _prologue(self, x, router_logits, route, routing, input_ready_event):
+    def _prologue(self, x, router_logits, route, input_ready_event):
         """Route and quantize: ``(x, x_sf, routing)``; a BF16 ``x`` is joined before the routing,
         an NVFP4 one after it."""
         if isinstance(x, torch.Tensor):
             _wait(input_ready_event)
             input_ready_event = None
-        if routing is None:
-            routing = route(
-                router_logits, self.backend.slot_start, self.backend.expert_size_per_partition
-            )
+        routing = route(
+            router_logits, self.backend.slot_start, self.backend.expert_size_per_partition
+        )
         _wait(input_ready_event)
         x_q, x_sf = self.quantize_input(x)
         return x_q, x_sf, routing
 
-    def _forward_chunked(
-        self, x, router_logits, route, routing, input_ready_event, all_rank_num_tokens
-    ):
+    def _forward_chunked(self, x, router_logits, route, input_ready_event, all_rank_num_tokens):
         num_tokens = router_logits.shape[0]
         rows = max(all_rank_num_tokens) if self.enable_dwdp and all_rank_num_tokens else num_tokens
         num_chunks = max(1, -(-rows // self.max_chunk_tokens))
         if num_chunks == 1:
-            return self._forward_chunk(x, router_logits, route, routing, input_ready_event)
-        if routing is not None:
-            raise RuntimeError("a caller routing covers one launch chain, not several")
+            return self._forward_chunk(x, router_logits, route, input_ready_event)
         _wait(input_ready_event)
         base, extra = divmod(num_tokens, num_chunks)
         sizes = [base + 1] * extra + [base] * (num_chunks - extra)
@@ -758,12 +572,12 @@ class K3RoutedExperts(nn.Module):
         else:
             x_chunks = x.split(sizes)
         outs = [
-            self._forward_chunk(xc, lc, route, None, None)
+            self._forward_chunk(xc, lc, route, None)
             for xc, lc in zip(x_chunks, router_logits.split(sizes))
         ]
         return torch.cat(outs)
 
-    def _forward_chunk(self, x, router_logits, route, routing, input_ready_event):
+    def _forward_chunk(self, x, router_logits, route, input_ready_event):
         x_ready = None
         if (
             self.kernels == "CUTEDSL"
@@ -773,17 +587,18 @@ class K3RoutedExperts(nn.Module):
             and (do_multi_stream() or torch.cuda.is_current_stream_capturing())
         ):
             x_q, x_sf, x_ready = self._quantize_on_aux(x, input_ready_event)
-            if routing is None:
-                routing = route(
-                    router_logits, self.backend.slot_start, self.backend.expert_size_per_partition
-                )
+            routing = route(
+                router_logits, self.backend.slot_start, self.backend.expert_size_per_partition
+            )
         else:
-            x_q, x_sf, routing = self._prologue(x, router_logits, route, routing, input_ready_event)
-        tables = routing.sort_tables
-        if isinstance(tables, PublishedSortTables):
-            raise RuntimeError("published routing needs the small-batch kernel")
+            x_q, x_sf, routing = self._prologue(x, router_logits, route, input_ready_event)
         return self._run_tuned(
-            x_q, x_sf, routing.token_selected_experts, routing.token_final_scales, tables, x_ready
+            x_q,
+            x_sf,
+            routing.token_selected_experts,
+            routing.token_final_scales,
+            routing.sort_tables,
+            x_ready,
         )
 
     def _run_tuned(self, x, x_sf, ids, scales, tables: Optional[SortTables], x_ready):
@@ -864,6 +679,9 @@ class K3RoutedExperts(nn.Module):
         fc2_scale = weights.w2_weight_scale.view(torch.uint8)
         if self.kernels == "CUTEDSL_FC12":
             self._join_x_ready()
+            # TODO(fam_moe): die-major FC12 layout/schedule (084745cde4 ran it via
+            # TRTLLM_K3_FC12_DIE_LAYOUT/SCHED in main's fused_fc12.py) -- pass
+            # die_major=self.fc12_die_major once the family FC12 module lands.
             torch.ops.trtllm.cute_dsl_nvfp4_fc12_fused_rubin(
                 input=x.view(torch.float4_e2m1fn_x2),
                 fc1_weight=fc1_weight,

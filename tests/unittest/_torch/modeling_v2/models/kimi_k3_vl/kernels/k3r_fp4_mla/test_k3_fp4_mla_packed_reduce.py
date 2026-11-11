@@ -604,6 +604,7 @@ def test_packed_split_reduce_matches_reference_and_replays(
             plan=plan,
             stats=stats,
             sm_count=212,
+            use_pdl=False,
         )
 
     def check() -> None:

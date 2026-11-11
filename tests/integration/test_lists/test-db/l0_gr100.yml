@@ -110,7 +110,6 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/spec/test_fused_select_accept_kda_replay.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/spec/test_k3_markov_entries.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/spec/test_k3_spec_tail_entries.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/spec/test_k3_splitk_dense.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/spec/test_k3_vocab_parallel_entries.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_fused_kda_conv_prefill.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_fused_kda_post_conv.py
@@ -129,10 +128,6 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/sm107_parts/test_k3_fp8_weight_read_slice.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/sm107_parts/test_k3_glue.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/sm107_parts/test_k3_mla_ctx_split_k.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/sm107_parts/test_k3_ull2_mla.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/sm107_parts/test_k3_ull3_mla.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/sm107_parts/test_k3_ull4_mla.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/sm107_parts/test_k3_ull_shared_fork.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/sm107_parts/test_k3_unified_draft_binding.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/sm107_parts/test_kda_prefill_op.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/sm107_parts/test_kimi_kda_fused_verify_parity.py

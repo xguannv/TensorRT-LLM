@@ -51,8 +51,8 @@ class FusedKdaPostConv(OpWrapper):
     )
     note = """
     Kimi K3's KDA prefill calls it after the causal convolution where
-    features.kda_fused_conv_prefill is off (every generation target), with head_dim 128 and the
-    default l2_norm_eps, on the convolution's contiguous output. features.kda_prepad_prefill
+    the target's kda_fused_conv_prefill is off (every generation target), with head_dim 128 and the
+    default l2_norm_eps, on the convolution's contiguous output. kda_prepad_prefill
     asks for padded_tokens and beta (a single sequence padded to the prefill chunk), but only the
     tp1 target sets it, and that target runs fused_kda_conv_prefill instead: the padded form is
     accepted and tested by its kernel test, not certified here.

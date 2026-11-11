@@ -48,12 +48,12 @@ class FusedKdaConvPrefill(OpWrapper):
         ),
     )
     note = """
-    Kimi K3's KDA prefill calls it where features.kda_fused_conv_prefill is on (the tp1 context
+    Kimi K3's KDA prefill calls it where the target's kda_fused_conv_prefill is on (the tp1 context
     target): qkv the [q | k | v] column view of the QKVG output (unit channel stride, row stride
     4 * H * D), the [W, 3 * H * D] weight copy transposed (unit channel stride), the bf16
     [slots, 3 * H * D, 3] conv pool, the metadata's int32 query_start_loc and cache_indices,
     96 heads of 128, width 4, normalize_qk; padded_tokens and beta (a [f_a | b] column view)
-    for a single sequence whose length is not a chunk multiple (features.kda_prepad_prefill).
+    for a single sequence whose length is not a chunk multiple (kda_prepad_prefill).
 
     Two launches: the token kernel, then the sequence-edge kernel, which rewrites the first
     W - 1 tokens of each sequence and updates its conv state after reading it. The conv

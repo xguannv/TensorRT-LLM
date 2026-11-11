@@ -63,7 +63,7 @@ def test_cells(cell) -> None:
 @pytest.mark.parametrize("tokens", [1, 63, 65, 193])
 @torch.no_grad()
 def test_chunk_padded_with_beta(tokens: int) -> None:
-    """features.kda_prepad_prefill's form: Q/K/V and beta (a column view of the [f_a | b]
+    """``kda_prepad_prefill``'s form: Q/K/V and beta (a column view of the [f_a | b]
     output) zero-padded to the 64-token chunk."""
     heads = 6
     packed = _packed(heads, tokens, tokens)

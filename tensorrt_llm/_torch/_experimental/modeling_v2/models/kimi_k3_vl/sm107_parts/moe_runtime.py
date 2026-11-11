@@ -3,24 +3,22 @@
 """Kimi K3 NVFP4 on Rubin (SM107): the MoE block.
 
 ``K3MoERuntime`` runs one layer's latent MoE: the router (``K3MoEGate``), the latent
-down projection, the routed experts (the CuTe DSL kernel chain of ``moe.py``,
-the MegaMoE module, or the small-batch kernels), the latent all-reduce,
-``routed_expert_norm`` / ``routed_expert_up_proj``, and the shared experts
-(``_K3SharedExpert``) on an auxiliary stream. Its decode tails leave the residual update to
-the next layer's attention-residual mix (``attn_res.py``).
+down projection, the routed experts (the CuTe DSL kernel chain of ``moe.py`` or the
+MegaMoE module), the latent all-reduce, ``routed_expert_norm`` / ``routed_expert_up_proj``,
+and the shared experts (``_K3SharedExpert``) on an auxiliary stream. Its decode tails leave the
+residual update to the next layer's attention-residual mix (``attn_res.py``).
 
 Also here: the routed-expert checkpoint specs (key families and the loader of each
-quantization), the workspaces the latent all-reduce and the column-parallel tail share
-across layers, and the MoE feature constants, read from ``features.active()`` at import.
+quantization) and the workspace the routed latent all-reduce keeps across layers. The MoE
+switches come from the target's ``K3Sm107Constants``, handed to ``K3MoERuntime``.
 """
 
 from __future__ import annotations
 
 import copy
-import functools
 import os
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 import torch
 from torch import nn
@@ -35,31 +33,19 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
-from ..ops.comm.k3_lamport_push import k3_lamport_push
 from ..ops.comm.k3_latent_ar_rmsnorm import k3_latent_ar_rmsnorm
 from ..ops.gemm.k3_fp8w_lowm_gemm_push import k3_fp8w_lowm_gemm_push as k3_fp8w_lowm_gemm_push_op
-from ..ops.gemm.k3_fp8w_lowm_mxfp8_push import k3_fp8w_lowm_mxfp8_push as k3_fp8w_lowm_mxfp8_push_op
 from ..ops.gemm.k3_fp8w_mid_gemm import k3_fp8w_mid_gemm as k3_fp8w_mid_gemm_op
 from ..ops.gemm.k3_latent_down_fp4 import k3_latent_down_fp4 as k3_latent_down_fp4_op
 from ..ops.moe.k3_moe_residual_add import k3_moe_residual_add as k3_moe_residual_add_op
-from ..ops.moe.k3_moe_tail1 import k3_moe_tail1 as k3_moe_tail1_op
 from ..ops.moe.k3_route_tail import k3_route_tail as k3_route_tail_op
 from ..ops.moe.k3_router_logits import k3_router_logits as k3_router_logits_op
-from ..ops.moe.k3_shared_persist import k3_shared_persist as k3_shared_persist_op
-from ..ops.moe.k3_ull_front import k3_ull_front as k3_ull_front_op
-from .attn_res import _K3_ULL_TAIL_SANDWICH, _DeferredMoEResidual, _DeferredRpTail
-from .features import active as _features
-from .fp8_weight_read import (
-    _K3_FP8W_LOWM_GEMM,
-    _K3_LD_FUSED,
-    _Fp8BlockScaleWeightReadLinear,
-    _k3_lowm_gemm_can_run,
-)
+from .attn_res import _DeferredMoEResidual, _DeferredRpTail
+from .constants import K3Sm107Constants
+from .fp8_weight_read import _Fp8BlockScaleWeightReadLinear, _k3_lowm_gemm_can_run
 from .layers import (
     Bf16Linear,
     GatedMlp,
-    LamportPending,
-    LamportWorkspaceView,
     RMSNormWeight,
     TpAllReduce,
     finish_lamport_push,
@@ -70,10 +56,8 @@ from .layers import (
 )
 from .layers import mnnvl_workspace_mpi_comm as _k3_mnnvl_mpi_comm
 from .moe import KERNEL_SETS as _K3_ROUTED_KERNEL_SETS
-from .moe import K3Nvfp4Experts, K3RoutedExperts, PublishedSortTables, SortedRouting, SortTables
+from .moe import K3Nvfp4Experts, K3RoutedExperts, SortedRouting, SortTables
 from .text_config import _is_kda_layer, _resolve_kimi_situ_betas
-
-_F = _features()
 
 # Decode-batch routing tail of the CuteDSL MoE (see k3_route_tail): replaces noaux_tc_op ->
 # moe_sort with one launch on a cluster of at most eight CTAs (same logits, same routing).
@@ -99,42 +83,37 @@ _K3_LD_FUSED_MAX_M = 4096
 # either order.
 _K3_ROUTER_FIRST_MAX_M = 64
 
-# c240: SM-count target of the shared expert's cuBLAS GEMMs (0: off). FC12's persistent grid needs
-# whole SMs, so shared-expert GEMMs still resident when routing finishes delay its launch; with
-# TRTLLM_K3_SHARED_SM=N they run on N SMs (torch SM carveout, captured into CUDA graphs) and the
-# routed experts' backend keeps N SMs free of its persistent grids
-# (``reserve_sms_for_concurrent_kernels``, K3MoERuntime).
-_K3_SHARED_SM = _F.shared_sm
-# Two-domain devices: die-major expert weights. Not available: the routed experts keep the loaded
-# layout (``_k3_routed_backend_opt_ins`` logs it once).
-_K3_FC12_DIE_MAJOR = _F.fc12_die_major
+# ``K3Sm107Constants.shared_sm`` (c240): SM-count target of the shared expert's cuBLAS GEMMs (0:
+# off). FC12's persistent grid needs whole SMs, so shared-expert GEMMs still resident when routing
+# finishes delay its launch; with N > 0 they run on N SMs (torch SM carveout, captured into CUDA
+# graphs) and the routed experts' backend keeps N SMs free of its persistent grids
+# (``reserved_sms``, ``_k3_routed_backend_opt_ins``).
 
 
 @contextmanager
-def _k3_shared_sm_scope():
-    """Run the enclosed cuBLAS GEMMs on ``TRTLLM_K3_SHARED_SM`` SMs (no-op when 0)."""
-    if _K3_SHARED_SM <= 0:
+def _k3_shared_sm_scope(shared_sm: int):
+    """Run the enclosed cuBLAS GEMMs on ``shared_sm`` SMs (no-op when 0)."""
+    if shared_sm <= 0:
         yield
         return
     num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     prev = torch._C._get_sm_carveout_experimental()
-    torch._C._set_sm_carveout_experimental(max(0, num_sms - _K3_SHARED_SM))
+    torch._C._set_sm_carveout_experimental(max(0, num_sms - shared_sm))
     try:
         yield
     finally:
         torch._C._set_sm_carveout_experimental(prev)
 
 
-# Small-batch MoE front end (b1-b4 decode), bit-identical to the path it replaces:
-#   TRTLLM_K3_ROUTER_EXACT=kda: in the MoE blocks of KDA layers, the router logits of M <= 16
-#     tokens come from k3_router_exact (bit-identical to dsv3_router_gemm_op; its weight is copied
-#     into shared memory before griddepcontrol.wait). The faster router also starts the route tail
-#     earlier, inside the burst of latent_down and the shared gate_up; after an MLA attention block
-#     the route tail then stretches by ~3 us (b2 gen-only, GB300) and the routing chain gets longer
-#     than with dsv3_router_gemm_op, while after a KDA attention block the front gets shorter.
-_K3_ROUTER_EXACT_KDA = _F.router_exact_kda
-# TRTLLM_K3_LATENT_AR_OWN_WS=1: for up to _K3_LATENT_AR_OWN_WS_MAX_M tokens, the routed latent
-# all-reduce + RMSNorm (the same MNNVL Lamport kernels) runs on a workspace of its own instead of the
+# ``K3Sm107Constants.router_exact_kda`` (bit-identical to the path it replaces): in the MoE blocks
+# of KDA layers, the router logits of M <= 16 tokens come from k3_router_exact (bit-identical to
+# dsv3_router_gemm_op; its weight is copied into shared memory before griddepcontrol.wait). The
+# faster router also starts the route tail earlier, inside the burst of latent_down and the shared
+# gate_up; after an MLA attention block the route tail then stretches by ~3 us (b2 gen-only,
+# GB300) and the routing chain gets longer than with dsv3_router_gemm_op, while after a KDA
+# attention block the front gets shorter.
+# ``K3Sm107Constants.latent_ar_own_ws``: for up to _K3_LATENT_AR_OWN_WS_MAX_M tokens, the routed
+# latent all-reduce + RMSNorm (the same MNNVL Lamport kernels) runs on a workspace of its own instead of the
 # one it shares with the shared expert's all-reduce. It then no longer has to follow the shared-expert
 # chain: the main stream issues it and latent_up right after the routed FC2 and joins the shared
 # stream after latent_up. Applies where latent_up does not add the shared output itself (no fused
@@ -153,7 +132,6 @@ _K3_ROUTER_EXACT_KDA = _F.router_exact_kda
 # normalized latent in that GEMM's scale layout and latent_up runs the mid-M GEMM on it
 # (k3_fp8w_lowm_gemm.run_mid_prequantized) instead of quantizing the BF16 rows in a kernel of its
 # own: bitwise the same projection, one kernel less after the all-reduce.
-_K3_LATENT_AR_OWN_WS = _F.latent_ar_own_ws
 _K3_LATENT_AR_OWN_WS_MAX_M = 128
 _K3_LATENT_AR_ONESHOT_MAX_BYTES = 6291456
 # The routed latent all-reduce's own MNNVL workspaces, by all-reduce mapping.
@@ -362,130 +340,16 @@ class K3MoEGate(nn.Module):
         return SortedRouting(outs[0], outs[1], SortTables(k3_route_tail.TILE, tuple(outs[2:8])))
 
 
-def _router_exact_for_layer(cfg, layer_idx: int) -> bool:
-    """Whether ``TRTLLM_K3_ROUTER_EXACT`` serves the router of this layer's MoE block."""
-    return _K3_ROUTER_EXACT_KDA and _is_kda_layer(cfg, layer_idx)
-
-
-# TRTLLM_K3_ULL2_COLL_CP_TAIL=1 (BF16 shared expert): the MoE tail of a
-# generation-only forward splits latent_up by output columns instead of by latent columns. After
-# the latent all-reduce + RMSNorm (k3_latent_ar_norm's row kernel with its MXFP8 output, as
-# TRTLLM_K3_ULL_TAIL_SANDWICH) every rank computes its whole 128-row blocks of latent_up's output
-# over the full latent (the MXFP8 low-M GEMM with the replicated projection's tactic) and multicasts
-# them into the all-gather rows of the next call on a Lamport workspace of the tail's own
-# (k3_lamport_ar "ag"); the shared expert's BF16 partial is pushed into the same call's slots on
-# the shared stream as soon as it is ready. The next layer's pre-attention mix finishes the call
-# (k3_attn_res ``finish_ag``): bf16(latent_up + bf16(all-reduced shared)), the replicated tail's
-# bf16(routed + shared), so the result is bitwise the replicated tail (latent_up on every rank +
-# the shared expert's MNNVL all-reduce) while each rank reads 1 / W of latent_up as the
-# row-parallel tail does. Compared with the row-parallel tail, the critical path after the latent
-# all-reduce carries 1 / W of the bytes (W x M x 7168 x 2 B of slots land on every rank, but the
-# shared expert's land while the experts still run) and no two-shot step above the one-shot size.
-# The latent all-reduce runs one-shot on a workspace of the tail's own, up to the C++ one-shot size
-# (the sizes where the C++ all-reduce is one-shot too, so the sums keep its order); larger sizes keep
-# the row-parallel tail. The mix polls the call before its griddepcontrol.wait (``early_poll``).
-# The tail's latent all-reduce row kernel reads its workspace's rotation state, counts itself and
-# re-arms the previous call's buffer before its griddepcontrol.wait (k3_latent_ar_norm
-# ``early_state``: the previous call on that workspace, the previous MoE layer's, completed long
-# before the routed experts launched). Same bits.
-# With the routed experts' output push, the tail of a generation-only forward of at most 8 rows is
-# one kernel (k3_moe_tail1). The routed experts (CUTEDSL_FC12's small-batch kernel) push this
-# rank's latent partial rows, combined across experts with BF16 vector reds (whose order, and so
-# the rows' bits, may change from run to run), into the slots of the latent
-# workspace (``output_push``); k3_moe_tail1 polls them, sums them in the latent all-reduce's order,
-# applies the RMSNorm after the products, multiplies by this rank's HIDDEN / W rows of latent_up and
-# multicasts them into the column-parallel tail call's all-gather rows, which the next
-# pre-attention mix finishes as before (``finish_ag``). It replaces the latent all-reduce row kernel
-# and the column-parallel GEMM. Not bitwise (BF16 activation instead of MXFP8, the RMS scale applied
-# to the FP32 products).
-# On the column-parallel tail path of at most 8 rows, the shared expert (gate/up, SiTU, down and
-# the push of its partial into the tail call's slots) is one persistent kernel on
-# _K3_ULL_SHARED_PERSIST_CTAS CTAs (k3_shared_persist) on the shared stream, beside the routed
-# experts, whose backend leaves it that many SMs (``reserve_sms_for_concurrent_kernels``).
-# The next pre-attention mix reads the slots as before. Not bitwise (BF16 GEMM products in another
-# summation order, tanh / sigmoid with ex2.approx). Needs the BF16 GatedMlp shard with SiTU on the
-# tail's TP group; the weights are copied once into the kernel's stream order (16.5 MB per MoE layer
-# and rank at TP16).
-_K3_ULL2_COLL_CP_TAIL = _F.ull2_coll_cp_tail
-_K3_ULL_SHARED_PERSIST_CTAS = 16
-
-# The shared expert's part of the forward was pushed by the persistent kernel (no partial).
-_SHARED_PUSHED = object()
-
-
-# The column-parallel tail's Lamport workspaces, by (use, all-reduce mapping), the same workspaces
-# as the routed experts' ``output_push`` takes them, and the multicast handles that own their memory.
-_K3_CP_TAIL_WORKSPACES: Dict[Tuple[str, Mapping], Any] = {}
-_K3_CP_TAIL_PUSH_VIEWS: Dict[Tuple[str, Mapping], LamportWorkspaceView] = {}
-_K3_CP_TAIL_HANDLES: Dict[Tuple[str, Mapping], Any] = {}
-
-
-def _k3_cp_tail_workspace(mapping: Mapping, hidden_size: int, max_tokens: int, use: str = "tail"):
-    """``k3_lamport_ar.LamportWorkspace`` of the column-parallel MoE tail
-    (``TRTLLM_K3_ULL2_COLL_CP_TAIL``) and the rotation state. ``use="tail"``: three Lamport buffers
-    of ``max_tokens x (W + 1)`` BF16 rows of ``hidden_size`` (the one-shot slots plus the
-    all-gather rows); ``"latent"``: ``max_tokens x W`` one-shot rows.
-    Collective over the all-reduce group: every rank builds it at the same point of model
-    construction. ``_K3_CP_TAIL_HANDLES[(use, mapping)]`` holds the multicast buffer."""
-    workspace = _K3_CP_TAIL_WORKSPACES.get((use, mapping))
-    if workspace is not None:
-        return workspace
-    from tensorrt_llm._torch.distributed.ops import get_or_scale_allreduce_mnnvl_workspace
-    from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
-
-    from ..kernels.k3r_comm.k3_lamport_ar import LamportWorkspace, required_bytes
-
-    comm = _k3_mnnvl_mpi_comm(get_or_scale_allreduce_mnnvl_workspace(mapping, torch.bfloat16))
-    need = required_bytes(max_tokens, hidden_size, mapping.tp_size, True, ag=use == "tail")
-    buffer_bytes = -(-need // (1 << 20)) << 20
-    use_fabric_handle = (
-        os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1" or mapping.is_multi_node()
-    )
-    handle = McastGPUBuffer(
-        3 * buffer_bytes,
-        mapping.tp_size,
-        mapping.tp_rank,
-        mapping.local_rank,
-        use_fabric_handle,
-        comm.py2f(),
-    )
-    buffer = handle.get_uc_buffer(mapping.tp_rank, (3 * buffer_bytes // 4,), torch.float32, 0)
-    buffer.fill_(-0.0)
-    torch.cuda.synchronize()
-    comm.Barrier()
-    flags = torch.tensor(
-        [0, 2, buffer_bytes, 0, 0, 0, 0, 0, 0], dtype=torch.uint32, device=buffer.device
-    )
-    peers = [
-        handle.get_uc_buffer(r, (1,), torch.uint8, 0).data_ptr() for r in range(mapping.tp_size)
-    ]
-    workspace = LamportWorkspace(
-        world=mapping.tp_size,
-        rank=mapping.tp_rank,
-        uc_local=buffer.data_ptr(),
-        mc_base=handle.get_mc_buffer((1,), torch.uint8, 0).data_ptr(),
-        peer_ptrs=torch.tensor(peers, dtype=torch.int64, device=buffer.device),
-        flags=flags,
-        bytes_per_buffer=buffer_bytes,
-    )
-    _K3_CP_TAIL_WORKSPACES[(use, mapping)] = workspace
-    _K3_CP_TAIL_PUSH_VIEWS[(use, mapping)] = LamportWorkspaceView(
-        world=workspace.world,
-        rank=workspace.rank,
-        buffer=buffer,
-        mc_base=workspace.mc_base,
-        peer_ptrs=workspace.peer_ptrs,
-        flags=flags,
-        bytes_per_buffer=buffer_bytes,
-    )
-    _K3_CP_TAIL_HANDLES[(use, mapping)] = handle
-    return workspace
+def _router_exact_for_layer(router_exact_kda: bool, cfg, layer_idx: int) -> bool:
+    """Whether ``k3_router_exact`` serves the router of this layer's MoE block
+    (``router_exact_kda``: in the KDA layers)."""
+    return router_exact_kda and _is_kda_layer(cfg, layer_idx)
 
 
 # Row-parallel MoE tail for generation-only batches of up to _K3_RP_TAIL_MAX_M tokens (the low-M
 # GEMM's range), where the routed latent is all-reduced by the model (MoE TP/EP over the all-reduce
 # group, TP-sharded shared expert) and the layer's residual update is fused
-# (TRTLLM_K3_FUSE_MOE_RESIDUAL). After the latent all-reduce + RMSNorm, every rank runs one low-M
+# (``fuse_moe_residual``). After the latent all-reduce + RMSNorm, every rank runs one low-M
 # FP8 GEMM over its whole 128-column blocks of the normalized latent with the matching latent_up
 # columns (FP8 codes and block scales read in place) and pushes its partial [M, hidden] plus its
 # shared-expert partial into the next all-reduce on the latent all-reduce's MNNVL workspace: the
@@ -496,55 +360,6 @@ def _k3_cp_tail_workspace(mapping: Mapping, hidden_size: int, max_tokens: int, u
 # (``_DeferredRpTail``). This replaces the shared expert's all-reduce and the replicated latent_up.
 # Not bitwise: the latent_up sum is split over the ranks.
 _K3_RP_TAIL_MAX_M = 32
-# TRTLLM_K3_ULL_FRONT=1: MoE forwards of 1 .. _K3_ULL_FRONT_MAX_M (<= 32) rows run the MoE
-# front of cute_dsl_kernels/blackwell/k3_ull_front.py on the routed all-reduce's TP group, two kernels
-# on the main stream: each rank computes the router logits of every expert (k3_router_exact's
-# arithmetic) and the latent_down columns of its 128-column tiles (the low-M GEMM of
-# k3_latent_down_fp4) into an MNNVL workspace (the latent is multicast to every rank); a routing-tail
-# cluster polls the logits and writes the top-16 and this rank's moe_sort tables, and gather CTAs
-# write the NVFP4 latent. This replaces the router GEMM, the routing tail, the replicated latent_down
-# + quantization and the latent stream's fork / join.
-# Routing is bitwise (per 16-row tile of the router); the latent is bitwise up to 16 rows (above,
-# k3_latent_down_fp4 runs the mid-M kernel, split 4, and the front the low-M kernel, split 4).
-# The routing reaches the routed experts as ``routing``: where they offer a
-# routing word for the call (``published_routing_word``: the small-batch kernel on MoE-TP slices),
-# the route kernel publishes each token's top-k into it instead of writing the moe_sort tables and
-# the experts build their tables from it while the route kernel still runs
-# (``PublishedSortTables``; same tables, same bits); otherwise the front's tile-128 moe_sort tables
-# (``SortTables``) replace the experts' own moe_sort.
-# The A_mid that finishes the pushed o_proj all-reduce releases the front's head at kernel entry
-# (k3_attn_res ``entry_trigger``) where the head follows it, so the head's CTAs become resident
-# while A_mid polls the o_proj all-reduce and stream the router and latent_down weights into
-# shared memory before their griddepcontrol.wait; after the wait only the activation loads, the
-# MMAs and the pushes remain. Before its wait the head reads only weights and writes nothing, and
-# it releases the route kernel only after its wait. The early-polling A_mid otherwise releases it
-# after its stores. Same bits.
-# Forwards of up to _K3_ULL_FRONT_FORK_AT_HEAD_MAX_M rows fork the shared expert after the head
-# (between the head and the route kernel): under CUDA graph capture the shared GEMMs become
-# programmatic dependents of the kernel the fork follows, so a fork before the head lets the
-# entry-releasing A_mid release them with the head, and their CTAs take the SMs the head's CTAs
-# need while A_mid polls (helix16 n1 / n2: -3.4 / -2.6% per step forking at the head vs -0.3 /
-# -0.8% before it; at 24 / 32 rows forking before the head stays ahead, -1.5 / -1.3% vs -1.0 /
-# +0.1%, where the larger gate_up competes with the routed experts instead).
-_K3_ULL_FRONT = _F.ull_front
-_K3_ULL_FRONT_MAX_M = 32
-_K3_ULL_FRONT_FORK_AT_HEAD_MAX_M = 16
-
-
-def _ull_shared_fork(lead: bool, rows: int) -> Optional[str]:
-    """Where the ULL front forks the shared expert's GEMMs on ``rows`` rows (``None``: no fork, ``lead`` is
-    ``_shared_gemms_can_lead()``).
-
-    * ``"head"`` (up to ``_K3_ULL_FRONT_FORK_AT_HEAD_MAX_M`` rows): the event is recorded after the head, so
-      the shared GEMMs depend on the head.
-    * ``"after_head"`` (more rows): the event is recorded before the head, so the shared GEMMs depend on what
-      precedes the head (the entry-releasing A_mid).
-
-    The shared GEMMs themselves are issued after the front (``K3MoERuntime._ull_fork_shared``).
-    """
-    if not lead:
-        return None
-    return "head" if rows <= _K3_ULL_FRONT_FORK_AT_HEAD_MAX_M else "after_head"
 
 
 # ---------------------------------------------------------------------------
@@ -601,15 +416,15 @@ def _load_nvfp4_expert(
         )
 
 
-def _k3_routed_backend_opt_ins(routed_experts, column_parallel_tail: bool) -> None:
+def _k3_routed_backend_opt_ins(routed_experts, *, shared_sm: int, fc12_die_major: bool) -> None:
     """The routed experts' opt-ins of a MoE layer, made once at construction.
 
     SMs the FC12 kernels' persistent grids leave to the kernels the shared stream runs beside them
-    (the shared expert's GEMMs confined to ``_K3_SHARED_SM`` SMs; with the column-parallel tail,
-    the persistent shared expert's ``_K3_ULL_SHARED_PERSIST_CTAS`` CTAs). The CUTEDSL kernels take
-    no reserve.
+    (the shared expert's GEMMs confined to ``shared_sm`` SMs). The CUTEDSL kernels take no
+    reserve. ``fc12_die_major``: the target asks for die-major expert weights, which the routed
+    experts do not have yet (logged once; they keep the loaded layout).
     """
-    if _K3_FC12_DIE_MAJOR:
+    if fc12_die_major:
         logger.info_once(
             "TRTLLM_K3_FC12_DIE_LAYOUT: die-major expert weights are not available; the routed "
             "experts keep the loaded layout",
@@ -617,11 +432,8 @@ def _k3_routed_backend_opt_ins(routed_experts, column_parallel_tail: bool) -> No
         )
     if getattr(routed_experts, "kernels", None) != "CUTEDSL_FC12":
         return
-    reserve = _K3_SHARED_SM
-    if column_parallel_tail:
-        reserve = max(reserve, _K3_ULL_SHARED_PERSIST_CTAS)
-    if reserve > 0:
-        routed_experts.sm_reserve = reserve
+    if shared_sm > 0:
+        routed_experts.sm_reserve = shared_sm
 
 
 class _K3ExpertCkptSpec(NamedTuple):
@@ -662,17 +474,6 @@ class _RpTailOperands(NamedTuple):
     scale: torch.Tensor
 
 
-class _CpTailOperands(NamedTuple):
-    """One rank's operands of the column-parallel MoE tail (``TRTLLM_K3_ULL2_COLL_CP_TAIL``): the
-    ``n`` output rows of latent_up from row ``c0`` (whole 128-row blocks; their FP8 codes read in
-    place) and the DeepGEMM-packed UE8M0 scale of that ``[n, latent]`` slice."""
-
-    c0: int
-    n: int
-    weight: torch.Tensor
-    scale: torch.Tensor
-
-
 def _rp_tail_latent_slice(latent_size: int, world: int, rank: int) -> Tuple[int, int]:
     """``(first column, columns)`` of ``rank``'s 128-column blocks of the latent: whole blocks,
     as even as possible (28 blocks over 8 ranks: 4 on ranks 0-3, 3 on ranks 4-7)."""
@@ -696,28 +497,6 @@ def _k3_expert_ckpt_spec(quant_config: QuantConfig) -> _K3ExpertCkptSpec:
             f"Kimi K3 NVFP4 routed experts take 16-element scale blocks, got group_size={group_size}"
         )
     return spec
-
-
-class _NoSmallBatch:
-    """The small-batch path of routed experts that have none."""
-
-    max_tokens = 0
-    counters = None
-
-    @staticmethod
-    def applies(num_tokens: int) -> bool:
-        return False
-
-    @staticmethod
-    def published_routing_word(num_tokens: int) -> None:
-        return None
-
-    @staticmethod
-    def post_load_weights() -> None:
-        pass
-
-
-_NO_SMALL_BATCH = _NoSmallBatch()
 
 
 class _K3SharedExpert(GatedMlp):
@@ -788,33 +567,15 @@ class K3MoERuntime(nn.Module):
     of ``moe`` (MEGAMOE_CUTEDSL: the MegaMoE module), the shared expert runs beside
     them."""
 
-    # TRTLLM_K3_LATENT_AR_OWN_WS: the routed latent all-reduce's own MNNVL workspace (``None``: it
+    # ``latent_ar_own_ws``: the routed latent all-reduce's own MNNVL workspace (``None``: it
     # shares the one of the shared expert's all-reduce).
     _latent_ar_ws: Optional[Dict[str, Any]] = None
-    # TRTLLM_K3_ULL2_COLL_CP_TAIL: the column-parallel tail's workspace and this rank's operands.
-    _cp_ws: Optional[Any] = None
-    _cp_latent_ws: Optional[Any] = None
-    # The latent workspace as the routed experts' ``output_push`` (k3_moe_tail1).
-    _cp_latent_push: Optional[LamportWorkspaceView] = None
-    _cp_tail: Optional[_CpTailOperands] = None
-    # k3_moe_tail1 (column-parallel tail): latent_up's UE8M0 block exponents
-    # [HIDDEN / 128, LATENT / 128] (None: not built).
-    _tail1_wexp: Optional[torch.Tensor] = None
-    # k3_shared_persist (column-parallel tail): the shared expert's weights in the kernel's stream
-    # order, its exchange workspace and SiTU's (beta, linear beta) (None: not built).
-    _persist_frags: Optional[torch.Tensor] = None
-    _persist_ws: Optional[Any] = None
-    _persist_act: Optional[Tuple[float, Optional[float]]] = None
-    # TRTLLM_K3_ROUTER_EXACT: whether this layer's router logits come from k3_router_exact (set
-    # per layer in ``__init__``; off unless the switch selects the layer).
+    # ``router_exact_kda``: whether this layer's router logits come from k3_router_exact (set
+    # per layer in ``__init__``; off unless the constant selects the layer).
     _router_exact = False
     # The row-parallel tail: this rank's tail GEMM operands, built after loading (``None``: not
     # applicable to this layer).
     _rp_tail: Optional[_RpTailOperands] = None
-    # TRTLLM_K3_ULL_FRONT: the front's MNNVL workspace of the routed all-reduce group (built at
-    # construction) and this layer's front operands on this rank (built after loading).
-    _ull_ws = None
-    _ull_plan = None
 
     def __init__(
         self,
@@ -822,6 +583,8 @@ class K3MoERuntime(nn.Module):
         cfg,
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+        *,
+        constants: K3Sm107Constants,
     ):
         """Build the routed experts and the shared expert for one MoE layer.
 
@@ -832,10 +595,14 @@ class K3MoERuntime(nn.Module):
         ``aux_stream_dict`` is shared across every layer of the model, so the
         streams reached through it are borrowed and must not be synchronized
         or reassigned here.
+
+        ``constants``: the target's switches (``shared_sm``, ``router_exact_kda``,
+        ``latent_ar_own_ws``, ``fc12_die_major``, ``fp8w_lowm_gemm``, ``ld_fused``).
         """
         super().__init__()
+        self._constants = constants
         self.layer_idx = layer_idx
-        self._router_exact = _router_exact_for_layer(cfg, layer_idx)
+        self._router_exact = _router_exact_for_layer(constants.router_exact_kda, cfg, layer_idx)
         self.hidden_size = cfg.hidden_size
         self.num_experts = cfg.num_experts
         self.top_k = cfg.num_experts_per_token
@@ -909,6 +676,7 @@ class K3MoERuntime(nn.Module):
                 situ_linear_beta=situ_linear_beta,
                 aux_stream=aux_stream_dict.get(AuxStreamType.MoeOutputMemset),
                 max_chunk_tokens=routed_moe_model_config.moe_max_num_tokens,
+                fc12_die_major=constants.fc12_die_major,
             )
             # The routed latent partial sums, reduced over the TP group (Kimi orders this
             # collective after the shared expert's).
@@ -935,7 +703,6 @@ class K3MoERuntime(nn.Module):
             )
             returns_global_routed_output = self.routed_experts.returns_global_routed_output
             self._routed_fused_comm = True
-        self.small_experts = getattr(self.routed_experts, "small_batch", None) or _NO_SMALL_BATCH
         local_expert_ids = list(self.routed_experts.backend.initial_local_expert_ids)
         if local_expert_ids != list(
             range(local_expert_ids[0], local_expert_ids[0] + len(local_expert_ids))
@@ -986,11 +753,12 @@ class K3MoERuntime(nn.Module):
             reduce_output=use_shared_tp,
             allreduce_strategy=model_config.allreduce_strategy,
         )
-        if _K3_SHARED_SM > 0:
+        shared_sm = constants.shared_sm
+        if shared_sm > 0:
             shared_forward = self.shared_experts.forward
 
             def _shared_forward_confined(*args, **kwargs):
-                with _k3_shared_sm_scope():
+                with _k3_shared_sm_scope(shared_sm):
                     return shared_forward(*args, **kwargs)
 
             self.shared_experts.forward = _shared_forward_confined
@@ -1012,8 +780,6 @@ class K3MoERuntime(nn.Module):
         has_latent_stream = self.latent_down_stream is not None
         self.moe_latent_fork_event = torch.cuda.Event() if has_latent_stream else None
         self.moe_latent_ready_event = torch.cuda.Event() if has_latent_stream else None
-        # The shared expert's GEMMs issued ahead of the routed experts are done.
-        self.moe_shared_gemm_event = torch.cuda.Event() if has_latent_stream else None
         self.routed_expert_down_proj = nn.Linear(
             cfg.hidden_size, self.moe_hidden_size, bias=False, dtype=dtype
         )
@@ -1022,35 +788,15 @@ class K3MoERuntime(nn.Module):
         )
         # FlashInfer RMSNorm on the reduced latent (or folded into the routed all-reduce).
         self.routed_expert_norm = RMSNormWeight(self.moe_hidden_size, cfg.rms_norm_eps, dtype=dtype)
-        if _K3_LATENT_AR_OWN_WS and self._reduce_routed_output:
+        if constants.latent_ar_own_ws and self._reduce_routed_output:
             mnnvl = getattr(self.routed_experts.all_reduce, "mnnvl_allreduce", None)
             if mnnvl is not None and mnnvl.mapping.tp_size > 1:
                 self._latent_ar_ws = _k3_latent_ar_workspace(
                     mnnvl.mapping, mnnvl.dtype, self.moe_hidden_size, _K3_LATENT_AR_OWN_WS_MAX_M
                 )
-        if _K3_ULL_FRONT and self._reduce_routed_output:
-            from ..kernels.k3r_moe import k3_ull_front
-
-            mnnvl = getattr(self.routed_experts.all_reduce, "mnnvl_allreduce", None)
-            if mnnvl is not None and k3_ull_front.supports_world(mnnvl.mapping.tp_size):
-                # Collective over the all-reduce group: every rank builds it here.
-                self._ull_ws = k3_ull_front.ull_front_workspace(mnnvl.mapping)
-        if _K3_ULL2_COLL_CP_TAIL and self._reduce_routed_output:
-            # TRTLLM_K3_ULL2_COLL_CP_TAIL: the column-parallel tail's workspaces (collective).
-            mnnvl = getattr(self.routed_experts.all_reduce, "mnnvl_allreduce", None)
-            if mnnvl is not None and mnnvl.mapping.tp_size > 1:
-                world = mnnvl.mapping.tp_size
-                row_bytes = self.moe_hidden_size * world * 2
-                rows = min(_K3_RP_TAIL_MAX_M, self._cp_latent_oneshot_bytes() // row_bytes)
-                if rows >= 1:
-                    self._cp_ws = _k3_cp_tail_workspace(
-                        mnnvl.mapping, self.hidden_size, _K3_RP_TAIL_MAX_M
-                    )
-                    self._cp_latent_ws = _k3_cp_tail_workspace(
-                        mnnvl.mapping, self.moe_hidden_size, rows, use="latent"
-                    )
-                    self._cp_latent_push = _K3_CP_TAIL_PUSH_VIEWS[("latent", mnnvl.mapping)]
-        _k3_routed_backend_opt_ins(self.routed_experts, self._cp_ws is not None)
+        _k3_routed_backend_opt_ins(
+            self.routed_experts, shared_sm=shared_sm, fc12_die_major=constants.fc12_die_major
+        )
 
     def _lu_mid_prequant_plan(self, latent: torch.Tensor):
         """``(tactic, sf_blocks)`` of the mid-M path that
@@ -1059,7 +805,7 @@ class K3MoERuntime(nn.Module):
         or ``None`` where it runs another GEMM."""
         up = self.routed_expert_up_proj
         if (
-            not _K3_FP8W_LOWM_GEMM
+            not self._constants.fp8w_lowm_gemm
             or not isinstance(up, _Fp8BlockScaleWeightReadLinear)
             or up.lowm_weight_scale is None
             or up.next_ar_push is not None
@@ -1086,7 +832,7 @@ class K3MoERuntime(nn.Module):
         return out.reshape(routed_latent.shape[:-1] + (up.out_features,))
 
     def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """FP32 router logits; ``TRTLLM_K3_ROUTER_EXACT`` serves ``M <= 16`` BF16 tokens with
+        """FP32 router logits; ``router_exact_kda`` serves ``M <= 16`` BF16 tokens with
         ``k3_router_exact`` (bit-identical to the ``dsv3_router_gemm_op`` it replaces) in the
         layers it selects."""
         if self._router_exact:
@@ -1097,17 +843,6 @@ class K3MoERuntime(nn.Module):
                 return k3_router_logits_op(x, self.gate.weight)
         return self.gate.compute_logits(hidden_states)
 
-    def _shared_gemms_can_lead(self) -> bool:
-        """Whether this forward can issue the shared expert's GEMMs ahead of the routed experts
-        (``_ull_fork_shared``) and its all-reduce separately."""
-        return (
-            self.shared_expert_stream is not None
-            and self.moe_shared_gemm_event is not None
-            and not self._defer_shared_allreduce
-            and not getattr(self.shared_experts.down_proj, "use_fused_gemm_allreduce", False)
-            and do_multi_stream()
-        )
-
     def _shared_needs_all_reduce(self) -> bool:
         """Whether the shared expert's output is a row-parallel partial to all-reduce."""
         return bool(getattr(self.shared_experts.down_proj, "reduce_output", False))
@@ -1117,14 +852,10 @@ class K3MoERuntime(nn.Module):
         return self.shared_experts.down_proj.all_reduce
 
     def post_load_weights(self) -> None:
-        self.small_experts.post_load_weights()
         self.prepare_rp_tail()
-        self.prepare_ull_front()
 
     def cache_derived_state(self) -> None:
-        self.small_experts.post_load_weights()
         self.prepare_rp_tail()
-        self.prepare_ull_front()
 
     def prepare_expert_load(self) -> None:
         """Before this layer's first routed expert streams in."""
@@ -1141,187 +872,6 @@ class K3MoERuntime(nn.Module):
             backend.finalize()
         else:
             backend.process_weights_after_loading()
-
-    def _ull_front_unsupported(self) -> Optional[str]:
-        """Why this layer cannot run the sharded MoE front (``TRTLLM_K3_ULL_FRONT``), or
-        ``None``."""
-        if self._ull_ws is None:
-            return "no MNNVL routed all-reduce over a supported TP group"
-        moe = self.routed_experts
-        if not isinstance(moe, K3RoutedExperts) or self._attention_dp:
-            return "the routed experts are not the CuTe DSL kernels of a TP group"
-        if moe.backend.num_slots != self.gate.num_experts:
-            return "the routed experts have no static contiguous expert slice"
-        down = self.routed_expert_down_proj
-        if (
-            not isinstance(down, _Fp8BlockScaleWeightReadLinear)
-            or down._fused_projection is not None
-        ):
-            return "latent_down is not an FP8 weight-read projection"
-        if self.gate.weight.dtype != torch.bfloat16:
-            return "the router weight is not BF16"
-        return None
-
-    def prepare_ull_front(self) -> bool:
-        """``TRTLLM_K3_ULL_FRONT``: build this layer's front operands on this rank (views of the
-        router and latent_down weights, the packed scale of the rank's latent_down tiles). Rebuilt
-        on every call (post-load), before CUDA graph capture."""
-        self._ull_plan = None
-        if not _K3_ULL_FRONT:
-            return False
-        reason = self._ull_front_unsupported()
-        if reason is not None:
-            logger.info_once(
-                f"TRTLLM_K3_ULL_FRONT: MoE layers keep the replicated front: {reason}",
-                key=f"k3_ull_front_off_{reason}",
-            )
-            return False
-        from ..kernels.k3r_moe import k3_ull_front
-
-        down = self.routed_expert_down_proj
-        down.transform_weights()
-        backend = self.routed_experts.backend
-        ws = self._ull_ws
-        with torch.no_grad():
-            self._ull_plan = k3_ull_front.make_plan(
-                down.weight,
-                down.weight_scale,
-                self.gate.weight,
-                self.gate.e_score_correction_bias,
-                float(self.gate.routed_scaling_factor),
-                backend.fc31_input_scale,
-                ws.world,
-                ws.rank,
-                backend.slot_start,
-                backend.expert_size_per_partition,
-            )
-        logger.info_once(
-            f"TRTLLM_K3_ULL_FRONT: sharded MoE front over {ws.world} ranks, routed experts "
-            f"[{backend.slot_start}, {backend.slot_start + backend.expert_size_per_partition}) "
-            f"on rank {ws.rank}",
-            key="k3_ull_front_on",
-        )
-        return True
-
-    def _ull_front_applies(self, hidden_states: torch.Tensor) -> bool:
-        """Whether this forward runs the sharded MoE front."""
-        plan = self._ull_plan
-        if plan is None:
-            return False
-        if not 1 <= hidden_states.shape[0] <= min(_K3_ULL_FRONT_MAX_M, 32):
-            return False
-        from ..kernels.k3r_moe import k3_ull_front
-
-        x = hidden_states.reshape(-1, self.hidden_size)
-        if not k3_ull_front.can_run(x, plan):
-            return False
-        # The kernels compile on their first call, which must not fall into a CUDA graph capture.
-        return not torch.cuda.is_current_stream_capturing() or k3_ull_front.is_compiled(
-            x.shape[0], plan, self._ull_publish_word(x.shape[0]) is not None
-        )
-
-    def _ull_publish_word(self, m: int) -> Optional[torch.Tensor]:
-        """The routed experts' routing word into which the front of an ``m``-row forward publishes
-        the top-k (``K3SmallBatchExperts.published_routing_word``), or ``None`` where the front
-        writes the ``moe_sort`` tables."""
-        if not getattr(self.routed_experts, "consumes_sort_tables", False):
-            return None
-        return self.small_experts.published_routing_word(m)
-
-    def ull_front_releases_early(self, like: torch.Tensor) -> bool:
-        """Whether the mix that produces this forward's input may release the front's head at
-        kernel entry, i.e. whether the next forward on rows shaped like ``like`` (a contiguous BF16
-        ``[M, hidden]`` tensor, e.g. the prefix sum the mix updates) runs the sharded front, whose
-        head is then the next launch on the stream. Conservative: ``False`` where ``like`` cannot
-        stand for the mix's output."""
-        if like.dim() != 2 or not like.is_contiguous():
-            return False
-        return self._ull_front_applies(like)
-
-    def _ull_front(self, hidden_states: torch.Tensor, after_head=None):
-        """Run the sharded MoE front: returns ``(router_logits placeholder, NVFP4 routed input,
-        routing)``, ``routing`` the ``SortedRouting`` the routed experts take (with this rank's
-        ``moe_sort`` tables, the published top-k, or no tables); ``after_head`` runs between the
-        front's two launches."""
-        from ..kernels.k3r_moe import k3_ull_front
-
-        plan = self._ull_plan
-        x = hidden_states.reshape(-1, self.hidden_size)
-        if not x.is_contiguous():
-            x = x.contiguous()
-        moe = self.routed_experts
-        backend = moe.backend
-        # The global scale can be replaced after the plan was built (calibration, reload).
-        plan.global_sf = backend.fc31_input_scale.reshape(-1)[:1]
-        # Where the routed experts offer a routing word, the route kernel publishes each token's
-        # top-k into it instead of writing the moe_sort tables; the experts build their tables.
-        word = self._ull_publish_word(x.shape[0])
-        routing, codes, scales = k3_ull_front_op(
-            x,
-            plan,
-            self._ull_ws,
-            after_head=after_head,
-            publish=word.data_ptr() if word is not None else 0,
-        )
-        if word is not None:
-            sorted_routing = SortedRouting(routing[0], routing[1], PublishedSortTables())
-        elif moe.consumes_sort_tables and self.small_experts.applies(x.shape[0]):
-            sorted_routing = SortedRouting(
-                routing[0], routing[1], SortTables(k3_ull_front.TILE, tuple(routing[2:8]))
-            )
-        else:
-            sorted_routing = SortedRouting(routing[0], routing[1], None)
-        # The routing does not read the logits; they only carry the shape.
-        logits = torch.empty(
-            (x.shape[0], self.gate.num_experts), dtype=torch.float32, device=x.device
-        )
-        return logits, Fp4QuantizedTensor(codes, scales, is_sf_swizzled=False), sorted_routing
-
-    def _ull_fork_shared(
-        self, identity: torch.Tensor, persist: bool, rows: int
-    ) -> Tuple[Optional[Callable[[], None]], Optional[Callable[[], None]], List[torch.Tensor]]:
-        """Fork the shared expert's GEMMs for a ULL front on ``rows`` rows where ``_ull_shared_fork`` puts it.
-
-        Returns ``(after_head, after_front, forked)``: the callback the front runs between its head and route
-        launches, the one the caller runs once the front is issued (``None``: nothing to run) and the list that
-        holds the shared partial once the GEMMs are issued.
-
-        The shared GEMMs are captured after the whole front, whichever kernel they depend on: each
-        early-releasing kernel's first dependent in the CUDA graph then is the one its trigger is meant for
-        (A_mid's the head, the head's the route kernel), and the executor keeps that one on the releasing
-        kernel's stream. A shared gate_up captured before it would take that place whenever no
-        other edge pins it to the shared stream, and the intended dependent would wait for the releasing kernel
-        to finish.
-        """
-        forked: List[torch.Tensor] = []
-
-        def run_shared():
-            forked.append(self._ull_shared_first(identity, persist))
-
-        fork = _ull_shared_fork(self._shared_gemms_can_lead(), rows)
-        if fork == "head":
-            return self.moe_main_event.record, run_shared, forked
-        if fork == "after_head":
-            self.moe_main_event.record()
-            return None, run_shared, forked
-        return None, None, forked
-
-    def _ull_shared_first(self, identity: torch.Tensor, persist: bool = False) -> torch.Tensor:
-        """The shared expert's GEMMs on the shared stream from ``moe_main_event`` (recorded around
-        the sharded front's head, ``_ull_shared_fork``), without its all-reduce;
-        ``moe_shared_gemm_event`` marks them done. ``persist`` (the column-parallel tail): the
-        persistent kernel instead, which pushes the partial itself (returns ``_SHARED_PUSHED``)."""
-        with torch.cuda.stream(self.shared_expert_stream):
-            self.moe_main_event.wait()
-            if persist:
-                self._run_shared_persist(identity)
-                partial = _SHARED_PUSHED
-            else:
-                partial = self.shared_experts(
-                    identity, final_all_reduce_params=AllReduceParams(enable_allreduce=False)
-                )
-            self.moe_shared_gemm_event.record()
-        return partial
 
     def _rp_tail_unsupported(self) -> Optional[str]:
         """Why this layer cannot run the row-parallel MoE tail, or ``None``."""
@@ -1384,154 +934,12 @@ class K3MoERuntime(nn.Module):
             )[:, k0 // 128 : (k0 + k1) // 128]
             scale = k3_fp8w_lowm_gemm.pack_ue8m0_exponents(exponents.contiguous(), hidden, k1)
         self._rp_tail = _RpTailOperands(k0, k1, scale)
-        self._cp_tail = None
-        if self._cp_ws is not None:
-            # TRTLLM_K3_ULL2_COLL_CP_TAIL: this rank's whole 128-row blocks of latent_up's output.
-            c0, n = _rp_tail_latent_slice(hidden, mapping.tp_size, mapping.tp_rank)
-            with torch.no_grad():
-                cp_exps = k3_fp8w_lowm_gemm.block_exponents_of(
-                    up.weight_scale, hidden, self.moe_hidden_size
-                )[c0 // 128 : (c0 + n) // 128]
-                cp_scale = k3_fp8w_lowm_gemm.pack_ue8m0_exponents(
-                    cp_exps.contiguous(), n, self.moe_hidden_size
-                )
-            self._cp_tail = _CpTailOperands(c0, n, up.weight[c0 : c0 + n], cp_scale)
-            logger.info_once(
-                f"TRTLLM_K3_ULL2_COLL_CP_TAIL: column-parallel MoE tail, latent_up rows "
-                f"[{c0}, {c0 + n}) (rank {mapping.tp_rank} of {mapping.tp_size})",
-                key=f"k3_cp_tail_on_{n}",
-            )
-            self._prepare_tail1(up, hidden)
-            self._prepare_shared_persist()
         logger.info_once(
             f"Kimi K3 row-parallel MoE tail, K = latent [{k0}, {k0 + k1}), BF16 shared "
             f"partial added (rank {mapping.tp_rank} of {mapping.tp_size})",
             key=f"k3_rp_tail_on_{k1}_{shard}",
         )
         return True
-
-    def _prepare_tail1(self, up, hidden: int) -> None:
-        """latent_up's block exponents for k3_moe_tail1 (the FP8 codes are read in place)."""
-        self._tail1_wexp = None
-        if self._cp_latent_push is None:
-            return
-        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm
-        from ..kernels.k3r_moe import k3_moe_tail1
-
-        weight = up.weight
-        if (
-            weight.dtype != torch.float8_e4m3fn
-            or tuple(weight.shape) != (k3_moe_tail1.HIDDEN, k3_moe_tail1.LATENT)
-            or hidden != k3_moe_tail1.HIDDEN
-            or self.moe_hidden_size != k3_moe_tail1.LATENT
-            or not weight.is_contiguous()
-        ):
-            logger.info_once(
-                "k3_moe_tail1: latent_up is not the [7168, 3584] FP8 weight, tail unchanged",
-                key="k3_tail1_off_weight",
-            )
-            return
-        with torch.no_grad():
-            wexp = k3_fp8w_lowm_gemm.block_exponents_of(
-                up.weight_scale, hidden, self.moe_hidden_size
-            ).contiguous()
-        if int(wexp.min().item()) < 1 or int(wexp.max().item()) > 254:
-            logger.info_once(
-                "k3_moe_tail1: latent_up block scale outside the kernel's range, tail unchanged",
-                key="k3_tail1_off_scale",
-            )
-            return
-        self._tail1_wexp = wexp
-        world, rank = self._cp_latent_ws.world, self._cp_latent_ws.rank
-        c0, n = k3_moe_tail1.rank_rows(world, rank)
-        logger.info_once(
-            f"k3_moe_tail1: one-kernel MoE tail up to {k3_moe_tail1.MAX_M} rows, latent_up "
-            f"rows [{c0}, {c0 + n}) (rank {rank} of {world})",
-            key=f"k3_tail1_on_{n}",
-        )
-
-    def _prepare_shared_persist(self) -> None:
-        """This rank's shared expert weights in k3_shared_persist's stream order and its
-        workspace."""
-        self._persist_frags = None
-        if self._cp_ws is None:
-            return
-        from ..kernels.k3r_moe import k3_shared_persist
-
-        ws = self._cp_ws
-        mlp = self.shared_experts
-        sms = _K3_ULL_SHARED_PERSIST_CTAS
-        gate_up = getattr(getattr(mlp, "gate_up_proj", None), "weight", None)
-        down = getattr(getattr(mlp, "down_proj", None), "weight", None)
-        inter = k3_shared_persist.INTER // ws.world
-        reason = None
-        if getattr(mlp, "activation", None) != "situ":
-            reason = "the shared expert's activation is not SiTU"
-        elif (
-            gate_up is None
-            or down is None
-            or gate_up.dtype != torch.bfloat16
-            or down.dtype != torch.bfloat16
-            or tuple(gate_up.shape) != (2 * inter, k3_shared_persist.HIDDEN)
-            or tuple(down.shape) != (k3_shared_persist.HIDDEN, inter)
-        ):
-            reason = "the shared expert is not the BF16 [2 I, 7168] / [7168, I] shard"
-        elif mlp.down_proj.tp_size != ws.world or mlp.down_proj.tp_rank != ws.rank:
-            reason = "the shared expert's TP group is not the tail's"
-        elif not k3_shared_persist.can_run(k3_shared_persist.MAX_M, ws.world, sms):
-            reason = f"{sms} CTAs do not split the {inter}-column shard"
-        if reason is not None:
-            logger.info_once(
-                f"k3_shared_persist: shared expert unchanged: {reason}",
-                key=f"k3_persist_off_{reason}",
-            )
-            return
-        with torch.no_grad():
-            self._persist_frags = k3_shared_persist.persist_fragments(
-                gate_up.data.contiguous(), down.data.contiguous(), sms
-            )
-        self._persist_ws = k3_shared_persist.PersistWorkspace(ws.world, gate_up.device)
-        self._persist_act = (float(mlp.beta), mlp.linear_beta)
-        logger.info_once(
-            f"k3_shared_persist: the shared expert on {sms} CTAs beside the routed "
-            f"experts up to {k3_shared_persist.MAX_M} rows (rank {ws.rank} of {ws.world})",
-            key=f"k3_persist_on_{sms}",
-        )
-
-    def _persist_applies(self, num_tokens: int, target) -> bool:
-        """Whether this forward's shared expert is the persistent kernel (the column-parallel
-        tail)."""
-        if (
-            self._persist_frags is None
-            or target is None
-            or self.shared_expert_stream is None
-            or not do_multi_stream()
-            or not _K3_ULL2_COLL_CP_TAIL
-            or not self._cp_tail_applies(num_tokens, target)
-        ):
-            return False
-        from ..kernels.k3r_moe import k3_shared_persist
-
-        return k3_shared_persist.can_run(num_tokens, self._cp_ws.world, _K3_ULL_SHARED_PERSIST_CTAS)
-
-    def _run_shared_persist(self, identity: torch.Tensor) -> None:
-        """The persistent shared expert of ``identity`` on the current (shared) stream, pushing
-        into the tail call's slots."""
-        ws = self._cp_ws
-        x = identity if identity.is_contiguous() else identity.contiguous()
-        beta, linear_beta = self._persist_act
-        k3_shared_persist_op(
-            x=x,
-            frags=self._persist_frags,
-            world=ws.world,
-            rank=ws.rank,
-            sms=_K3_ULL_SHARED_PERSIST_CTAS,
-            ws=self._persist_ws,
-            out_base=ws.mc_base,
-            out_flags=ws.flags,
-            beta=beta,
-            linear_beta=linear_beta,
-        )
 
     def _rp_tail_target(
         self, hidden_states: torch.Tensor, residual: Optional[torch.Tensor], rp_tail_ok: bool
@@ -1569,288 +977,19 @@ class K3MoERuntime(nn.Module):
             hidden_states, final_all_reduce_params=AllReduceParams(enable_allreduce=False)
         )
 
-    def _rp_tail_mx_applies(self, num_tokens: int) -> bool:
-        """Whether the row-parallel tail GEMM can run as the MXFP8 low-M GEMM on the latent
-        all-reduce's MXFP8 output (``TRTLLM_K3_ULL_TAIL_SANDWICH``; the tail GEMM has one source):
-        the same tactic as the split-source BF16 GEMM, so the same bits."""
-        from ..kernels.k3r_gemm import k3_fp8w_lowm_mxfp8
-
-        if num_tokens > k3_fp8w_lowm_mxfp8.MAX_M:
-            return False
-        try:
-            k3_fp8w_lowm_mxfp8.default_mx_tactic(num_tokens, self.hidden_size, self._rp_tail.k1)
-        except ValueError:
-            return False
-        return True
-
-    def _rp_tail_latent_ar_early(
-        self, routed_out: torch.Tensor, target, mxfp8: bool = False
-    ) -> Optional[Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]]:
-        """``TRTLLM_K3_ULL_TAIL_SANDWICH``: the routed latent all-reduce + RMSNorm of the
-        row-parallel tail by ``k3_latent_ar_norm`` (its row kernel where it serves the size, else
-        the cluster kernel) on the MNNVL workspace the tail GEMM pushes into: bit-identical to the
-        C++ one-shot kernel, but it releases the tail GEMM right after its own
-        ``griddepcontrol.wait``, so the GEMM streams its weight slice while the all-reduce waits
-        for the other ranks. Returns ``(latent, (xq, xs) with mxfp8 else None)``, or ``None``
-        where it does not apply (the C++ kernel's two-shot sizes). ``mxfp8``: the kernel also
-        stores the MXFP8 form of the latent, bitwise the low-M GEMM's own quantization of it."""
-        from tensorrt_llm._torch.distributed.ops import _MNNVL_ONE_SHOT_THRESHOLD_BYTES
-
-        from ..kernels.k3r_comm import k3_latent_ar_norm
-
-        ws = target.workspace
-        latent = routed_out.reshape(-1, self.moe_hidden_size)
-        if not latent.is_contiguous():
-            latent = latent.contiguous()
-        gamma = self.routed_expert_norm.weight
-        if latent.numel() * ws.world * latent.element_size() > _MNNVL_ONE_SHOT_THRESHOLD_BYTES:
-            return None
-        row = k3_latent_ar_norm.can_run_row(latent, gamma, ws.world, ws.bytes_per_buffer)
-        if not (row or k3_latent_ar_norm.can_run(latent, gamma, ws.world)):
-            return None
-        out = torch.empty_like(latent)
-        m, k = latent.shape
-        latent_mx = None
-        if mxfp8:
-            latent_mx = (
-                torch.empty((m, k), dtype=torch.float8_e4m3fn, device=latent.device),
-                torch.empty((m, k // 32), dtype=torch.uint8, device=latent.device),
-            )
-        k3_latent_ar_rmsnorm(
-            latent,
-            gamma,
-            float(self.routed_expert_norm.variance_epsilon),
-            out,
-            uc_addr=ws.uc_local,
-            mc_addr=ws.mc_base,
-            flags=ws.flags,
-            rank=ws.rank,
-            world_size=ws.world,
-            mxfp8_out=latent_mx,
-            row=row,
-        )
-        return out, latent_mx
-
-    @staticmethod
-    def _cp_latent_oneshot_bytes() -> int:
-        """Largest one-shot latent all-reduce of the column-parallel tail (bytes of slots): the C++
-        one-shot size."""
-        from tensorrt_llm._torch.distributed.ops import _MNNVL_ONE_SHOT_THRESHOLD_BYTES
-
-        return _MNNVL_ONE_SHOT_THRESHOLD_BYTES
-
-    def _tail1_applies(self, num_tokens: int) -> bool:
-        """Whether this forward's MoE tail runs k3_moe_tail1: its operands are built, the routed
-        experts push their latent rows at ``num_tokens`` (``K3SmallBatchExperts.applies``: the
-        small-batch kernel, no communication strategy) and the kernel serves the shape."""
-        if (
-            self._tail1_wexp is None
-            or self._cp_latent_push is None
-            or not self.small_experts.applies(num_tokens)
-        ):
-            return False
-        from ..kernels.k3r_moe import k3_moe_tail1
-
-        return k3_moe_tail1.can_run(num_tokens, self._cp_latent_push.world)
-
-    def _cp_tail_applies(self, num_tokens: int, target) -> bool:
-        """Whether this forward's MoE tail runs column-parallel (``TRTLLM_K3_ULL2_COLL_CP_TAIL``):
-        the latent all-reduce runs one-shot by ``k3_latent_ar_norm``'s row kernel on the tail's
-        latent workspace (its MXFP8 output feeds the tail GEMM), the replicated projection's MXFP8
-        tactic serves ``num_tokens`` and the tail's workspaces hold them."""
-        cp = self._cp_tail
-        lws = self._cp_latent_ws
-        if cp is None or lws is None or num_tokens > _K3_RP_TAIL_MAX_M:
-            return False
-        from ..kernels.k3r_comm import k3_latent_ar_norm
-        from ..kernels.k3r_gemm import k3_fp8w_lowm_mxfp8
-
-        if (
-            lws.world not in k3_latent_ar_norm.ROW_WORLD_SIZES
-            or num_tokens > k3_latent_ar_norm.ROW_MAX_M
-            or self.moe_hidden_size != k3_latent_ar_norm.HIDDEN
-        ):
-            return False
-        nbytes = num_tokens * self.moe_hidden_size * lws.world * 2
-        if nbytes > self._cp_latent_oneshot_bytes() or nbytes > lws.bytes_per_buffer:
-            return False
-        if num_tokens > k3_fp8w_lowm_mxfp8.MAX_M:
-            return False
-        try:
-            k3_fp8w_lowm_mxfp8.default_mx_tactic(num_tokens, self.hidden_size, self.moe_hidden_size)
-        except ValueError:
-            return False
-        return True
-
-    def _cp_tail_forward(
-        self,
-        routed_output: Callable[..., torch.Tensor],
-        identity: torch.Tensor,
-        shared_part: Optional[torch.Tensor],
-        residual: torch.Tensor,
-        target,
-        defer_residual: bool,
-    ):
-        """``TRTLLM_K3_ULL2_COLL_CP_TAIL``: the routed experts, the shared expert's BF16 partial
-        pushed into the tail's call on the shared stream, the latent all-reduce + RMSNorm (MXFP8
-        output), then this rank's latent_up output columns multicast into the call's all-gather
-        rows; or, where k3_moe_tail1 applies, the routed experts push their latent rows
-        (``routed_output(output_push=...)``) and one kernel does the rest. Returns a
-        ``_DeferredRpTail`` whose pending call the next pre-attention mix finishes (``finish_ag``),
-        or the updated residual."""
-        from ..kernels.k3r_gemm.k3_fp8w_lowm_mxfp8 import default_mx_tactic
-
-        cp = self._cp_tail
-        cp_ws = self._cp_ws
-        num_tokens = identity.shape[0]
-        tail1 = self._tail1_applies(num_tokens)
-        if tail1:
-            routed_output = functools.partial(routed_output, output_push=self._cp_latent_push)
-
-        def push_shared(part: torch.Tensor) -> None:
-            part = part.reshape(num_tokens, -1)
-            if not part.is_contiguous():
-                part = part.contiguous()
-            k3_lamport_push(cp_ws, part, True)
-
-        side = self.shared_expert_stream is not None and do_multi_stream()
-        if shared_part is not None:
-            # The shared expert ran ahead on the shared stream (moe_shared_gemm_event); the
-            # persistent kernel pushed its partial itself.
-            routed_out = routed_output()
-            if side:
-                with torch.cuda.stream(self.shared_expert_stream):
-                    self.moe_shared_gemm_event.wait()
-                    if shared_part is not _SHARED_PUSHED:
-                        push_shared(shared_part)
-                    self.moe_shared_event.record()
-            else:
-                self.moe_shared_gemm_event.wait()
-                push_shared(shared_part)
-        elif side:
-            self.moe_main_event.record()
-            persist = self._persist_applies(num_tokens, target)
-            routed_out = routed_output()
-            with torch.cuda.stream(self.shared_expert_stream):
-                self.moe_main_event.wait()
-                if persist:
-                    self._run_shared_persist(identity)
-                else:
-                    push_shared(self._rp_shared_output(identity))
-                self.moe_shared_event.record()
-        else:
-            routed_out = routed_output()
-            push_shared(self._rp_shared_output(identity))
-        if tail1:
-            # The whole tail in one kernel (the experts pushed their latent rows), into the call's
-            # all-gather rows.
-            from ..kernels.k3r_moe import k3_moe_tail1
-
-            lws = self._cp_latent_ws
-            c0, _ = k3_moe_tail1.rank_rows(lws.world, lws.rank)
-            k3_moe_tail1_op(
-                m=num_tokens,
-                world=lws.world,
-                lat_uc=lws.uc_local,
-                lat_flags=lws.flags,
-                weight=self.routed_expert_up_proj.weight,
-                wexp=self._tail1_wexp,
-                gamma=self.routed_expert_norm.weight,
-                eps=float(self.routed_expert_norm.variance_epsilon),
-                ag_base=cp_ws.mc_base,
-                ag_flags=cp_ws.flags,
-                c0=c0,
-            )
-            return self._cp_tail_finish(cp_ws, num_tokens, residual, side, defer_residual)
-        # The latent all-reduce + RMSNorm on the tail's latent workspace (one-shot, checked by
-        # _cp_tail_applies), releasing the tail GEMM at once, with its MXFP8 output.
-        latent = routed_out.reshape(-1, self.moe_hidden_size)
-        if not latent.is_contiguous():
-            latent = latent.contiguous()
-        ws = self._cp_latent_ws
-        latent_mx = (
-            torch.empty(latent.shape, dtype=torch.float8_e4m3fn, device=latent.device),
-            torch.empty(
-                (num_tokens, self.moe_hidden_size // 32), dtype=torch.uint8, device=latent.device
-            ),
-        )
-        k3_latent_ar_rmsnorm(
-            latent,
-            self.routed_expert_norm.weight,
-            float(self.routed_expert_norm.variance_epsilon),
-            torch.empty_like(latent),
-            uc_addr=ws.uc_local,
-            mc_addr=ws.mc_base,
-            flags=ws.flags,
-            rank=ws.rank,
-            world_size=ws.world,
-            mxfp8_out=latent_mx,
-            early_state=True,
-        )
-        # The replicated projection's tactic: every 128-row output tile is computed as there.
-        k3_fp8w_lowm_mxfp8_push_op(
-            *latent_mx,
-            cp.weight,
-            cp.scale,
-            cp_ws,
-            col0=cp.c0,
-            hidden=self.hidden_size,
-            tactic=default_mx_tactic(num_tokens, self.hidden_size, self.moe_hidden_size),
-        )
-        return self._cp_tail_finish(cp_ws, num_tokens, residual, side, defer_residual)
-
-    def _cp_tail_finish(
-        self, cp_ws, num_tokens: int, residual: torch.Tensor, side: bool, defer_residual: bool
-    ):
-        """The column-parallel tail call (all-gather rows pushed, the shared expert's slots pushed
-        on the shared stream, joined here) as a ``_DeferredRpTail`` the next pre-attention mix
-        finishes, or the updated residual."""
-        from tensorrt_llm._torch.distributed.ops import _MNNVL_ONE_SHOT_THRESHOLD_BYTES
-
-        from .layers import LamportPushTarget
-
-        if side:
-            self.moe_shared_event.wait()
-        # The call reproduces the shared expert's C++ all-reduce (its transport by size).
-        cpp_one_shot = (
-            num_tokens * self.hidden_size * cp_ws.world * 2 <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES
-        )
-        cp_target = LamportPushTarget(
-            cp_ws, True, cpp_one_shot, torch.empty_like(residual.reshape(num_tokens, -1))
-        )
-        cp_target.pushed = True
-        cp_target.deferred = True
-        cp_target.ag = True
-        deferred = _DeferredRpTail(residual.reshape(num_tokens, -1), LamportPending(cp_target))
-        if defer_residual:
-            return deferred
-        return deferred.materialize().view(residual.shape)
-
     def _rp_tail_forward(
         self,
-        routed_output: Callable[..., torch.Tensor],
+        routed_output: Callable[[], torch.Tensor],
         identity: torch.Tensor,
-        shared_part: Optional[torch.Tensor],
         residual: torch.Tensor,
         target,
         defer_residual: bool,
     ):
         """The row-parallel tail: the routed experts (``routed_output``) and the shared expert's
-        part (``_rp_shared_output``; ``shared_part`` if it already ran ahead of the routed experts),
-        then the latent all-reduce + RMSNorm, then this rank's tail GEMM pushing its partial into
-        ``target``. Returns a ``_DeferredRpTail`` (``defer_residual``) or the updated residual."""
-        if _K3_ULL2_COLL_CP_TAIL and self._cp_tail_applies(
-            residual.numel() // self.hidden_size, target
-        ):
-            return self._cp_tail_forward(
-                routed_output, identity, shared_part, residual, target, defer_residual
-            )
-        if shared_part is not None:
-            # The shared expert ran ahead on the shared stream and the routed experts waited for
-            # it (moe_shared_gemm_event).
-            routed_out = routed_output()
-            self.moe_shared_gemm_event.wait()
-        elif self.shared_expert_stream is not None and do_multi_stream():
+        part (``_rp_shared_output``), then the latent all-reduce + RMSNorm, then this rank's tail
+        GEMM pushing its partial into ``target``. Returns a ``_DeferredRpTail``
+        (``defer_residual``) or the updated residual."""
+        if self.shared_expert_stream is not None and do_multi_stream():
             self.moe_main_event.record()
             routed_out = routed_output()
             with torch.cuda.stream(self.shared_expert_stream):
@@ -1862,24 +1001,14 @@ class K3MoERuntime(nn.Module):
             routed_out = routed_output()
             shared_part = self._rp_shared_output(identity)
         moe_all_reduce = self.routed_experts.all_reduce
-        routed_latent = None
-        latent_mx = None
-        if _K3_ULL_TAIL_SANDWICH:
-            num_rows = routed_out.numel() // self.moe_hidden_size
-            early = self._rp_tail_latent_ar_early(
-                routed_out, target, mxfp8=self._rp_tail_mx_applies(num_rows)
-            )
-            if early is not None:
-                routed_latent, latent_mx = early
-        if routed_latent is None:
-            routed_latent = moe_all_reduce(
-                routed_out,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RMS_NORM,
-                    norm_weight=self.routed_expert_norm.weight,
-                    eps=float(self.routed_expert_norm.variance_epsilon),
-                ),
-            )
+        routed_latent = moe_all_reduce(
+            routed_out,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RMS_NORM,
+                norm_weight=self.routed_expert_norm.weight,
+                eps=float(self.routed_expert_norm.variance_epsilon),
+            ),
+        )
         latent = routed_latent.reshape(-1, self.moe_hidden_size)
         num_tokens = latent.shape[0]
         shared_part = shared_part.reshape(num_tokens, -1)
@@ -1887,29 +1016,15 @@ class K3MoERuntime(nn.Module):
             shared_part = shared_part.contiguous()
         rp = self._rp_tail
         lo, hi = rp.k0, rp.k0 + rp.k1
-        if latent_mx is not None:
-            # TRTLLM_K3_ULL_TAIL_SANDWICH: the MXFP8 GEMM on the all-reduce's MXFP8 output (its
-            # slice read in place), no quantization in the tail GEMM; the same bits.
-            k3_fp8w_lowm_mxfp8_push_op(
-                *latent_mx,
-                self.routed_expert_up_proj.weight,
-                rp.scale,
-                target.workspace,
-                target.one_shot,
-                k0=lo,
-                k1=rp.k1,
-                addend=shared_part,
-            )
-        else:
-            k3_fp8w_lowm_gemm_push_op(
-                latent[:, lo:hi],
-                self.routed_expert_up_proj.weight[:, lo:hi],
-                rp.scale,
-                target.workspace,
-                target.one_shot,
-                addend=shared_part,
-                strided=True,
-            )
+        k3_fp8w_lowm_gemm_push_op(
+            latent[:, lo:hi],
+            self.routed_expert_up_proj.weight[:, lo:hi],
+            rp.scale,
+            target.workspace,
+            target.one_shot,
+            addend=shared_part,
+            strided=True,
+        )
         target.pushed = True
         result = finish_lamport_push(moe_all_reduce, target, deferred=True)
         deferred = _DeferredRpTail(residual.reshape(num_tokens, -1), result)
@@ -1967,10 +1082,9 @@ class K3MoERuntime(nn.Module):
 
         return route
 
-    @staticmethod
-    def _fused_projection_applies(x: torch.Tensor, projection: nn.Module) -> bool:
-        """Whether the fused latent projection replaces ``projection(x)``."""
-        if not _K3_LD_FUSED:
+    def _fused_projection_applies(self, x: torch.Tensor, projection: nn.Module) -> bool:
+        """Whether the fused latent projection replaces ``projection(x)`` (``ld_fused``)."""
+        if not self._constants.ld_fused:
             return False
         if not isinstance(projection, _Fp8BlockScaleWeightReadLinear):
             return False
@@ -1984,7 +1098,9 @@ class K3MoERuntime(nn.Module):
         # Where the fused op itself runs the low-M GEMM (SM107), it only adds the epilogue.
         if x.shape[0] <= k3_latent_fp8_gemm.lowm_route_max_m(*projection.weight.shape):
             return True
-        if _K3_FP8W_LOWM_GEMM and _k3_lowm_gemm_can_run(x, projection.weight, packed_scale):
+        if self._constants.fp8w_lowm_gemm and _k3_lowm_gemm_can_run(
+            x, projection.weight, packed_scale
+        ):
             return False
         return True
 
@@ -2018,7 +1134,7 @@ class K3MoERuntime(nn.Module):
         residual: Optional[torch.Tensor],
         defer_residual: bool,
     ):
-        """``TRTLLM_K3_LATENT_AR_OWN_WS``: the routed latent all-reduce + RMSNorm on its own MNNVL
+        """``latent_ar_own_ws``: the routed latent all-reduce + RMSNorm on its own MNNVL
         workspace (``k3_latent_ar_norm`` up to ``_K3_LATENT_AR_ONESHOT_MAX_BYTES``, the C++ fused
         all-reduce otherwise) and latent_up, issued on the main stream before it joins the shared-expert
         stream, whose output only the residual update reads. Returns what ``forward`` returns."""
@@ -2321,29 +1437,10 @@ class K3MoERuntime(nn.Module):
         """
         identity = hidden_states
         rp_target = self._rp_tail_target(hidden_states, residual, rp_tail_ok)
-        # The shared expert as the persistent kernel (forked with the ULL front's shared fork,
-        # else in the column-parallel tail).
-        persist = self._persist_applies(hidden_states.shape[0], rp_target)
         projected_input = None
         early_routed_in = None
-        shared_partial = None
-        front_routing = None
         route_target = self._route_tail_target(hidden_states.shape[0])
-        if self._ull_front_applies(hidden_states):
-            # TRTLLM_K3_ULL_FRONT: the shared expert forks where _ull_fork_shared puts it; the sharded
-            # front routes (route_target is the front's) and produces the NVFP4 routed input on this stream.
-            route_target = None
-            after_head, after_front, forked = self._ull_fork_shared(
-                identity, persist, hidden_states.shape[0]
-            )
-            router_logits, projected_input, front_routing = self._ull_front(
-                hidden_states, after_head=after_head
-            )
-            if after_front is not None:
-                after_front()
-            if forked:
-                shared_partial = forked[0]
-        elif self._can_fuse_router_down(hidden_states):
+        if self._can_fuse_router_down(hidden_states):
             router_logits, projected_input = torch.ops.trtllm.dsv3_router_latent_gemm_op(
                 hidden_states, self.gate.weight, self.routed_expert_down_proj.weight
             )
@@ -2378,9 +1475,7 @@ class K3MoERuntime(nn.Module):
         )
         num_tokens = hidden_states.shape[0]
 
-        def _routed_output(output_push: Optional[LamportWorkspaceView] = None):
-            # ``output_push``: also push the routed rows into that one-shot all-reduce's slots
-            # (the column-parallel tail's k3_moe_tail1).
+        def _routed_output():
             # Latent down/up projections via the min-latency fused GEMM op:
             # at <=16 tokens (decode graphs) it runs a single pipelined
             # bf16 kernel per projection instead of cuBLAS's split-K GEMV +
@@ -2407,21 +1502,15 @@ class K3MoERuntime(nn.Module):
                 moe_kwargs["output_dtype"] = hidden_states.dtype
             if isinstance(self.routed_experts, K3RoutedExperts):
                 # Routed by the CuTe tail (route_target), the sorted routing kernel or
-                # noaux_tc_op, unless the front routed already; then the kernels.
+                # noaux_tc_op; then the kernels.
                 y = self.routed_experts(
                     routed_in,
                     logits,
                     route=self._router(route_target),
-                    routing=front_routing,
                     input_ready_event=moe_kwargs.get("input_ready_event"),
-                    output_push=output_push,
                     all_rank_num_tokens=all_rank_num_tokens,
                 )
             else:
-                if front_routing is not None or output_push is not None:
-                    raise RuntimeError(
-                        "caller routing or an output push needs the CuTe DSL experts"
-                    )
                 y = self.routed_experts(
                     routed_in,
                     logits,
@@ -2455,19 +1544,11 @@ class K3MoERuntime(nn.Module):
 
         if rp_target is not None:
             return self._rp_tail_forward(
-                _routed_output, identity, shared_partial, residual, rp_target, defer_residual
+                _routed_output, identity, residual, rp_target, defer_residual
             )
         # The final join includes the shared all-reduce, keeping it ordered before any outer
         # routed reduction or the next layer's collectives.
-        if shared_partial is not None:
-            routed_out = _routed_output()
-            with torch.cuda.stream(self.shared_expert_stream):
-                shared_out = shared_partial
-                if self._shared_needs_all_reduce():
-                    shared_out = self._shared_all_reduce()(shared_partial)
-                self.moe_shared_event.record()
-            self.moe_shared_event.wait()
-        elif (
+        if (
             self._latent_ar_ws is not None
             and moe_all_reduce is not None
             and not self._defer_shared_allreduce

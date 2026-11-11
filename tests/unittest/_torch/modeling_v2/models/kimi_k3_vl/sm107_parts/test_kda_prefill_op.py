@@ -7,6 +7,7 @@ as the model loader does. The FLA reference (``KimiKDAReference``) shares the la
 projections, so a comparison measures the convolution, recurrence and gated RMSNorm.
 """
 
+import dataclasses
 import importlib.util
 import math
 import sys
@@ -25,8 +26,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r
     fused_kda_post_conv,
     is_kda_optimized_supported,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts import (
-    kda as kimi_kda_mixer,
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.constants import (  # noqa: E402, E501
+    K3Sm107Constants,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.fp8_weight_read import (  # noqa: E402, E501
     _Fp8BlockScaleWeightReadLinear,
@@ -72,10 +73,21 @@ def _kda_prefill_entry():
     return kda_prefill
 
 
+def _constants(**changes) -> K3Sm107Constants:
+    """Every switch off (the plain code path) except ``changes``."""
+    values = {field.name: False for field in dataclasses.fields(K3Sm107Constants)}
+    values.update(shared_sm=0, attn_res_pdl_max_m=64, torch_mem_safety_margin=0)
+    values.update(changes)
+    return K3Sm107Constants(**values)
+
+
 @torch.no_grad()
-def _make_kda(*, num_heads: int = NUM_HEADS, seed: int = 0) -> K3KDALinearAttention:
+def _make_kda(
+    *, num_heads: int = NUM_HEADS, seed: int = 0, constants: K3Sm107Constants | None = None
+) -> K3KDALinearAttention:
     """A layer on seeded FP8 checkpoint-like weights, finalized as the model loader does: the
-    fused QKVG and o_proj swapped to the K3 FP8 weight-read GEMM."""
+    fused QKVG and o_proj swapped to the K3 FP8 weight-read GEMM. ``constants``: the plain code
+    path by default."""
     cfg = SimpleNamespace(
         hidden_size=HIDDEN_SIZE,
         rms_norm_eps=1e-5,
@@ -88,7 +100,9 @@ def _make_kda(*, num_heads: int = NUM_HEADS, seed: int = 0) -> K3KDALinearAttent
         },
     )
     model_config = ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES))
-    kda = K3KDALinearAttention(cfg, layer_idx=0, model_config=model_config).to("cuda")
+    kda = K3KDALinearAttention(
+        cfg, layer_idx=0, model_config=model_config, constants=constants or _constants()
+    ).to("cuda")
     generator = torch.Generator(device="cuda").manual_seed(seed)
 
     def randn(shape, scale):
@@ -981,17 +995,16 @@ def test_kda_prefill_rejects_unaligned_slot_indices() -> None:
 @torch.no_grad()
 @pytest.mark.parametrize("sequence_lengths", [[64, 64, 64, 63], [300]], ids=["varlen", "single"])
 def test_fused_conv_prefill_matches_unfused_chain_with_initial_states(
-    monkeypatch: pytest.MonkeyPatch, sequence_lengths: list[int]
+    sequence_lengths: list[int],
 ) -> None:
-    """features.kda_fused_conv_prefill (fused_kda_conv_prefill on the token-major QKVG output)
+    """``kda_fused_conv_prefill`` (fused_kda_conv_prefill on the token-major QKVG output)
     carries continuation state like extract_transpose_prefill_slice + causal_conv1d_fn +
     fused_kda_post_conv: the same outputs and recurrent rows, the same convolution rows bit for
     bit, for mixed initial states, permuted slots and an unused slot; with and without
-    features.kda_prepad_prefill."""
+    ``kda_prepad_prefill``."""
     torch.manual_seed(5)
     # The fused kernel's channel-contiguous taps are built with the layer's constants.
-    monkeypatch.setattr(kimi_kda_mixer, "_KDA_FUSED_CONV_PREFILL", True)
-    kda = _make_kda()
+    kda = _make_kda(constants=_constants(kda_fused_conv_prefill=True))
     num_sequences = len(sequence_lengths)
     cumulative_lengths = torch.tensor(
         [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()], dtype=torch.long, device="cuda"
@@ -1015,8 +1028,8 @@ def test_fused_conv_prefill_matches_unfused_chain_with_initial_states(
 
     def run(fused_conv: bool, prepad: bool):
         """Prefill from fresh copies of the seeded pools; return output and pools."""
-        monkeypatch.setattr(kimi_kda_mixer, "_KDA_FUSED_CONV_PREFILL", fused_conv)
-        monkeypatch.setattr(kimi_kda_mixer, "_KDA_PREPAD_PREFILL", prepad)
+        kda._fused_conv_prefill = fused_conv
+        kda._prepad_prefill = prepad
         conv_pool, state_pool = conv_seed.clone(), state_seed.clone()
         output = _run_production_prefill(
             kda,

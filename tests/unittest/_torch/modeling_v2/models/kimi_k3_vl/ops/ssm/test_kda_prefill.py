@@ -65,7 +65,7 @@ def _call_args(spec: dict, seed: int) -> tuple[dict, torch.Tensor, int]:
     single = tokens if len(seq_lens) == 1 else None
     q, k, v, beta = raw["q"], raw["k"], raw["v"], raw["beta"]
     if single is not None and tokens % CHUNK:
-        # features.kda_prepad_prefill: Q/K/V/beta arrive zero-padded to the chunk, g does not.
+        # kda_prepad_prefill: Q/K/V/beta arrive zero-padded to the chunk, g does not.
         pad = CHUNK - tokens % CHUNK
         q, k, v = (torch.nn.functional.pad(t, (0, 0, 0, 0, 0, pad)) for t in (q, k, v))
         beta = torch.nn.functional.pad(beta, (0, 0, 0, pad))

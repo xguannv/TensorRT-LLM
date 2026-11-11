@@ -69,7 +69,12 @@ def _inputs(spec: dict, seed: int):
 def test_certified_cells(cell) -> None:
     spec = cell.spec
     layer, addends, block, weights = _inputs(spec, zlib.crc32(cell.why.encode()) % 2**31)
-    flags = dict(mxfp8=spec["mxfp8"], entry_trigger=spec["entry_trigger"], mx_atom=spec["mx_atom"])
+    flags = dict(
+        mxfp8=spec["mxfp8"],
+        entry_trigger=spec["entry_trigger"],
+        mx_atom=spec["mx_atom"],
+        early_trigger=spec["early_trigger"],
+    )
     args = (layer, addends, block, *weights, spec["rms_eps"], spec["out_eps"])
     before = [t.clone() for t in (layer, *addends, block, *weights)]
     with validating(k3_attn_res_norm):

@@ -784,7 +784,7 @@ class K3RouteTailKernel:
 
     def load_logits(self, row: Int64, g: Int32, stride: int, n: int):
         """Logit ``s * stride + g`` (``s < n``) of the first split of the token whose logits start
-        at ``row``. A subclass may read them differently (the ULL MoE front polls them)."""
+        at ``row``."""
         return [_ld_f32(row + Int64((s * stride + g) * 4)) for s in range(n)]
 
     def load_logits4(self, row: Int64, lane: Int32, n: int):

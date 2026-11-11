@@ -23,13 +23,11 @@ def packed_reduce_reference(
     stats FP32 [requests * valid_m, 2])``, natural-log ``(max, sum)``.
 
     A request planned on one task keeps the row the decode stored in ``rows`` and that task's
-    statistics. FP32 partials are max-relative numerators (``output_scale`` converts them), FP16
-    partials normalized split outputs."""
+    statistics. The FP32 partials are max-relative numerators (``output_scale`` converts them)."""
     plan = fold.plan.tolist()
     begins = plan[2 : 3 + fold.num_requests]
     valid_m = fold.valid_m
     scale = fold.sm_scale * _LOG2_E / (fold.q_scale.double().item() * fold.kv_scale.double().item())
-    normalized = fold.partial.dtype == torch.float16
     latent, maxima, sums = [], [], []
     for r, (begin, end) in enumerate(zip(begins, begins[1:])):
         row_sum = fold.sums[begin:end, :valid_m].double()
@@ -38,8 +36,6 @@ def packed_reduce_reference(
         global_max = row_max.masked_fill(~active, -torch.inf).amax(0)
         weights = torch.where(active, torch.exp2(row_max - global_max), 0.0)
         values = fold.partial[begin:end, :valid_m].double()
-        if normalized:
-            values = values * row_sum.unsqueeze(-1)
         numerator = (torch.where(active.unsqueeze(-1), values, 0.0) * weights.unsqueeze(-1)).sum(0)
         denominator = (row_sum * weights).sum(0)
         out = torch.where(
@@ -82,8 +78,8 @@ class K3HelixTailOp(OpWrapper):
     ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
     # Spec: `cp_size` (P; > 1 runs on one GPU with `loopback`), the decode's split state
     # (`kv_tiles` per request, `splits` task slots, `wave_tasks`, `query_len`; T = requests *
-    # query_len), `partial` ("fp32", "fp16" normalized, or None: rows stored directly), `ull2`,
-    # `mx_out` (o_proj's MXFP8 operand). H = 96 heads per rank, latent 512, V head 128.
+    # query_len), `partial` ("fp32", or None: rows stored directly), `mx_out` (o_proj's MXFP8
+    # operand). H = 96 heads per rank, latent 512, V head 128.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="helix8 decode: P = 8 (12 heads out), FP32 split partials folded, 8 requests x 4",
@@ -94,7 +90,6 @@ class K3HelixTailOp(OpWrapper):
                 wave_tasks=106,
                 query_len=4,
                 partial="fp32",
-                ull2=False,
                 mx_out=False,
             ),
         ),  # fmt: skip
@@ -107,46 +102,30 @@ class K3HelixTailOp(OpWrapper):
                 wave_tasks=106,
                 query_len=4,
                 partial="fp32",
-                ull2=False,
                 mx_out=False,
             ),
         ),  # fmt: skip
         Cell(
-            why="helix16 ULL: P = 16 (6 heads out), FP16 normalized partials, staged (ull2) fold",
+            why="helix8 side gate: the gate joins before the tail, o_proj's MXFP8 operand stored",
             spec=dict(
-                cp_size=16,
-                kv_tiles=[86],
-                splits=8,
-                wave_tasks=106,
-                query_len=4,
-                partial="fp16",
-                ull2=True,
-                mx_out=False,
-            ),
-        ),  # fmt: skip
-        Cell(
-            why="helix16 ULL above 16 tokens: the gate joins first, o_proj's MXFP8 operand stored",
-            spec=dict(
-                cp_size=16,
+                cp_size=8,
                 kv_tiles=[60, 9, 33, 1, 86, 20, 5, 40],
                 splits=8,
                 wave_tasks=106,
                 query_len=4,
-                partial="fp16",
-                ull2=True,
+                partial="fp32",
                 mx_out=True,
             ),
         ),  # fmt: skip
         Cell(
-            why="helix16 ULL DSpark drafter: rows the attention stored directly, no fold",
+            why="helix8 DSpark drafter: rows the attention stored directly, no fold",
             spec=dict(
-                cp_size=16,
+                cp_size=8,
                 kv_tiles=[1] * 2,
                 splits=1,
                 wave_tasks=106,
                 query_len=8,
                 partial=None,
-                ull2=True,
                 mx_out=False,
             ),
         ),  # fmt: skip
@@ -159,7 +138,6 @@ class K3HelixTailOp(OpWrapper):
                 wave_tasks=17,
                 query_len=8,
                 partial="fp32",
-                ull2=False,
                 mx_out=False,
             ),
         ),  # fmt: skip
@@ -179,8 +157,7 @@ class K3HelixTailOp(OpWrapper):
     of `bf16(out * gate)` (o_proj's operand, bitwise the gated low-M GEMM's quantization).
 
     A process cache holds compiled kernels per feature combination; one CTA per SM at most
-    (`max_ctas`). `ull2` selects the staged fold (bitwise the same; always for FP16 partials).
-    `timestamps` (microbenchmarks) stores %globaltimer phase stamps. The receive buffer and `state`
+    (`max_ctas`). `timestamps` (microbenchmarks) stores %globaltimer phase stamps. The receive buffer and `state`
     are internal: the reference does not model them. The cells run one GPU (`loopback`), so no
     cell masks a token (every source of a looped-back token is the same rank).
     """
@@ -205,7 +182,6 @@ class K3HelixTailOp(OpWrapper):
         timestamps: torch.Tensor | None,
         loopback: bool,
         mx_atom: bool,
-        ull2: bool,
     ) -> None:
         _tail.k3_helix_tail(
             rows,
@@ -226,7 +202,6 @@ class K3HelixTailOp(OpWrapper):
             timestamps=timestamps,
             loopback=loopback,
             mx_atom=mx_atom,
-            ull2=ull2,
         )
 
     def reference(
@@ -249,15 +224,14 @@ class K3HelixTailOp(OpWrapper):
         timestamps: torch.Tensor | None,
         loopback: bool,
         mx_atom: bool,
-        ull2: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The post-state ``out`` (and ``(out, xq, xs)`` with ``mx_out``), FP64-accumulated.
 
         A collective: with ``cp_size > 1`` and not ``loopback``, ``rows``, ``stats``, ``fold`` and
         ``zero_kv_mask`` are the group's inputs in rank order (``w_uv`` is replicated). With
         ``loopback`` (or ``P = 1``) they are this rank's, and source ``d`` is this rank's head
-        group ``d``. The workspace arguments, ``state``, ``max_ctas``, ``use_pdl``, ``timestamps``
-        and ``ull2`` do not change the result. ``mx_atom`` (another scale layout) is not
+        group ``d``. The workspace arguments, ``state``, ``max_ctas``, ``use_pdl`` and
+        ``timestamps`` do not change the result. ``mx_atom`` (another scale layout) is not
         modelled: its cells are none."""
         heads = w_uv.shape[0]
         group = heads // cp_size
@@ -319,7 +293,6 @@ class K3HelixTailOp(OpWrapper):
         timestamps: torch.Tensor | None,
         loopback: bool,
         mx_atom: bool,
-        ull2: bool,
     ) -> None:
         # Every CTA polls after its own pushes: more CTAs than SMs can leave a sender unscheduled
         # behind a spinning receiver.

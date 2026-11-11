@@ -32,6 +32,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__helix8_moeep8.constants import (  # noqa: E501
+    CONSTANTS,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.dflash import (
     K3DFlashWorker,
 )
@@ -115,7 +118,9 @@ class _UnifiedK3Manager(KimiK3HybridCacheManager):
 
 def _worker(manager=None):
     worker = K3DFlashWorker(
-        SimpleNamespace(attention_backend="CUTEDSL", max_draft_len=7), Mapping()
+        SimpleNamespace(attention_backend="CUTEDSL", max_draft_len=7),
+        Mapping(),
+        constants=CONSTANTS,
     )
     # What _lazy_init_ctx_buffers sets before binding: a manager that is the target metadata's
     # own is the unified cache, and the MLA drafter keeps one latent per token.

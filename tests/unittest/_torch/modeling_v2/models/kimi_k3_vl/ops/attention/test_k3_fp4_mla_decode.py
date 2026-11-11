@@ -14,12 +14,12 @@
 # limitations under the License.
 """K3's FP4 MLA generation decode (``ops/attention/_fp4_mla_decode``).
 
-Host side, with the plan and decode kernels stubbed: the step's plan geometry from the target's
-features, and the plan key and metadata-launch count over a step (the lengths fused with the plan
-by the step's first caller, the plan alone when the backend wrote the lengths, nothing after; the
-backend's own plan untouched). On SM107: the decode against the FP4 MLA backend's decode of the
-same cache and query rows under each target's settings, and the reduction's programmatic launch
-bitwise.
+Host side, with the plan and decode kernels stubbed: the step's plan geometry with and without
+the page plan, and the plan key over a step (the lengths fused with the plan by the step's first
+caller, the plan alone when the backend wrote the lengths, nothing after; the backend's own plan
+untouched). On SM107: the decode against the FP4 MLA backend's decode of the same cache and query
+rows under each target's settings (``page_plan`` / ``reduce_pdl``), and the reduction's
+programmatic launch bitwise.
 
 The FP4 cache helpers are those of ``test_k3_mla_q_fused.py`` (same directory).
 """
@@ -68,9 +68,9 @@ def _stub_kernels(monkeypatch):
     monkeypatch.setattr(
         dec,
         "_fp4_mla_packed_rows_per_seq",
-        lambda heads, query_len: 0
-        if heads * query_len > 1024
-        else -(-heads * query_len // 128) * 128,
+        lambda heads, query_len: (
+            0 if heads * query_len > 1024 else -(-heads * query_len // 128) * 128
+        ),
     )
     monkeypatch.setattr(
         dec,
@@ -97,13 +97,13 @@ def _geometry_metadata(device, num_requests=4):
 
 
 @pytest.mark.cpu_only
-def test_plan_geometry_follows_the_features(monkeypatch, k3_features):
+def test_plan_geometry_follows_the_page_plan(monkeypatch):
     dec, kernels = _stub_kernels(monkeypatch)
     device = torch.device("cpu")
     md = _geometry_metadata(device)
 
     def geometry(**kwargs):
-        args = dict(num_heads=96, query_len=8, num_requests=4, helix_kv_bounds=None)
+        args = dict(num_heads=96, query_len=8, num_requests=4, helix_kv_bounds=None, page_plan=True)
         args.update(kwargs)
         return dec.packed_plan_geometry(md, device=device, **args)
 
@@ -121,12 +121,10 @@ def test_plan_geometry_follows_the_features(monkeypatch, k3_features):
     assert geometry().key == base.key
     bounds = torch.zeros(32, dtype=torch.int32, device=device)
     assert geometry(helix_kv_bounds=bounds).key != base.key
-    # features.fp4_mla_page_plan off (dep16): a profile past the page-plan one.
-    k3_features(fp4_mla_page_plan=False)
-    no_page_plan = geometry()
+    # Without the page plan (dep16): a profile past the page-plan one.
+    no_page_plan = geometry(page_plan=False)
     assert no_page_plan.split_kv_len == _Kernels.PAGE_PLAN_PROFILE_KV + 1
     assert no_page_plan.profile_tiles == 1024 and no_page_plan.key != base.key
-    k3_features(fp4_mla_page_plan=True)
     # A batch that fills the machine with one task per request keeps the full profile.
     wide = geometry(num_requests=16)
     assert (wide.wave_tasks, wide.split_kv_len, wide.profile_tiles) == (17, 1952 * 256, 2048)
@@ -207,52 +205,20 @@ def test_step_writes_lengths_and_plan_once(monkeypatch):
     state.device_page_table_valid = True
     dec.materialize_page_table(md)
     assert [name for name, _ in calls[5:]] == ["page_table"]
-    # Each metadata kernel counts once; the query mark records the count.
-    assert step.metadata_launches == 6
-    dec.mark_query_launch(md)
-    assert step.query_launch_mark == 6
     with pytest.raises(RuntimeError):
         uniform(md, 12, 3, plan_geometry=geometry)
     with pytest.raises(RuntimeError):
         uniform(md, 7, 2)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_prelaunch_writes_the_step_metadata(monkeypatch):
-    dec, kernels = _stub_kernels(monkeypatch)
-    device = torch.device("cuda", torch.cuda.current_device())
-    md = _lengths_metadata(device)
-    md.page_size = 128
-    md.fp4_mla_state.page_table_stride = 64
-    md.fp4_mla_state.workspaces = {}
-    # Only a generation-only step with the device page table.
-    md.num_contexts = 1
-    assert not dec.prelaunch_generation_metadata(md, num_heads=96, use_helix=False, device=device)
-    md.num_contexts = 0
-    assert dec.prelaunch_generation_metadata(
-        md, num_heads=96, use_helix=False, device=torch.device("cuda")
-    )
-    assert [name for name, _ in kernels.calls] == ["plan", "page_table"]
-    assert kernels.calls[0][1]["generation_lengths"] is not None
-    # An index-less device reuses the plan workspace allocated on the indexed one.
-    assert md.fp4_mla_state.workspaces[PLAN_WS].device == device
-    step = dec._step(md)
-    assert step.plan_key is not None and step.metadata_launches == 2
-    # Later calls of the step find the metadata current.
-    md.fp4_mla_state.device_page_table_valid = True
-    assert dec.prelaunch_generation_metadata(md, num_heads=96, use_helix=False, device=device)
-    assert len(kernels.calls) == 2
-
-
 # ---------------------------------------------------------------------------
 # SM107: the decode itself.
 # ---------------------------------------------------------------------------
 
-# Each target's decode settings (k3_rubin/features.py profiles).
+# Each target's decode settings (K3Sm107Constants.fp4_mla_page_plan / fp4_mla_reduce_pdl).
 _TARGETS = {
-    "helix8": dict(fp4_mla_reduce_pdl=True),
-    "ull": dict(fp4_mla_reduce_pdl=True, fp4_mla_f16_partials=True),
-    "dep16": dict(fp4_mla_page_plan=False),
+    "helix8": dict(page_plan=True, reduce_pdl=True),
+    "dep16": dict(page_plan=False, reduce_pdl=False),
 }
 
 _SEQ_LENS = {
@@ -292,8 +258,9 @@ def _decode_case(seq_lens, seed, helix):
     return mgr, md, qf
 
 
-def _run(md, qf, decode, helix):
-    """One decode of every query row on fresh outputs; returns (output, stats or None)."""
+def _run(md, qf, decode, helix, **settings):
+    """One decode of every query row on fresh outputs (``settings``: K3's ``page_plan`` /
+    ``reduce_pdl``); returns (output, stats or None)."""
     state = md.fp4_mla_state
     num_tokens = md.num_tokens
     q = torch.empty(num_tokens, qf.H, qf.LORA + qf.ROPE, device="cuda", dtype=torch.bfloat16)
@@ -314,6 +281,7 @@ def _run(md, qf, decode, helix):
         prequantized_q_sf=state.prequantized_q_sf,
         q_batch_capacity=state.q_batch_capacity,
         softmax_stats_tensor=stats,
+        **settings,
     )
     torch.cuda.synchronize()
     return out.clone(), None if stats is None else stats.clone()
@@ -334,18 +302,17 @@ def _assert_close_rows(got, ref):
 @pytest.mark.parametrize("helix", [True, False], ids=["helix", "no-helix"])
 @pytest.mark.parametrize("seq_lens", list(_SEQ_LENS.values()), ids=list(_SEQ_LENS))
 @pytest.mark.parametrize("target", list(_TARGETS))
-def test_decode_matches_backend_decode(target, seq_lens, helix, k3_features):
+def test_decode_matches_backend_decode(target, seq_lens, helix):
     """K3's decode against the FP4 MLA backend's decode (its own kernel, plan and reduction) of
     the same cache and query rows, under each target's settings."""
     from tensorrt_llm._torch.attention.backends import fp4_mla
 
     mgr, md, qf = _decode_case(seq_lens, seed=11 + len(seq_lens), helix=helix)
     try:
-        k3_features(**_TARGETS[target])
         ref_out, ref_stats = _run(md, qf, fp4_mla.run_fp4_mla_attention_decode, helix)
         dec = _decode()
         dec.begin_step(md)
-        out, stats = _run(md, qf, dec.run_decode, helix)
+        out, stats = _run(md, qf, dec.run_decode, helix, **_TARGETS[target])
         assert not torch.isnan(out).any()
         _assert_close_rows(out, ref_out)
         if helix:
@@ -358,20 +325,18 @@ def test_decode_matches_backend_decode(target, seq_lens, helix, k3_features):
 
 
 @pytest.mark.parametrize("seq_lens", list(_SEQ_LENS.values()), ids=list(_SEQ_LENS))
-@pytest.mark.parametrize("f16_partials", [False, True], ids=["fp32", "fp16"])
-def test_reduce_pdl_is_bitwise(seq_lens, f16_partials, k3_features):
-    """``features.fp4_mla_reduce_pdl`` only schedules the split reduction: output and Helix
-    statistics bitwise, over repeated steps."""
+@pytest.mark.parametrize("page_plan", [True, False], ids=["page-plan", "no-page-plan"])
+def test_reduce_pdl_is_bitwise(seq_lens, page_plan):
+    """``reduce_pdl`` only schedules the split reduction: output and Helix statistics bitwise,
+    over repeated steps."""
     mgr, md, qf = _decode_case(seq_lens, seed=23 + len(seq_lens), helix=True)
     dec = _decode()
     try:
-        k3_features(fp4_mla_f16_partials=f16_partials, fp4_mla_reduce_pdl=False)
         dec.begin_step(md)
-        ref = _run(md, qf, dec.run_decode, True)
-        k3_features(fp4_mla_f16_partials=f16_partials, fp4_mla_reduce_pdl=True)
+        ref = _run(md, qf, dec.run_decode, True, page_plan=page_plan, reduce_pdl=False)
         for _ in range(2):
             dec.begin_step(md)
-            got = _run(md, qf, dec.run_decode, True)
+            got = _run(md, qf, dec.run_decode, True, page_plan=page_plan, reduce_pdl=True)
             assert torch.equal(got[0].view(torch.int16), ref[0].view(torch.int16))
             assert torch.equal(got[1].view(torch.int32), ref[1].view(torch.int32))
     finally:

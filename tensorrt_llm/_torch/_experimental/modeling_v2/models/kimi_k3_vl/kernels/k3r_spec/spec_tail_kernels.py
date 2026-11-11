@@ -29,12 +29,11 @@ produces the same values:
 Launch shapes depend only on host batch sizes, so all of them are CUDA-graph
 capturable.
 
-Kimi K3 Rubin (private copy): the kernels below the main ones are Jonas Li's
-env-gated tail fusions from ``user/jonasl/k3-rubin-agentic-opt`` (189fe67b81):
-``TLLM_SPEC_TAIL_FUSION`` (:func:`fused_strict_accept`) and ``TLLM_DSPARK_TAIL_V2``
-(fused selection + acceptance, the column-parallel block-table decode, the MLA
-drafter's context/block preparation and its context latents on a side stream).
-Unset, the main kernels above are what runs.
+The kernels below the main ones are fused tails a caller selects with the
+target's constants: ``spec_tail_fusion`` (:func:`fused_strict_accept`) and
+``dspark_tail_v2`` (fused selection + acceptance, the column-parallel block-table
+decode, the MLA drafter's context/block preparation and its context latents on a
+side stream). Without them, the main kernels above are what runs.
 """
 
 from typing import NamedTuple, Optional
@@ -42,8 +41,6 @@ from typing import NamedTuple, Optional
 import torch
 import triton
 import triton.language as tl
-
-from ...sm107_parts.features import active as _features
 
 _VP_INT32_MAX = tl.constexpr(2**31 - 1)
 
@@ -490,7 +487,7 @@ def store_context_latents(
 
 
 # --------------------------------------------------------------------------------------------------
-# Jonas Li's env-gated tail fusions (k3-rubin-agentic-opt).
+# Fused tails (the target's spec_tail_fusion / dspark_tail_v2 constants select them).
 # --------------------------------------------------------------------------------------------------
 
 # Largest number of generation requests the one-program fused tail kernels
@@ -500,23 +497,6 @@ TAIL_V2_MAX_GENS = 16
 
 # Columns per program of the parallel draft block-table decode.
 BLOCK_TABLE_CHUNK = _BLOCK_TABLE_BLOCK
-
-
-def spec_tail_fusion_enabled() -> bool:
-    """Whether ``TLLM_SPEC_TAIL_FUSION=1`` selects the fused tail kernels."""
-    return _features().spec_tail_fusion
-
-
-def tail_v2_enabled() -> bool:
-    """Whether ``TLLM_DSPARK_TAIL_V2=1`` (with ``TLLM_SPEC_TAIL_FUSION=1``) selects
-    the second set of fused tail kernels. They write bitwise the values of the
-    paths they replace: the MLA drafter's context and block RoPE kernels with
-    in-kernel table lookups and the block latents stored straight into the
-    paged pool, the column-parallel draft block-table decode, shape-only
-    operands built once instead of every step, and a TP-sharded drafter's
-    context latents computed on a side stream, concurrently with the
-    target-token selection and acceptance."""
-    return spec_tail_fusion_enabled() and _features().dspark_tail_v2
 
 
 @triton.jit

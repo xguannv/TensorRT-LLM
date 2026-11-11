@@ -87,6 +87,7 @@ class K3AttnResNorm(OpWrapper):
                 mxfp8=mxfp8,
                 entry_trigger=entry_trigger,
                 mx_atom=mx_atom,
+                early_trigger=False,
                 rms_eps=1e-6,
                 out_eps=1e-6,
             ),
@@ -137,10 +138,26 @@ class K3AttnResNorm(OpWrapper):
                 True,
             ),
         )
+    ) + (
+        Cell(
+            why="helix8 MoE add + MXFP8 atoms, release after the grid wait: 96 rows, N=9",
+            spec=dict(
+                rows=96,
+                candidates=9,
+                hidden=7168,
+                addends=2,
+                mxfp8=True,
+                entry_trigger=False,
+                mx_atom=True,
+                early_trigger=True,
+                rms_eps=1e-6,
+                out_eps=1e-6,
+            ),
+        ),
     )
 
     note = """
-    Decode-size fusion: up to TRTLLM_K3_ATTN_RES_PDL_MAX_M rows (helix8: 128,
+    Decode-size fusion: up to the target's attn_res_pdl_max_m rows (helix8: 128,
     others: 64) where `kernels/k3_attn_res.can_use_k3_attn_res` holds (H 7168,
     2 <= N <= 12, M <= 1024, contiguous BF16). Inputs are read-only.
     A cluster of 4 or 8 CTAs per token (`fast_cluster_size`) loads the weights
@@ -149,12 +166,14 @@ class K3AttnResNorm(OpWrapper):
     has the bits of the unfused adds; the normed output can differ from the
     C++ per-token kernels by one BF16 step in a few elements (other sum order).
     A process-wide cache (`kernels/k3_attn_res._compiled`) holds one compiled
-    kernel per (N, add mode, PDL, cluster, mxfp8, entry_trigger, mx_atom);
+    kernel per (N, add mode, PDL, cluster, mxfp8, entry_trigger, mx_atom,
+    early_trigger);
     compile each key eagerly before CUDA-graph capture. TRTLLM_ENABLE_PDL is
     read at import. `entry_trigger` releases the dependent grid at kernel entry
     and prefers the largest shared-memory carve-out; `mx_atom` (M <= 128) stores
     the scales of one 128-row block of the mid-M GEMM's atoms, rows past M are
-    not written.
+    not written. `early_trigger` releases the dependent grid right after
+    griddepcontrol.wait instead of after the last store.
     """
 
     def __call__(
@@ -170,6 +189,7 @@ class K3AttnResNorm(OpWrapper):
         mxfp8: bool = False,
         entry_trigger: bool = False,
         mx_atom: bool = False,
+        early_trigger: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         if len(addends) == 2:
             routed, shared = addends
@@ -186,18 +206,43 @@ class K3AttnResNorm(OpWrapper):
                     out_eps,
                     entry_trigger,
                     mx_atom,
+                    early_trigger=early_trigger,
                 )
             return _kernel.k3_attn_res_moe_add_rmsnorm(
-                layer, routed, shared, block, res_weight, rms_weight, out_weight, rms_eps, out_eps
+                layer,
+                routed,
+                shared,
+                block,
+                res_weight,
+                rms_weight,
+                out_weight,
+                rms_eps,
+                out_eps,
+                early_trigger=early_trigger,
             )
         if mxfp8:
             raise ValueError("the MXFP8 output is served with the (routed, shared) addends only")
         if addends:
             return _kernel.k3_attn_res_add_rmsnorm(
-                layer, addends[0], block, res_weight, rms_weight, out_weight, rms_eps, out_eps
+                layer,
+                addends[0],
+                block,
+                res_weight,
+                rms_weight,
+                out_weight,
+                rms_eps,
+                out_eps,
+                early_trigger=early_trigger,
             )
         return _kernel.k3_attn_res_rmsnorm(
-            layer, block, res_weight, rms_weight, out_weight, rms_eps, out_eps
+            layer,
+            block,
+            res_weight,
+            rms_weight,
+            out_weight,
+            rms_eps,
+            out_eps,
+            early_trigger=early_trigger,
         )
 
     def reference(
@@ -213,11 +258,13 @@ class K3AttnResNorm(OpWrapper):
         mxfp8: bool = False,
         entry_trigger: bool = False,
         mx_atom: bool = False,
+        early_trigger: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """The adds in FP32 rounded to BF16 where the kernel rounds, then the family
         ``attn_res_fwd`` mixture and the twice-rounded trailing RMSNorm. With ``mxfp8`` the
         scales come row-major ``[M, 224]``, or with ``mx_atom`` at :func:`mx_atom_offsets` of a
-        zeroed buffer of the op's size. ``entry_trigger`` only changes scheduling."""
+        zeroed buffer of the op's size. ``entry_trigger`` and ``early_trigger`` only change
+        scheduling."""
         if len(addends) == 2:
             routed, shared = addends
             moe = (routed.float() + shared.float()).to(torch.bfloat16)
@@ -254,6 +301,7 @@ class K3AttnResNorm(OpWrapper):
         mxfp8: bool = False,
         entry_trigger: bool = False,
         mx_atom: bool = False,
+        early_trigger: bool = False,
     ) -> None:
         # The launcher does not re-validate: a strided, mis-sized or foreign-device operand is
         # read as dense rows of 7168 and gives a plausible wrong mix.

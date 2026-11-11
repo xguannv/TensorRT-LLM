@@ -11,9 +11,12 @@ The checkpoint declares the vision-language wrapper, and the language model's
 shape lives in its ``text_config``, so that is what this tree reads. The MXFP4
 targets on sm100 are text-only: they load no vision tower and refuse image input.
 
-The NVFP4 checkpoint on sm107 (Rubin) has one target, ``kimi_k3_nvfp4__sm_107__default``,
-which derives its sharding from the mapping and serves the disaggregated
-deployments listed in ``_sm107_parallel``.
+The NVFP4 checkpoint on sm107 (Rubin) has one target per disaggregated layout
+(``_SM107_TARGETS``): the one-GPU DWDP context servers of every deployment, and
+the generation servers over Helix CP8 (MoE EP8, or MoE TP2 x EP4) and over
+attention DP16. ``_sm107_target`` reads the layout from the mapping, the MoE
+backend and the context-parallel config; the layouts exclude each other, so the
+disaggregated role is not needed to choose.
 """
 
 from __future__ import annotations
@@ -119,43 +122,71 @@ _SM107_SHAPE_FIELDS = (
 )
 
 
-def _sm107_parallel(mapping) -> str:
-    """The deployment this mapping is, or a description of it when it is none of them.
+# Target directory -> the layout it serves (for the NoTarget message).
+_SM107_TARGETS = {
+    "kimi_k3_nvfp4__sm_107__tp1": (
+        "context servers: one rank (world 1), DWDP, moe_config.backend CUTEDSL"
+    ),
+    "kimi_k3_nvfp4__sm_107__helix8_moeep8": (
+        "generation over Helix CP8 (tp 1, no attention DP, NCCL off for the all-to-all), "
+        "MoE EP8, moe_config.backend CUTEDSL_FC12"
+    ),
+    "kimi_k3_nvfp4__sm_107__helix8_moetp2ep4": (
+        "generation over Helix CP8 (tp 1, no attention DP, NCCL off for the all-to-all), "
+        "MoE TP2 x EP4, moe_config.backend CUTEDSL_FC12"
+    ),
+    "kimi_k3_nvfp4__sm_107__dep16": (
+        "generation with attention DP over 16 ranks (tp 16), MoE EP16, "
+        "moe_config.backend MEGAMOE_CUTEDSL"
+    ),
+}
 
-    The sm107 target serves one-rank DWDP context servers (``tp1``), generation over
-    Helix CP8 (``helix8``), over Helix CP16 with the experts split MoE TP4 x EP4
-    (``helix16_moetp4ep4``), and attention DP over 16 ranks (``dep16``).
-    """
+
+def _sm107_target(mapping, llm_args) -> Optional[str]:
+    """The SM107 target directory serving this layout, or None."""
+    backend = llm_args.moe_config.backend
+    moe = (mapping.moe_tp_size, mapping.moe_ep_size)
     helix = mapping.cp_size > 1 and mapping.has_cp_helix()
     if mapping.pp_size != 1:
-        return f"pp{mapping.pp_size}"
-    if mapping.world_size == 1:
-        return "tp1"
-    if helix and not mapping.enable_attention_dp and mapping.tp_size == 1:
-        if mapping.cp_size == 8:
-            return "helix8"
-        if mapping.cp_size == 16 and (mapping.moe_tp_size, mapping.moe_ep_size) == (4, 4):
-            return "helix16_moetp4ep4"
+        return None
+    if (
+        mapping.world_size == 1
+        and mapping.cp_size == 1
+        and moe == (1, 1)
+        and backend == "CUTEDSL"
+        and getattr(llm_args, "dwdp_config", None) is not None
+    ):
+        return "kimi_k3_nvfp4__sm_107__tp1"
+    if (
+        helix
+        and mapping.cp_size == 8
+        and mapping.tp_size == 1
+        and not mapping.enable_attention_dp
+        and backend == "CUTEDSL_FC12"
+        and mapping.cp_config.get("use_nccl_for_alltoall") is False
+    ):
+        if moe == (1, 8):
+            return "kimi_k3_nvfp4__sm_107__helix8_moeep8"
+        if moe == (2, 4):
+            return "kimi_k3_nvfp4__sm_107__helix8_moetp2ep4"
     if (
         mapping.enable_attention_dp
         and mapping.world_size == 16
         and mapping.tp_size == 16
         and mapping.cp_size == 1
+        and moe == (1, 16)
+        and backend == "MEGAMOE_CUTEDSL"
     ):
-        return "dep16"
-    return (
-        f"world_size={mapping.world_size} tp={mapping.tp_size} cp={mapping.cp_size} "
-        f"helix={helix} attention_dp={mapping.enable_attention_dp} "
-        f"moe_tp={mapping.moe_tp_size} moe_ep={mapping.moe_ep_size}"
-    )
+        return "kimi_k3_nvfp4__sm_107__dep16"
+    return None
 
 
 def _check_sm107(model_config: ModelConfig, llm_args: TorchLlmArgs) -> str:
-    """Return the sm107 deployment name, or raise ``NoTarget`` saying why the target does not fit."""
+    """Return the sm107 target directory, or raise ``NoTarget`` saying why none fits."""
     pretrained_config = model_config.pretrained_config
     text = getattr(pretrained_config, "text_config", None)
     if text is None:
-        raise NoTarget("the sm107 Kimi K3 target needs the composite checkpoint's text_config")
+        raise NoTarget("the sm107 Kimi K3 targets need the composite checkpoint's text_config")
     shape = tuple(getattr(text, name, None) for name in _SM107_SHAPE_FIELDS)
     if shape != _SM107_SHAPE:
         raise NoTarget(f"text_config shape {shape} is not Kimi K3's {_SM107_SHAPE}")
@@ -166,32 +197,37 @@ def _check_sm107(model_config: ModelConfig, llm_args: TorchLlmArgs) -> str:
         if name.endswith(".experts")
     ]
     if not experts or any(value.get("quant_algo") != "NVFP4" for value in experts):
-        raise NoTarget("the sm107 Kimi K3 target needs the NVFP4 checkpoint (NVFP4 routed experts)")
+        raise NoTarget("the sm107 Kimi K3 targets need the NVFP4 checkpoint (NVFP4 routed experts)")
     spec_config = model_config.spec_config
-    if spec_config is not None and not spec_config.spec_dec_mode.is_dspark():
+    if spec_config is None or not spec_config.spec_dec_mode.is_dspark():
         raise NoTarget(
-            f"the sm107 Kimi K3 target runs DSpark or no speculative decoding, got "
-            f"{spec_config.spec_dec_mode.name}"
+            "the sm107 Kimi K3 targets run DSpark speculative decoding, got "
+            f"{spec_config.spec_dec_mode.name if spec_config is not None else 'none'}"
         )
     kv_algo = engine_kv_cache_quant_algo(model_config, llm_args)
-    if kv_algo not in (QuantAlgo.NVFP4, QuantAlgo.FP8):
-        raise NoTarget(f"the sm107 Kimi K3 target runs an NVFP4 or FP8 KV cache, got {kv_algo}")
+    if kv_algo != QuantAlgo.NVFP4:
+        raise NoTarget(f"the sm107 Kimi K3 targets run an NVFP4 KV cache, got {kv_algo}")
     mapping = model_config.mapping
-    parallel = _sm107_parallel(mapping)
-    if parallel not in ("tp1", "helix8", "helix16_moetp4ep4", "dep16"):
+    backend = llm_args.moe_config.backend
+    target = _sm107_target(mapping, llm_args)
+    seen = (
+        f"world_size={mapping.world_size} pp={mapping.pp_size} tp={mapping.tp_size} "
+        f"cp={mapping.cp_size} helix={mapping.cp_size > 1 and mapping.has_cp_helix()} "
+        f"attention_dp={mapping.enable_attention_dp} moe_tp={mapping.moe_tp_size} "
+        f"moe_ep={mapping.moe_ep_size} moe_backend={backend} "
+        f"cp_nccl_alltoall={mapping.cp_config.get('use_nccl_for_alltoall')} "
+        f"dwdp={getattr(llm_args, 'dwdp_config', None) is not None}"
+    )
+    if target is None:
+        layouts = "; ".join(f"{name}: {layout}" for name, layout in _SM107_TARGETS.items())
         raise NoTarget(
-            f"{parallel}: the sm107 Kimi K3 target serves one rank per process (DWDP context "
-            "servers), Helix over 8 ranks, Helix over 16 ranks with MoE TP4 x EP4, or attention "
-            "DP over 16 ranks"
+            f"{seen}: no sm107 Kimi K3 target serves this layout. The targets: {layouts}"
         )
     logger.info(
-        f"modeling_v2 kimi_k3_vl: parallel={parallel} world_size={mapping.world_size} "
-        f"rank={mapping.rank} tp={mapping.tp_size} cp={mapping.cp_size} "
-        f"attention_dp={mapping.enable_attention_dp} moe_tp={mapping.moe_tp_size} "
-        f"moe_ep={mapping.moe_ep_size} dwdp_size={getattr(mapping, 'dwdp_size', None)} "
-        f"kv={kv_algo} spec={spec_config.spec_dec_mode.name if spec_config else None}"
+        f"modeling_v2 kimi_k3_vl: {target} rank={mapping.rank} {seen} kv={kv_algo} "
+        f"spec={spec_config.spec_dec_mode.name}"
     )
-    return parallel
+    return target
 
 
 @routes("KimiK3ForConditionalGeneration")
@@ -204,14 +240,26 @@ def route(
     of modeling code.
     """
     if compute_capability == _SM107:
-        parallel = _check_sm107(model_config, llm_args)
-        from .sm107_parts import features
+        target = _check_sm107(model_config, llm_args)
+        if target == "kimi_k3_nvfp4__sm_107__tp1":
+            from .kimi_k3_nvfp4__sm_107__tp1.modeling import ModelingV2KimiK3Nvfp4Sm107Tp1
 
-        # The family SM107 modules read the deployment's feature profile when imported.
-        features.select(parallel)
-        from .kimi_k3_nvfp4__sm_107__default.modeling import ModelingV2KimiK3Nvfp4Sm107Default
+            return ModelingV2KimiK3Nvfp4Sm107Tp1
+        if target == "kimi_k3_nvfp4__sm_107__helix8_moeep8":
+            from .kimi_k3_nvfp4__sm_107__helix8_moeep8.modeling import (
+                ModelingV2KimiK3Nvfp4Sm107Helix8Moeep8,
+            )
 
-        return ModelingV2KimiK3Nvfp4Sm107Default
+            return ModelingV2KimiK3Nvfp4Sm107Helix8Moeep8
+        if target == "kimi_k3_nvfp4__sm_107__helix8_moetp2ep4":
+            from .kimi_k3_nvfp4__sm_107__helix8_moetp2ep4.modeling import (
+                ModelingV2KimiK3Nvfp4Sm107Helix8Moetp2ep4,
+            )
+
+            return ModelingV2KimiK3Nvfp4Sm107Helix8Moetp2ep4
+        from .kimi_k3_nvfp4__sm_107__dep16.modeling import ModelingV2KimiK3Nvfp4Sm107Dep16
+
+        return ModelingV2KimiK3Nvfp4Sm107Dep16
 
     pretrained_config = model_config.pretrained_config
     mapping = model_config.mapping

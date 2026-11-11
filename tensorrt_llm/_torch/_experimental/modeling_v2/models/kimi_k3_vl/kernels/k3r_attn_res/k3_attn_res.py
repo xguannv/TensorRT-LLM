@@ -58,12 +58,8 @@ from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ...sm107_parts.features import active as _features
 from ..k3r_comm import k3_lamport_ar as _lam
 from ..k3r_gemm import k3_fp8w_lowm_mxfp8 as mx_ops
-from . import k3_launch_attrs
-
-_F = _features()
 
 #: Hidden size the kernel is specialized for.
 HIDDEN_SIZE = 7168
@@ -77,9 +73,9 @@ ADD_NONE, ADD_PREFIX, ADD_MOE = 0, 1, 2
 
 #: Programmatic dependent launch unless TRTLLM_ENABLE_PDL=0 (the stack-wide switch).
 _USE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
-#: TRTLLM_K3_ATTN_RES_EARLY_TRIGGER=1: release the dependent grid right after ``griddepcontrol.wait``
-#: instead of after the last store, so the next kernel (a decode projection) can become resident and
-#: stream its weights while this one finishes.
+#: ``early_trigger`` (see run_k3_attn_res): release the dependent grid right after
+#: ``griddepcontrol.wait`` instead of after the last store, so the next kernel (a decode
+#: projection) can become resident and stream its weights while this one finishes.
 #:
 #: Why it is safe in the Kimi-K3 decode graph. Since the trigger follows this kernel's own wait, every
 #: grid upstream of it has completed when a dependent starts; only this grid may still run. The grids
@@ -95,7 +91,6 @@ _USE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 #: and A_mid; the latent and shared-expert all-reduces of the MoE block between A_mid and the next
 #: layer's A_pre). Those kernels call ``cudaGridDependencySynchronize`` before they trigger, so the
 #: next attn_res starts only after this grid completed.
-_EARLY_TRIGGER = _F.attn_res_early_trigger
 
 _THREADS = 256
 _LOG2E = "0f3FB8AA3B"
@@ -587,6 +582,7 @@ class K3AttnResFastKernel:
         mx_atom: bool = False,
         early_poll: bool = False,
         finish_ag: bool = False,
+        early_trigger: bool = False,
     ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
@@ -629,6 +625,8 @@ class K3AttnResFastKernel:
         # Finish the pushed all-reduce before ``griddepcontrol.wait`` (see ``early_poll`` of
         # run_k3_attn_res); without PDL the grid starts after its predecessor anyway.
         self.early_poll = early_poll and use_pdl
+        # Release the dependent grid right after ``griddepcontrol.wait`` (see the module notes).
+        self.early_trigger = early_trigger and use_pdl
         self.n = num_candidates
         self.k = num_candidates - 1
         self.c = cluster
@@ -843,7 +841,7 @@ class K3AttnResFastKernel:
         # ---- wait for the previous grid (early_poll: after the mix, before the first store) ----
         if cutlass.const_expr(self.use_pdl and not self.early_poll):
             _griddepcontrol_wait()
-            if cutlass.const_expr(_EARLY_TRIGGER and not self.entry_trigger):
+            if cutlass.const_expr(self.early_trigger and not self.entry_trigger):
                 _griddepcontrol_launch_dependents()
 
         upd_words = []
@@ -1075,10 +1073,10 @@ class K3AttnResFastKernel:
                     1 if self.finish_ag else 0,
                 )
 
-        # Release at the end unless released at entry or (TRTLLM_K3_ATTN_RES_EARLY_TRIGGER, not
+        # Release at the end unless released at entry or (``early_trigger``, not
         # with early_poll) after the wait.
         if cutlass.const_expr(
-            self.use_pdl and not self.entry_trigger and (self.early_poll or not _EARLY_TRIGGER)
+            self.use_pdl and not self.entry_trigger and (self.early_poll or not self.early_trigger)
         ):
             _bar_sync(4, self.threads)
             _griddepcontrol_launch_dependents()
@@ -1116,6 +1114,7 @@ def _compiled(
     mx_atom: bool = False,
     early_poll: bool = False,
     finish_ag: bool = False,
+    early_trigger: bool = False,
 ):
     kernel = K3AttnResFastKernel(
         num_candidates,
@@ -1132,6 +1131,7 @@ def _compiled(
         mx_atom,
         early_poll,
         finish_ag,
+        early_trigger,
     )
     addr = Int64(1 << 20)
     compiled = cute.compile(
@@ -1154,11 +1154,7 @@ def _compiled(
         Float32(1e-6),
         cuda.CUstream(torch.cuda.current_stream().cuda_stream),
     )
-    # TRTLLM_K3_CUTE_CARVEOUT_FIX=1: the SMs this grid lands on keep the maximum shared-memory
-    # split, so the CTAs of its programmatic dependent (a GEMM with a deep shared-memory weight
-    # ring) can become resident beside it. Without a preference the driver gives these SMs a small
-    # split, and the dependent's CTAs wait for this grid's CTAs to exit.
-    return k3_launch_attrs.apply_shared_carveout(compiled, k3_launch_attrs.MAX_SHARED_CARVEOUT)
+    return compiled
 
 
 @functools.cache
@@ -1235,6 +1231,7 @@ def run_k3_attn_res(
     mx_atom: bool = False,
     early_poll: bool = False,
     finish_ag: bool = False,
+    early_trigger: bool = False,
 ) -> None:
     """Launch on the current stream (inputs are not re-validated; see :func:`can_use_k3_attn_res`).
 
@@ -1305,6 +1302,10 @@ def run_k3_attn_res(
             (``k3_lamport_ar`` "ag"): the addend is ``bf16(y + bf16(slot sum))`` with ``y`` the
             token's all-gather row, the BF16 add of a column-parallel projection's output and
             the all-reduce of the ranks' partials (``ADD_MOE``'s ``bf16(routed + shared)``).
+        early_trigger: (PDL) release the dependent grid right after ``griddepcontrol.wait``
+            instead of after the last store (ignored with ``entry_trigger``; with
+            ``early_poll`` the release stays after the stores). See the module notes for why
+            the Kimi-K3 decode graph allows it. Same bits.
     """
     if early_poll and lamport_finish is None:
         raise ValueError("early_poll needs lamport_finish")
@@ -1343,6 +1344,7 @@ def run_k3_attn_res(
         mx_atom,
         early_poll and use_pdl,
         finish_ag,
+        early_trigger and use_pdl,
     )
     if entry_trigger:
         _prefer_max_carveout(compiled, layer.device.index or 0)
@@ -1380,15 +1382,28 @@ def k3_attn_res_rmsnorm(
     out_weight: torch.Tensor,
     rms_eps: float,
     out_eps: float,
+    *,
+    early_trigger: bool = False,
 ) -> torch.Tensor:
     """Attention-residual mix of ``block`` and ``layer`` followed by RMSNorm.
 
     ``trtllm::attn_res_rmsnorm_fwd`` (``layer [M, 7168]``, ``block [N - 1, M, 7168]``) up to one
-    BF16 rounding step in a small fraction of the output elements.
+    BF16 rounding step in a small fraction of the output elements. ``early_trigger``: see
+    :func:`run_k3_attn_res`.
     """
     output = torch.empty_like(layer)
     run_k3_attn_res(
-        layer, (), block, res_weight, rms_weight, out_weight, rms_eps, out_eps, output, None
+        layer,
+        (),
+        block,
+        res_weight,
+        rms_weight,
+        out_weight,
+        rms_eps,
+        out_eps,
+        output,
+        None,
+        early_trigger=early_trigger,
     )
     return output
 
@@ -1402,11 +1417,14 @@ def k3_attn_res_add_rmsnorm(
     out_weight: torch.Tensor,
     rms_eps: float,
     out_eps: float,
+    *,
+    early_trigger: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(bf16(prefix + addend), output)``: the residual add, then the mix and RMSNorm.
 
     ``trtllm::attn_res_add_rmsnorm_fwd``: the same updated prefix, the output up to one BF16
-    rounding step in a small fraction of the elements.
+    rounding step in a small fraction of the elements. ``early_trigger``: see
+    :func:`run_k3_attn_res`.
     """
     output = torch.empty_like(prefix)
     updated = torch.empty_like(prefix)
@@ -1421,6 +1439,7 @@ def k3_attn_res_add_rmsnorm(
         out_eps,
         output,
         updated,
+        early_trigger=early_trigger,
     )
     return updated, output
 
@@ -1435,12 +1454,14 @@ def k3_attn_res_moe_add_rmsnorm(
     out_weight: torch.Tensor,
     rms_eps: float,
     out_eps: float,
+    *,
+    early_trigger: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(prefix, output)`` with ``prefix = bf16(residual + bf16(routed + shared))``.
 
     The MoE residual update of the previous layer (bit-identical to
     ``kimi_k3_moe_residual._fused_moe_residual_add``) followed by the mix and RMSNorm of
-    :func:`k3_attn_res_rmsnorm` on ``prefix``.
+    :func:`k3_attn_res_rmsnorm` on ``prefix``. ``early_trigger``: see :func:`run_k3_attn_res`.
     """
     output = torch.empty_like(residual)
     prefix = torch.empty_like(residual)
@@ -1455,6 +1476,7 @@ def k3_attn_res_moe_add_rmsnorm(
         out_eps,
         output,
         prefix,
+        early_trigger=early_trigger,
     )
     return prefix, output
 
@@ -1480,10 +1502,12 @@ def k3_attn_res_moe_add_rmsnorm_mx(
     out_eps: float,
     entry_trigger: bool = False,
     mx_atom: bool = False,
+    *,
+    early_trigger: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """:func:`k3_attn_res_moe_add_rmsnorm` plus the MXFP8 form ``(xq, xs)`` of its output;
-    ``entry_trigger`` and ``mx_atom`` (the scales in the mid-M GEMM's layout): see
-    :func:`run_k3_attn_res`."""
+    ``entry_trigger``, ``mx_atom`` (the scales in the mid-M GEMM's layout) and
+    ``early_trigger``: see :func:`run_k3_attn_res`."""
     output = torch.empty_like(residual)
     prefix = torch.empty_like(residual)
     xq, xs = _mxfp8_outputs(residual, mx_atom)
@@ -1501,6 +1525,7 @@ def k3_attn_res_moe_add_rmsnorm_mx(
         mxfp8_out=(xq, xs),
         entry_trigger=entry_trigger,
         mx_atom=mx_atom,
+        early_trigger=early_trigger,
     )
     return prefix, output, xq, xs
 
@@ -1520,6 +1545,7 @@ def _run_lamport_add(
     entry_trigger=False,
     finish_ag=False,
     updated=None,
+    early_trigger=False,
 ):
     if updated is None:
         updated = torch.empty_like(prefix)
@@ -1541,6 +1567,7 @@ def _run_lamport_add(
         early_poll=early_poll,
         entry_trigger=entry_trigger,
         finish_ag=finish_ag,
+        early_trigger=early_trigger,
     )
     return (updated, output) + (tuple(mxfp8_out) if mx else ())
 
@@ -1555,7 +1582,8 @@ _LAMPORT_ADD_DOC = """``(bf16(prefix + addend), output)``: the mix and RMSNorm o
     grid wait and store after it (``early_poll`` of :func:`run_k3_attn_res`, same bits);
     ``entry_trigger``: release the dependent at kernel entry (see :func:`run_k3_attn_res`);
     ``finish_ag`` (one-shot finish): the call carries all-gather rows, the addend is
-    ``bf16(y + bf16(slot sum))`` (``finish_ag`` of :func:`run_k3_attn_res`)."""
+    ``bf16(y + bf16(slot sum))`` (``finish_ag`` of :func:`run_k3_attn_res`); ``early_trigger``:
+    release the dependent right after the grid wait (see :func:`run_k3_attn_res`)."""
 
 
 def k3_attn_res_lamport_add_rmsnorm(
@@ -1577,6 +1605,8 @@ def k3_attn_res_lamport_add_rmsnorm(
     early_poll: bool = False,
     entry_trigger: bool = False,
     finish_ag: bool = False,
+    *,
+    early_trigger: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _run_lamport_add(
         prefix,
@@ -1592,6 +1622,7 @@ def k3_attn_res_lamport_add_rmsnorm(
         early_poll,
         entry_trigger,
         finish_ag,
+        early_trigger=early_trigger,
     )
 
 
@@ -1617,6 +1648,8 @@ def k3_attn_res_lamport_add_rmsnorm_mx(
     early_poll: bool = False,
     entry_trigger: bool = False,
     finish_ag: bool = False,
+    *,
+    early_trigger: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """:func:`k3_attn_res_lamport_add_rmsnorm` plus the MXFP8 form ``(xq, xs)`` of its output."""
     return _run_lamport_add(
@@ -1633,6 +1666,7 @@ def k3_attn_res_lamport_add_rmsnorm_mx(
         early_poll,
         entry_trigger,
         finish_ag,
+        early_trigger=early_trigger,
     )
 
 
@@ -1657,6 +1691,8 @@ def k3_attn_res_lamport_add_rmsnorm_into(
     early_poll: bool = False,
     entry_trigger: bool = False,
     finish_ag: bool = False,
+    *,
+    early_trigger: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """:func:`k3_attn_res_lamport_add_rmsnorm` (``mx``: the ``_mx`` variant) storing the updated
     prefix sum into ``updated`` (contiguous, ``prefix``'s shape and dtype, not overlapping the
@@ -1683,6 +1719,7 @@ def k3_attn_res_lamport_add_rmsnorm_into(
         entry_trigger,
         finish_ag,
         updated=updated,
+        early_trigger=early_trigger,
     )
 
 

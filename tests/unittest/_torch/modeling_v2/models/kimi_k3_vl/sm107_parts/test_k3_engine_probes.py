@@ -33,7 +33,7 @@ import pytest
 from torch import nn
 
 K3_RUBIN = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
-TARGETS = ("tp1", "helix8", "helix16_moetp4ep4", "dep16")
+TARGETS = ("tp1", "helix8_moeep8", "helix8_moetp2ep4", "dep16")
 
 
 def _k3_module(name):
@@ -52,54 +52,59 @@ def _is_property(cls, name):
     return isinstance(inspect.getattr_static(cls, name, None), property)
 
 
-def _select_profile(monkeypatch, target):
-    """Make ``target``'s feature profile the active one for fields read when called."""
-    features = _k3_module("sm107_parts.features")
-    profile = features.PROFILES[target]
-    monkeypatch.setattr(features, "_ACTIVE", profile)
-    return profile
+def _constants(target):
+    """The ``K3Sm107Constants`` the SM107 target ``target`` hard-codes."""
+    return _k3_module(f"kimi_k3_nvfp4__sm_107__{target}.constants").CONSTANTS
+
+
+_TARGET_CLASSES = {
+    "tp1": "ModelingV2KimiK3Nvfp4Sm107Tp1",
+    "helix8_moeep8": "ModelingV2KimiK3Nvfp4Sm107Helix8Moeep8",
+    "helix8_moetp2ep4": "ModelingV2KimiK3Nvfp4Sm107Helix8Moetp2ep4",
+    "dep16": "ModelingV2KimiK3Nvfp4Sm107Dep16",
+}
 
 
 @pytest.mark.parametrize("target", TARGETS)
-def test_runtime_hooks_reach_the_engine(monkeypatch, target):
-    """``TLLM_SPEC_HEAD_FUSION`` (the decode step's head) and ``TRTLLM_K3_ULL_STEP_PREP`` (the
-    packed step inputs): the engine arms them only from the ``RuntimeHooks`` it reads off the
-    outermost model (``runtime_hooks_of``), which is the package's VL wrapper. The wrapper must
-    hand on the text model's hooks, and the text model must declare exactly the hooks its target's
-    profile turns on; everything else stays at the default."""
-    from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, runtime_hooks_of
-
-    spec_decode_head = _k3_module("kernels.k3r_spec.spec_decode_head").spec_decode_head
-    profile = _select_profile(monkeypatch, target)
-    text = _bare(_k3_module("sm107_parts.modeling").KimiK3DefaultForCausalLM)
-    wrapper = _bare(_k3_module("sm107_parts.modeling").KimiK3Sm107ForConditionalGeneration)
-    wrapper.llm = text
-
-    hooks = runtime_hooks_of(wrapper)
-    assert hooks == runtime_hooks_of(text)
-    assert (hooks.decode_prologue is spec_decode_head) == profile.embedding_gather
-    assert hooks.pack_step_inputs == profile.pack_step_inputs
-    assert hooks.pack_spec_rng_uploads == profile.pack_step_inputs
-    assert (
-        dataclasses.replace(
-            hooks, decode_prologue=None, pack_step_inputs=False, pack_spec_rng_uploads=False
-        )
-        == DEFAULT_RUNTIME_HOOKS
+def test_runtime_hooks_reach_the_engine(target):
+    """The speculative decode step's head (``spec_head_fusion``, ``decode_prologue``) and the
+    PyTorch memory margin (``torch_mem_safety_margin``): the engine arms them only from the
+    ``RuntimeHooks`` it reads off the outermost model (``runtime_hooks_of``), the target's
+    registered class. It must hand on the text model's hooks plus the target's margin, and the
+    text model must declare exactly the hooks its target's constants turn on; everything else
+    stays at the default."""
+    from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
+        DEFAULT_RUNTIME_HOOKS,
+        RuntimeHooks,
+        runtime_hooks_of,
     )
 
+    spec_decode_head = _k3_module("kernels.k3r_spec.spec_decode_head").spec_decode_head
+    constants = _constants(target)
+    text = _bare(_k3_module("sm107_parts.modeling").KimiK3DefaultForCausalLM)
+    text.k3_constants = constants
+    outer_cls = getattr(
+        _k3_module(f"kimi_k3_nvfp4__sm_107__{target}.modeling"), _TARGET_CLASSES[target]
+    )
+    assert outer_cls.K3_CONSTANTS is constants
+    outer = _bare(outer_cls)
+    outer.llm = text
 
-def test_runtime_hooks_are_on_where_the_recipes_set_them():
-    """The recipes set ``TLLM_SPEC_HEAD_FUSION=1`` on helix8 and helix16 and
-    ``TRTLLM_K3_ULL_STEP_PREP=1`` on helix16 only."""
-    features = _k3_module("sm107_parts.features")
-    head = {t for t in TARGETS if features.PROFILES[t].embedding_gather}
-    pack = {t for t in TARGETS if features.PROFILES[t].pack_step_inputs}
-    assert head == {"helix8", "helix16_moetp4ep4"}
-    assert pack == {"helix16_moetp4ep4"}
+    hooks = runtime_hooks_of(outer)
+    text_hooks = runtime_hooks_of(text)
+    assert (text_hooks.decode_prologue is spec_decode_head) == constants.spec_head_fusion
+    assert dataclasses.replace(text_hooks, decode_prologue=None) == DEFAULT_RUNTIME_HOOKS
+    if "torch_mem_safety_margin" in {f.name for f in dataclasses.fields(RuntimeHooks)}:
+        assert hooks.torch_mem_safety_margin == constants.torch_mem_safety_margin == 4 * 1024**3
+        assert dataclasses.replace(hooks, torch_mem_safety_margin=None) == dataclasses.replace(
+            text_hooks, torch_mem_safety_margin=None
+        )
+    else:
+        assert hooks == text_hooks
 
 
 def test_spec_decode_head_reads_main_names():
-    """``kernels.spec_decode_head`` (``decode_prologue`` on helix8 / helix16) reads main's preparer
+    """``kernels.spec_decode_head`` (``decode_prologue`` on the generation targets) reads main's preparer
     and metadata directly: the overlap switch, the previous step's offsets, the helix buffers and
     the per-token validity flag. ``preprocess_inputs`` must run the prologue before its own head
     and read the same names, so the two write the same step."""
@@ -167,11 +172,10 @@ def test_routed_experts_tune_the_routing_tile_with_mains_runners():
 
 
 def test_latent_down_fusion_feeds_the_fc12_experts():
-    """``TRTLLM_K3_LD_FUSED`` (helix8, helix16): the latent down projection hands the routed
-    experts its own NVFP4 output only where they run the FC12 kernels, whose input is quantized
-    with ``fp4_quantize`` against ``fc31_input_scale``, as k3_latent_down_fp4 quantizes it."""
-    features = _k3_module("sm107_parts.features")
-    assert {t for t in TARGETS if features.PROFILES[t].ld_fused} == {"helix8", "helix16_moetp4ep4"}
+    """``ld_fused`` (both helix8 targets): the latent down projection hands the routed experts its
+    own NVFP4 output only where they run the FC12 kernels, whose input is quantized with
+    ``fp4_quantize`` against ``fc31_input_scale``, as k3_latent_down_fp4 quantizes it."""
+    assert {t for t in TARGETS if _constants(t).ld_fused} == {"helix8_moeep8", "helix8_moetp2ep4"}
     source = inspect.getsource(
         _k3_module("sm107_parts.moe_runtime").K3MoERuntime._fused_latent_input
     )
@@ -182,138 +186,24 @@ def test_latent_down_fusion_feeds_the_fc12_experts():
     "target, expected",
     [
         ("tp1", 0),
-        ("helix8", 16),
-        ("helix16_moetp4ep4", 16),
+        ("helix8_moeep8", 16),
+        ("helix8_moetp2ep4", 16),
         ("dep16", 0),
     ],
 )
-def test_routed_experts_sm_reserve_follows_the_profile(monkeypatch, target, expected):
-    """Where B's recipes set the FC12 switches: ``TRTLLM_K3_FC12_SM_RESERVE=16`` on helix8
-    (beside the shared expert confined to ``TRTLLM_K3_SHARED_SM=16`` SMs); die-major weights
-    (``TRTLLM_K3_FC12_DIE_LAYOUT``) are not available and only logged. On helix16
-    B's small-batch experts kernel ran on 196 / 204 / 196 of the 212 SMs at 8 / 16 / 32 rows,
-    beside the 16-CTA persistent shared expert of the column-parallel tail. Only the FC12 kernels
-    take a reserve."""
+def test_routed_experts_sm_reserve_follows_the_target(target, expected):
+    """The helix8 targets leave 16 SMs of the FC12 grids to the shared expert, whose GEMMs are
+    confined to ``shared_sm`` = 16 SMs; die-major weights (``fc12_die_major``) are not available
+    yet and only logged. Only the FC12 kernels take a reserve."""
     moe_runtime = _k3_module("sm107_parts.moe_runtime")
-    profile = _k3_module("sm107_parts.features").PROFILES[target]
-    monkeypatch.setattr(moe_runtime, "_K3_SHARED_SM", profile.shared_sm)
-    monkeypatch.setattr(moe_runtime, "_K3_FC12_DIE_MAJOR", profile.fc12_die_major)
+    constants = _constants(target)
+    kwargs = dict(shared_sm=constants.shared_sm, fc12_die_major=constants.fc12_die_major)
     fc12 = SimpleNamespace(kernels="CUTEDSL_FC12", sm_reserve=0)
-    moe_runtime._k3_routed_backend_opt_ins(fc12, column_parallel_tail=profile.ull2_coll_cp_tail)
+    moe_runtime._k3_routed_backend_opt_ins(fc12, **kwargs)
     assert fc12.sm_reserve == expected
     other = SimpleNamespace(kernels="CUTEDSL", sm_reserve=0)
-    moe_runtime._k3_routed_backend_opt_ins(other, column_parallel_tail=profile.ull2_coll_cp_tail)
+    moe_runtime._k3_routed_backend_opt_ins(other, **kwargs)
     assert other.sm_reserve == 0
-
-
-class _RoutedCalled(Exception):
-    """Raised by a stand-in for the routed experts to stop the MoE tail right after them."""
-
-
-def _routed_experts_push(runtime, num_tokens):
-    """The ``output_push`` the MoE tail of a ``num_tokens``-row forward calls the routed experts
-    with (``None``: none)."""
-    import torch
-
-    pushes = []
-
-    def routed_output(output_push=None):
-        pushes.append(output_push)
-        raise _RoutedCalled
-
-    rows = torch.zeros(num_tokens, runtime.hidden_size)
-    with pytest.raises(_RoutedCalled):
-        runtime._rp_tail_forward(routed_output, rows, None, rows, None, True)
-    assert len(pushes) == 1
-    return pushes[0]
-
-
-@pytest.mark.parametrize("target", TARGETS)
-def test_one_kernel_tail_requests_the_output_push(target, monkeypatch):
-    """``TRTLLM_K3_ULL_TAIL1`` with ``TRTLLM_K3_ULL2_COLL_CP_TAIL`` (helix16 generation): on the
-    column-parallel tail of at most ``k3_moe_tail1.MAX_M`` rows the routed experts are called with
-    ``output_push``, the latent workspace whose slots k3_moe_tail1 polls, where they push those
-    rows (``K3SmallBatchExperts.applies``); every other tail calls them without one."""
-    import torch
-
-    routed = _k3_module("sm107_parts.moe")
-    assert "output_push" in inspect.signature(routed.K3RoutedExperts.forward).parameters
-
-    LamportWorkspaceView = _k3_module("sm107_parts.layers").LamportWorkspaceView
-    moe_runtime = _k3_module("sm107_parts.moe_runtime")
-    tail1 = _k3_module("kernels.k3r_moe.k3_moe_tail1")
-    profile = _k3_module("sm107_parts.features").PROFILES[target]
-    monkeypatch.setattr(moe_runtime, "_K3_ULL2_COLL_CP_TAIL", profile.ull2_coll_cp_tail)
-    world = 16
-    latent = LamportWorkspaceView(
-        world=world,
-        rank=0,
-        buffer=torch.empty(0),
-        mc_base=0,
-        peer_ptrs=torch.empty(0, dtype=torch.int64),
-        flags=torch.zeros(9, dtype=torch.uint32),
-        bytes_per_buffer=0,
-    )
-    runtime = _bare(moe_runtime.K3MoERuntime)
-    runtime.hidden_size = tail1.HIDDEN
-    runtime.moe_hidden_size = tail1.LATENT
-    runtime.shared_expert_stream = None
-    # The small-batch kernel pushes up to 32 rows.
-    runtime.small_experts = SimpleNamespace(applies=lambda num_tokens: 1 <= num_tokens <= 32)
-    # The tail's workspaces and k3_moe_tail1's operands as construction and loading build them;
-    # the column-parallel tail serves every row count here.
-    runtime._cp_ws = SimpleNamespace(world=world)
-    runtime._cp_latent_ws = SimpleNamespace(world=world, rank=0)
-    runtime._cp_latent_push = latent
-    runtime._tail1_wexp = torch.ones(tail1.HIDDEN // 128, tail1.LATENT // 128, dtype=torch.uint8)
-    runtime._cp_tail_applies = lambda num_tokens, target: True
-
-    pushed = [m for m in range(1, 33) if _routed_experts_push(runtime, m) is latent]
-    expected = list(range(1, tail1.MAX_M + 1)) if profile.ull2_coll_cp_tail else []
-    assert pushed == expected
-
-    # Experts that do not push (no small-batch kernel, a communication strategy) keep the tail.
-    runtime.small_experts = SimpleNamespace(applies=lambda num_tokens: False)
-    assert _routed_experts_push(runtime, 1) is None
-
-
-@pytest.mark.parametrize(
-    "change, max_tokens",
-    [
-        ({}, 32),
-        ({"kernels": "CUTEDSL"}, 0),
-        ({"intermediate_size_per_partition": 100}, 0),
-    ],
-)
-def test_small_batch_experts_serve_the_fc12_calls_of_at_most_32_tokens(change, max_tokens):
-    """``K3SmallBatchExperts`` (helix8, helix16 generation) takes the forwards of 1..32 tokens of
-    routed experts running the FC12 kernels; the published routing word exists only on MoE-TP
-    slices once the counters do."""
-    import torch
-
-    small_batch = _k3_module("sm107_parts.moe")
-    op = _k3_module("kernels.k3r_moe.k3_small_batch_moe_op")
-    kernel = _k3_module("kernels.k3r_moe.k3_small_batch_moe")
-    backend = SimpleNamespace(
-        intermediate_size_per_partition=change.get("intermediate_size_per_partition", 768),
-        hidden_size=3584,
-        expert_size_per_partition=224,
-        tp_size=4,
-    )
-    routed = SimpleNamespace(backend=backend, kernels=change.get("kernels", "CUTEDSL_FC12"))
-    experts = small_batch.K3SmallBatchExperts(routed)
-    assert experts.max_tokens == max_tokens
-    assert [n for n in range(40) if experts.applies(n)] == list(range(1, max_tokens + 1))
-    assert experts.published_routing_word(8) is None
-    experts.counters = op.new_small_batch_moe_counters(torch.device("cpu"))
-    word = experts.published_routing_word(8)
-    if max_tokens:
-        assert word.data_ptr() == experts.counters[kernel.CTR_ROUTE].data_ptr()
-        assert experts.published_routing_word(33) is None
-        backend.tp_size = 1
-        assert experts.published_routing_word(8) is None
-    else:
-        assert word is None
 
 
 def test_private_persistent_grids_take_the_shared_sm_reserve(monkeypatch):
@@ -350,7 +240,7 @@ def test_fp8_kv_layer_selector_on_the_cache_policy():
 
 
 def test_fp4_mla_probe_on_trtllm_attention():
-    """The FP4 MLA paths (packed decode, ``TRTLLM_K3_ULL4_MLA_PLAN_EARLY``) key off
+    """The FP4 MLA paths (packed decode) key off
     ``mqa.uses_fp4_mla_attention`` on main's ``TrtllmAttention``."""
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
@@ -471,8 +361,8 @@ def test_dspark_latent_cache_helix_mapping():
     unifies the draft KV with a CP > 1 target only when the drafter reports
     ``reads_helix_sharded_ctx_pages`` (``_dflash_unify_blocker``), which the private drafter does
     when its latent cache is page-sharded. The sharding comes from the target's helix CP mapping:
-    tp = 1 and cp over the repurposed TP group, on the target's CP ranks, with the target's
-    all-to-all transport for ``TRTLLM_K3_ULL2_DRAFT_A2A``."""
+    tp = 1 and cp over the repurposed TP group, on the target's CP ranks, with the NCCL all-to-all
+    exchange."""
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
     from tensorrt_llm.mapping import CpType, Mapping
 
@@ -498,12 +388,11 @@ def test_dspark_latent_cache_helix_mapping():
             cp_config={"cp_type": CpType.HELIX, "use_nccl_for_alltoall": False},
         )
         repurposed = helix.repurpose_helix_cp_to_tp()
-        inherited = shard(repurposed, helix, inherit_cp_config=True)
-        assert (inherited.tp_size, inherited.cp_size, inherited.pp_size) == (1, 8, 1)
-        assert inherited.has_cp_helix()
-        assert (inherited.cp_rank, inherited.rank) == (helix.cp_rank, rank)
-        assert inherited.cp_config["use_nccl_for_alltoall"] is False
-        assert shard(repurposed, helix).cp_config == {"cp_type": CpType.HELIX}
+        sharded = shard(repurposed, helix)
+        assert (sharded.tp_size, sharded.cp_size, sharded.pp_size) == (1, 8, 1)
+        assert sharded.has_cp_helix()
+        assert (sharded.cp_rank, sharded.rank) == (helix.cp_rank, rank)
+        assert sharded.cp_config == {"cp_type": CpType.HELIX}
         assert shard(repurposed, None) is None
     plain = Mapping(world_size=8, rank=0, gpus_per_node=4, tp_size=8)
     assert shard(plain, None) is None

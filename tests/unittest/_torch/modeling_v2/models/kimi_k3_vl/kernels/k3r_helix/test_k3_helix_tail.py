@@ -16,10 +16,10 @@
 receive buffer).
 
 The fold is bitwise the packed split reduction of K3's FP4 MLA decode (latent rows and statistics,
-FP32 or normalized FP16 split partials, any task count, under the rule, wave and makespan task
-plans), the V up-projection is within one BF16 ulp of an FP64 reference (and of the production
-BMM), and the combine is bitwise ``helix_post_process_native`` of what the senders produced, eager
-and replayed in a CUDA graph whose launches alternate the receive buffer halves.
+FP32 split partials, any task count, under the rule, wave and makespan task plans), the V
+up-projection is within one BF16 ulp of an FP64 reference (and of the production BMM), and the
+combine is bitwise ``helix_post_process_native`` of what the senders produced, eager and replayed
+in a CUDA graph whose launches alternate the receive buffer halves.
 """
 
 import math
@@ -72,12 +72,11 @@ def _split_case(
     wave_tasks,
     query_len,
     seed,
-    partial_dtype=torch.float32,
     plan_kind="wave",
 ):
     """Random decode split state of ``len(kv_tiles)`` requests (the reduction test's recipe):
     each request's first task is empty, unplanned slots hold garbage, rows of single-task
-    requests are stored directly in ``rows``; FP16 partials are normalized split outputs."""
+    requests are stored directly in ``rows``."""
     gen = torch.Generator(device="cuda")
     gen.manual_seed(seed)
     requests = len(kv_tiles)
@@ -110,7 +109,6 @@ def _split_case(
     sums[begins[-1] :] = 3.0
     maxima[begins[-1] :] = 1e9
     partial[begins[-1] :] = torch.nan
-    partial = partial.to(partial_dtype)
     rows = torch.randn((requests * valid_m, 512), device="cuda", generator=gen).to(torch.bfloat16)
     return dict(
         partial=partial,
@@ -147,6 +145,7 @@ def _reduce(reduce_mod, case):
         plan=case["plan"],
         stats=stats,
         sm_count=torch.cuda.get_device_properties(0).multi_processor_count,
+        use_pdl=False,
     )
     return rows, stats
 
@@ -175,7 +174,7 @@ class _Workspace:
         self.buffer = torch.full((2 * half_bytes // 4,), -1, dtype=torch.int32, device="cuda")
         self.state = torch.zeros(8, dtype=torch.int64, device="cuda")
 
-    def launch(self, tail_mod, rows, stats, w_uv, out, fold, debug, mx_out=None, ull2=False):
+    def launch(self, tail_mod, rows, stats, w_uv, out, fold, debug, mx_out=None):
         tail_mod.k3_helix_tail(
             rows,
             stats,
@@ -193,7 +192,6 @@ class _Workspace:
             use_pdl=True,
             mx_out=mx_out,
             debug=debug,
-            ull2=ull2,
         )
 
 
@@ -256,15 +254,8 @@ CASES = [
 
 
 @pytest.mark.parametrize("plan_kind", ["wave", "rule", "lpt"])
-@pytest.mark.parametrize(
-    "partial_dtype,ull2",
-    [(torch.float32, False), (torch.float32, True), (torch.float16, True)],
-    ids=["fp32", "fp32-ull2", "fp16-ull2"],
-)
 @pytest.mark.parametrize("kv_tiles,splits,wave_tasks,query_len", CASES)
-def test_helix_tail_fold_matches_reduction(
-    kv_tiles, splits, wave_tasks, query_len, partial_dtype, ull2, plan_kind
-):
+def test_helix_tail_fold_matches_reduction(kv_tiles, splits, wave_tasks, query_len, plan_kind):
     reduce_mod, tail_mod = _modules()
     case = _split_case(
         reduce_mod,
@@ -273,7 +264,6 @@ def test_helix_tail_fold_matches_reduction(
         wave_tasks,
         query_len,
         seed=11,
-        partial_dtype=partial_dtype,
         plan_kind=plan_kind,
     )
     tasks = case["plan"][2 : 3 + case["requests"]].diff()
@@ -293,14 +283,13 @@ def test_helix_tail_fold_matches_reduction(
     for _ in range(2):
         debug = _debug_buffers(num_tokens * NUM_HEADS)
         out.fill_(torch.nan)
-        ws.launch(tail_mod, case["rows"], None, w_uv, out, fold, debug, ull2=ull2)
+        ws.launch(tail_mod, case["rows"], None, w_uv, out, fold, debug)
         torch.cuda.synchronize()
         _check(tail_mod, latent_ref, stats_ref, w_uv, out, debug)
     assert bool((ws.buffer == -1).all()), "the receive buffer was not re-armed"
 
 
-@pytest.mark.parametrize("ull2", [False, True], ids=["default", "ull2"])
-def test_helix_tail_direct_rows_and_graph_replay(ull2):
+def test_helix_tail_direct_rows_and_graph_replay():
     """Rows stored directly (no split partials), several token counts in one CUDA graph."""
     _, tail_mod = _modules()
     gen = torch.Generator(device="cuda")
@@ -330,7 +319,7 @@ def test_helix_tail_direct_rows_and_graph_replay(ull2):
 
     def launch_all():
         for (rows, stats), out, debug in zip(cases, outs, debugs):
-            ws.launch(tail_mod, rows, stats, w_uv, out, None, debug, ull2=ull2)
+            ws.launch(tail_mod, rows, stats, w_uv, out, None, debug)
 
     launch_all()
     torch.cuda.synchronize()
@@ -454,7 +443,6 @@ def test_k3_helix_tail_cells(cell):
         stats[:, 1] = torch.rand(num_tokens * NUM_HEADS, device="cuda", generator=gen) * 50 + 1
         fold = None
     else:
-        dtype = torch.float16 if spec["partial"] == "fp16" else torch.float32
         case = _split_case(
             reduce_mod,
             spec["kv_tiles"],
@@ -462,12 +450,8 @@ def test_k3_helix_tail_cells(cell):
             spec["wave_tasks"],
             spec["query_len"],
             seed=seed,
-            partial_dtype=dtype,
             plan_kind="lpt",
         )
-        if dtype == torch.float16:
-            # Normalized split outputs are bounded by the values they average.
-            case["partial"] = (case["partial"].float() * 0.25).to(dtype)
         rows, stats = case["rows"], torch.empty((num_tokens * NUM_HEADS, 2), device="cuda")
         fold = _fold_inputs(tail_mod, case)
     w_uv = (torch.randn((NUM_HEADS, 128, 512), device="cuda", generator=gen) * 0.05).to(
@@ -506,7 +490,6 @@ def test_k3_helix_tail_cells(cell):
         None,
         cp_size > 1,
         False,
-        spec["ull2"],
     )
     # Two launches use both receive halves; each must re-arm what it read.
     for _ in range(2):

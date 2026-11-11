@@ -6,9 +6,8 @@ The FP4 MLA backend (``attention/backends/fp4_mla``) owns the cache layout, the 
 update (KV append, HP ring, FP4 query rows) and the step metadata buffers; this module runs the
 attention over them with K3's packed CuTe DSL decode kernel (``kernels/fp4_mla_mufu16``), whose
 task plan and split reduction are ``kernels/fp4_mla_packed_reduce``. The kernel stores partials
-by plan slot and optionally as normalized FP16, so the plan it reads is its own: written into
-its own workspace with its own key, never the backend's (whose cache update writes the backend's
-plan for the backend's decode).
+by plan slot, so the plan it reads is its own: written into its own workspace with its own key,
+never the backend's (whose cache update writes the backend's plan for the backend's decode).
 
 Per step, the first call that needs it writes the generation lengths (shared with the backend:
 whichever runs first writes them, the other finds them current) fused with this plan, then the
@@ -16,10 +15,9 @@ device page table. :func:`begin_step` forgets the previous step's plan; the K3 m
 the start of every forward, and an invalidation of the backend's step metadata (``prepare`` /
 ``on_update_kv_lens``) forgets it too.
 
-Settings: the split count (8 task slots per request), the makespan (LPT) plan and the wave plan
-are fixed; the page plan, the reduction's programmatic launch, FP16 partials and the decode's
-programmatic launch after the fused query are ``features`` fields. A late-released fold consumer
-(``DeferredPackedReduce(release_early=False)``) is released from the decode's epilogue.
+Settings: the split count (8 task slots per request), the makespan (LPT) plan, the wave plan and
+FP32 split partials are fixed; the page plan (``page_plan``) and the reduction's programmatic
+launch (``reduce_pdl``) are the caller's arguments (the target's ``K3Sm107Constants``).
 """
 
 from __future__ import annotations
@@ -68,8 +66,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.v_cache import (
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
-from ...sm107_parts.features import active as _features
-
 
 def _ceil_div(lhs: int, rhs: int) -> int:
     return (lhs + rhs - 1) // rhs
@@ -82,7 +78,6 @@ assert 1 < _SPLITS <= _FP4_MLA_PACKED_MAX_SPLITS
 # Workspace names (``fp4_mla_state.workspaces``); the backend's own buffers have other names.
 _PLAN_WS = "_k3_fp4_mla_packed_plan"
 _PARTIAL_WS = "_k3_fp4_mla_split_partial"
-_PARTIAL_F16_WS = "_k3_fp4_mla_split_partial_f16"
 _MAXIMA_WS = "_k3_fp4_mla_split_maxima"
 _SUMS_WS = "_k3_fp4_mla_split_sums"
 
@@ -120,10 +115,6 @@ class _Step:
 
     # Key of the plan in _PLAN_WS for the current step; None: to be written.
     plan_key: Optional[tuple] = None
-    # Kernels this module launched that write decode metadata (plan, lengths, page table), and
-    # that count when the kernel writing the query rows was launched (:func:`mark_query_launch`).
-    metadata_launches: int = 0
-    query_launch_mark: Optional[int] = None
 
 
 def _step(metadata: Any) -> _Step:
@@ -139,20 +130,6 @@ def begin_step(metadata: Any) -> None:
     """Forget the previous step's plan (the K3 model calls this at the start of every forward)."""
     if getattr(metadata, "fp4_mla_state", None) is not None:
         _step(metadata).plan_key = None
-
-
-def _count_metadata_launch(metadata: Any) -> None:
-    """Count a kernel that writes decode metadata on the current stream; a decode launched right
-    after one must not read that metadata before its wait."""
-    _step(metadata).metadata_launches += 1
-
-
-def mark_query_launch(metadata: Any) -> None:
-    """Record that the kernel writing this step's query rows was just launched (the fused query,
-    ``features.ull2_mla_decode_pdl``): a decode launched as its programmatic dependent requires that
-    no metadata kernel was launched since."""
-    step = _step(metadata)
-    step.query_launch_mark = step.metadata_launches
 
 
 # ---------------------------------------------------------------------------
@@ -206,12 +183,14 @@ def packed_plan_geometry(
     num_requests: int,
     device: torch.device,
     helix_kv_bounds: torch.Tensor | None,
+    page_plan: bool,
 ) -> PackedPlanGeometry | None:
     """Slots, task-length cap and plan buffer of this step's packed decode.
 
     None when the packed Q layout is off or there are no generation pages. The geometry depends
-    only on the batch shape and the page-table capacity, so the prelaunch and the decode derive
-    the same one.
+    only on the batch shape, the page-table capacity and ``page_plan``. Without ``page_plan`` the
+    task length is raised past the page-plan profile (``SMEM_P4_PAGE_PLAN_PROFILE_KV``), so the
+    kernel runs without its per-page plan.
     """
     rows_per_seq = _fp4_mla_packed_rows_per_seq(num_heads, query_len)
     if rows_per_seq == 0 or num_requests <= 0:
@@ -241,7 +220,7 @@ def packed_plan_geometry(
     split_kv_len = max(task_tiles * 256, 256)
     # The kernels clamp the plan to the compiled profile (a bucket >= split_kv_len).
     module = _kernel_module()
-    if not _features().fp4_mla_page_plan:
+    if not page_plan:
         split_kv_len = max(split_kv_len, module.SMEM_P4_PAGE_PLAN_PROFILE_KV + 1)
     profile_tiles = module._select_runtime_kv_profile(split_kv_len) // 256
     reduce = _reduce_module()
@@ -289,22 +268,6 @@ def packed_plan_geometry(
     )
 
 
-def helix_plan_bounds(metadata: Any, num_tokens: int, *, use_helix: bool) -> torch.Tensor | None:
-    """Per-token Helix KV bounds the decode plans on, or None (validated at decode)."""
-    if not use_helix or not bool(getattr(metadata, "_helix_spec_tokens_valid", False)):
-        return None
-    bounds = getattr(metadata, "helix_kv_bounds", None)
-    if (
-        not isinstance(bounds, torch.Tensor)
-        or bounds.dtype != torch.int32
-        or bounds.ndim != 1
-        or bounds.numel() < num_tokens
-        or not bounds.is_contiguous()
-    ):
-        return None
-    return bounds[:num_tokens]
-
-
 def _launch_packed_plan(
     geometry: PackedPlanGeometry,
     kv_lens: torch.Tensor,
@@ -313,7 +276,6 @@ def _launch_packed_plan(
     generation_lengths: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None = None,
 ) -> None:
     """Write the step's packed split plan, fused with the generation lengths when given."""
-    _count_metadata_launch(metadata)
     _reduce_module().launch_packed_plan(
         kv_lens,
         geometry.plan,
@@ -399,7 +361,6 @@ def uniform_generation_lengths(
                 ),
             )
         else:
-            _count_metadata_launch(metadata)
             populate_fp4_mla_generation_lengths(
                 kv_lens_gen,
                 prompt_lens_gen,
@@ -422,7 +383,7 @@ def materialize_page_table(
     metadata: Any, generation_kv_lens: Optional[torch.Tensor] = None
 ) -> None:
     """The backend's fixed-stride device page table of this forward, from the final device
-    lengths (once per forward; counted as a metadata launch when it launches)."""
+    lengths (once per forward)."""
     state = metadata.fp4_mla_state
     if not bool(getattr(state, "device_page_table", False)):
         raise RuntimeError("FP4 MLA cache update requires fixed-stride device page metadata.")
@@ -438,48 +399,11 @@ def materialize_page_table(
             )
         else:
             generation_kv_lens = metadata.kv_lens_cuda_runtime[num_contexts:num_sequences]
-    _count_metadata_launch(metadata)
     materialize_fp4_mla_device_page_table(
         metadata,
         metadata.kv_lens_cuda_runtime[:num_sequences],
         generation_kv_lens,
     )
-
-
-def prelaunch_generation_metadata(
-    metadata: Any, *, num_heads: int, use_helix: bool, device: torch.device
-) -> bool:
-    """``features.ull4_mla_plan_early``: launch on the current stream what the first FP4 MLA
-    generation layer of a step launches for the step's metadata: the generation lengths fused
-    with this module's plan of ``num_heads`` query heads, then the device page table. Later calls
-    of the step find them current and launch nothing. Returns whether it launched (a
-    generation-only step with the device page table); the caller orders the step's first FP4 MLA
-    kernel after this stream."""
-    state = getattr(metadata, "fp4_mla_state", None)
-    if state is None or not state.device_page_table:
-        return False
-    num_contexts = int(metadata.num_contexts)
-    num_gen = int(metadata.num_seqs) - num_contexts
-    num_tokens = int(metadata.num_tokens)
-    if num_contexts != 0 or num_gen <= 0 or num_tokens % num_gen != 0 or num_heads <= 0:
-        return False
-    # The plan workspace is reallocated on a device mismatch, and tensors carry an index.
-    device = torch.device(device)
-    if device.type == "cuda" and device.index is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    plan_geometry = packed_plan_geometry(
-        metadata,
-        num_heads=num_heads,
-        query_len=num_tokens // num_gen,
-        num_requests=num_gen,
-        device=device,
-        helix_kv_bounds=helix_plan_bounds(metadata, num_tokens, use_helix=use_helix),
-    )
-    kv_lens_gen, _ = uniform_generation_lengths(
-        metadata, num_tokens, num_gen, plan_geometry=plan_geometry
-    )
-    materialize_page_table(metadata, kv_lens_gen)
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -512,18 +436,16 @@ def _run_packed_decode(
     helix_kv_bounds: torch.Tensor | None,
     softmax_stats_tensor: torch.Tensor | None,
     plan_geometry: PackedPlanGeometry,
-    metadata_launches: int,
-    q_rows_external: bool,
+    reduce_pdl: bool,
 ) -> None:
     """Packed CuTe DSL decode: one kernel over (split, request) tasks.
 
-    The splits write partials (FP32, or normalized FP16 with ``features.fp4_mla_f16_partials``)
-    that one reduction kernel folds into the output and stats (or a ``DeferredPackedReduce``
-    consumer folds). Nothing pads, replicates, or copies Q or the output.
+    The splits write FP32 partials that one reduction kernel folds into the output and stats (or a
+    ``DeferredPackedReduce`` consumer folds). Nothing pads, replicates, or copies Q or the output.
 
-    ``metadata_launches`` is the metadata-launch count when the decode call began; with
-    ``features.ull2_mla_decode_pdl`` the decode is launched programmatically only if no metadata
-    kernel was launched since and the query rows come from another kernel (``q_rows_external``).
+    ``reduce_pdl``: the reduction (or the deferred consumer) launches as a programmatic dependent
+    of the decode, which triggers its dependents as soon as every decode CTA has started; the
+    reduction waits for the decode grid with ``griddepcontrol.wait`` after staging the plan.
     """
     valid_m, physical_m = module.packed_query_rows(num_heads, query_len)
     if physical_m != rows_per_seq:
@@ -539,11 +461,6 @@ def _run_packed_decode(
     device = output.device
     splits = plan_geometry.splits
     step = _step(metadata)
-    use_pdl_wait = (
-        _features().ull2_mla_decode_pdl
-        and q_rows_external
-        and (step.query_launch_mark is None or step.query_launch_mark == metadata_launches)
-    )
     output_rows = output.view(num_requests * valid_m, 512)
     stats_rows = None
     if softmax_stats_tensor is not None:
@@ -560,12 +477,6 @@ def _run_packed_decode(
         helix_kv_bounds=helix_kv_bounds,
     )
     reduce = _reduce_module()
-    reduce_pdl = reduce.reduce_pdl_enabled()
-    deferred = reduce.DeferredPackedReduce.active()
-    launch_dependents = reduce_pdl and (deferred is None or deferred.release_early)
-    if deferred is not None and not deferred.release_early:
-        launch_dependents = module.LAUNCH_DEPENDENTS_EPILOGUE
-    f16_partials = reduce.f16_partials_enabled()
     tasks = splits * num_requests
     task_capacity = plan_geometry.task_capacity
     plan = plan_geometry.plan
@@ -575,9 +486,9 @@ def _run_packed_decode(
         _launch_packed_plan(plan_geometry, kv_lens, metadata)
     partial = _ensure_workspace_tensor(
         metadata,
-        _PARTIAL_F16_WS if f16_partials else _PARTIAL_WS,
+        _PARTIAL_WS,
         (task_capacity, physical_m, 512),
-        dtype=torch.float16 if f16_partials else torch.float32,
+        dtype=torch.float32,
         device=device,
     )[:tasks]
     maxima = _ensure_workspace_tensor(
@@ -609,8 +520,7 @@ def _run_packed_decode(
         split_kv_buffers=(partial, maxima, sums),
         plan=plan,
         **common,
-        launch_dependents=launch_dependents,
-        pdl_wait=use_pdl_wait and step.metadata_launches == metadata_launches,
+        launch_dependents=reduce_pdl,
     )
     reduce.reduce_packed_splits(
         partial,
@@ -625,8 +535,7 @@ def _run_packed_decode(
         physical_m=physical_m,
         sm_scale=sm_scale,
         plan=plan,
-        # FP16 partials are already in output units.
-        output_scale=1.0 if f16_partials else 1.0 / module.FP4_MLA_P_GLOBAL_SCALE,
+        output_scale=1.0 / module.FP4_MLA_P_GLOBAL_SCALE,
         stats=stats_rows,
         sm_count=_get_sm_count(device),
         use_pdl=reduce_pdl,
@@ -647,17 +556,17 @@ def run_decode(
     prequantized_q_sf: torch.Tensor,
     q_batch_capacity: int,
     softmax_stats_tensor: torch.Tensor | None = None,
-    q_rows_external: bool = False,
+    page_plan: bool,
+    reduce_pdl: bool,
 ) -> None:
     """MLA decode with FP4 QK and FP4 PV tensor-core matmuls on the packed query rows the
-    backend's generation cache update prepared (and wrote, or ``q_rows_external``: another
-    kernel wrote them, the fused query).
+    backend's generation cache update prepared (and wrote, or the fused query wrote).
 
     ``q`` (``[tokens, heads, latent + RoPE]``) provides shapes; ``output`` is ``[tokens, heads,
     512]`` and ``softmax_stats_tensor`` the Helix ``[tokens, heads, 2]`` (max, sum) statistics.
+    ``page_plan`` / ``reduce_pdl``: see :func:`packed_plan_geometry` / :func:`_run_packed_decode`.
     """
     head_dim = kv_lora_rank + qk_rope_head_dim
-    metadata_launches = _step(metadata).metadata_launches
     if qk_rope_head_dim != FP4_MLA_K_RESIDUAL_DIM:
         raise ValueError(
             "FP4 MLA K residual attention requires "
@@ -807,6 +716,7 @@ def run_decode(
         num_requests=num_gen_seqs,
         device=q.device,
         helix_kv_bounds=helix_kv_bounds,
+        page_plan=page_plan,
     )
     if plan_geometry is None:
         raise RuntimeError("FP4 MLA packed decode requires generation cache pages.")
@@ -902,8 +812,7 @@ def run_decode(
         helix_kv_bounds=helix_kv_bounds,
         softmax_stats_tensor=softmax_stats_tensor,
         plan_geometry=plan_geometry,
-        metadata_launches=metadata_launches,
-        q_rows_external=q_rows_external,
+        reduce_pdl=reduce_pdl,
     )
 
 
@@ -913,13 +822,15 @@ def run_generation(
     metadata: Any,
     *,
     softmax_stats_tensor: Optional[torch.Tensor] = None,
-    q_rows_external: bool = False,
+    page_plan: bool,
+    reduce_pdl: bool,
 ) -> torch.Tensor:
     """The absorbed generation attention of the FP4 MLA layer ``attn`` (a ``TrtllmAttention``,
     :func:`applies`): what its ``forward`` returns for a generation-only call with the fused query
     ``q`` (``[tokens, heads * (latent + RoPE)]``), after the backend's generation cache update.
     Returns ``[tokens, heads * kv_lora_rank]`` in ``q``'s dtype; ``softmax_stats_tensor`` receives
-    the Helix statistics."""
+    the Helix statistics. ``page_plan`` / ``reduce_pdl``: the target's
+    ``K3Sm107Constants.fp4_mla_page_plan`` / ``fp4_mla_reduce_pdl`` (:func:`run_decode`)."""
     kv_lora_rank = attn.kv_lora_rank or 0
     qk_rope_head_dim = attn.qk_rope_head_dim or 0
     num_heads = attn.num_heads
@@ -946,11 +857,9 @@ def run_generation(
             "cache/HP-pool update before attention."
         )
     state.generation_cache_scattered = False
-    features = _features()
     logger.info_once(
         f"Kimi K3 FP4 MLA generation decode: k3_rubin packed kernel, {_SPLITS} KV splits, "
-        f"page_plan={features.fp4_mla_page_plan}, reduce_pdl={features.fp4_mla_reduce_pdl}, "
-        f"f16_partials={features.fp4_mla_f16_partials}, "
+        f"page_plan={page_plan}, reduce_pdl={reduce_pdl}, "
         f"helix={softmax_stats_tensor is not None}",
         key="k3_fp4_mla_generation_decode",
     )
@@ -970,7 +879,8 @@ def run_generation(
             prequantized_q_sf=state.prequantized_q_sf,
             q_batch_capacity=state.q_batch_capacity,
             softmax_stats_tensor=softmax_stats_tensor,
-            q_rows_external=q_rows_external,
+            page_plan=page_plan,
+            reduce_pdl=reduce_pdl,
         )
     finally:
         state.prequantized_q = None

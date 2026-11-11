@@ -40,7 +40,7 @@ class K3L2Prefetch(OpWrapper):
     note = """
     The only effect is on the L2 contents: no memory is written and nothing waits for the
     prefetches, so the reference is a no-op and the test proves the ranges' bytes and their
-    neighbours unchanged. Kimi K3's KDA verify (features.kda_l2_prefetch, the helix8 target, up to
+    neighbours unchanged. Kimi K3's KDA verify (the target's kda_l2_prefetch, the helix8 target, up to
     16 rows) launches it on the projection aux stream behind an event recorded after this
     layer's QKVG and [f_a | b] kernels, without PDL; it triggers its programmatic dependents at
     once. CTAs: one warp each, about one 8 KiB chunk per thread, at most max_ctas. Compiled

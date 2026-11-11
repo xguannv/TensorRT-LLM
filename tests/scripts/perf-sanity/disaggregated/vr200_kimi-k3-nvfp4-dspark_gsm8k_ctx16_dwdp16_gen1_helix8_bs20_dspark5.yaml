@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# GSM8K deployment of the kimi_k3_nvfp4__sm_107__default target
-# (accuracy/modeling_v2/kimi_k3_vl/kimi_k3_nvfp4__sm_107__default/test_accuracy.py):
+# GSM8K deployment of the kimi_k3_nvfp4__sm_107__helix8_moetp2ep4 (generation) and
+# kimi_k3_nvfp4__sm_107__tp1 (context) targets
+# (accuracy/modeling_v2/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix8_moetp2ep4/test_accuracy.py):
 # 16 one-GPU DWDP context servers feeding one Helix CP8 generation server
 # (batch 20, DSpark 5). 6 Rubin nodes. The test replaces the client with GSM8K
 # against the disaggregated frontend.

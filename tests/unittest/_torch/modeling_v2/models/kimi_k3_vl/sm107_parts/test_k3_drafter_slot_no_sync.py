@@ -222,6 +222,8 @@ def _refresh_worker(num_blocks, checks):
         _ctx_pool_idx=0,
         _ctx_block_divisor=1,
         _ctx_block_offset=OFFSET,
+        # The row-parallel decode of the draft block table (no dspark_tail_v2).
+        _tail_v2=False,
         _ctx_kv_manager=SimpleNamespace(
             kv_cache_map={
                 request_id: SimpleNamespace(num_blocks=count)

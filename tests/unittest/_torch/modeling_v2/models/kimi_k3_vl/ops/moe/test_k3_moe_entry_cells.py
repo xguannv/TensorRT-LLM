@@ -3,7 +3,6 @@
 """The single-GPU MoE entries of the K3 default target over their certified cells:
 ``k3_router_logits.CELLS``, ``k3_route_tail.CELLS`` and ``k3_moe_residual_add.CELLS``, each driven
 through ``validating`` and checked against the entry's own ``reference``.
-(``k3_small_batch_moe.CELLS`` run in ``kernels/test_k3_small_batch_moe.py``.)
 """
 
 import importlib

@@ -26,7 +26,6 @@ import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_ptr
 
-from ...sm107_parts.features import active as _features
 from .fp4_mla_mufu16 import (
     KV_TILE,
     LOG2_E,
@@ -75,21 +74,6 @@ _VALUE_DIM = 512
 _TASKS_PER_CHUNK = 4
 # Persistent reducer grid: up to this many CTAs per SM, one warp per output row.
 _REDUCE_CTAS_PER_SM = 4
-
-
-def reduce_pdl_enabled() -> bool:
-    """``features.fp4_mla_reduce_pdl``: the reduction launches as a programmatic dependent of the
-    decode kernel (which then triggers its dependents as soon as every decode CTA has started) and
-    waits for the decode grid with griddepcontrol.wait after staging the plan."""
-    return _features().fp4_mla_reduce_pdl
-
-
-def f16_partials_enabled() -> bool:
-    """``features.fp4_mla_f16_partials``: the decode kernel stores each split's normalized output
-    (numerator / row sum, in output units) as FP16 instead of the FP32 max-relative numerator,
-    which halves the partial store and load traffic; the merge then weighs every split by its
-    max-scaled row sum and applies no output scale."""
-    return _features().fp4_mla_f16_partials
 
 
 @cutlass.dsl_user_op
@@ -1736,7 +1720,7 @@ def reduce_packed_splits(
     plan: torch.Tensor,
     stats: torch.Tensor | None = None,
     sm_count: int = 128,
-    use_pdl: bool = False,
+    use_pdl: bool,
 ) -> None:
     """Reduce ``[splits * requests, physical_m, 512]`` partials into ``output``.
 
@@ -1869,17 +1853,12 @@ class DeferredPackedReduce:
     Kimi-K3 Helix tail, ``mla.py``). The partials, row state and plan stay
     valid until the next decode on the stream overwrites them; :meth:`run` launches the recorded
     reduction for a consumer that cannot fold them after all.
-
-    Args:
-        release_early: With ``features.fp4_mla_reduce_pdl``, the decode releases its programmatic
-            dependents (the consumer) at its entry; False: only its completion does.
     """
 
     _stack: list["DeferredPackedReduce"] = []
 
-    def __init__(self, release_early: bool = True) -> None:
+    def __init__(self) -> None:
         self.args: dict | None = None
-        self.release_early = release_early
 
     @classmethod
     def active(cls) -> "DeferredPackedReduce | None":
@@ -1894,7 +1873,8 @@ class DeferredPackedReduce:
         DeferredPackedReduce._stack.pop()
 
     def run(self) -> None:
-        """Launch the recorded reduction (no-op without a recorded call)."""
+        """Launch the recorded reduction (no-op without a recorded call), not as a programmatic
+        dependent."""
         if self.args is None:
             return
         args = dict(self.args)
@@ -1902,4 +1882,6 @@ class DeferredPackedReduce:
             args.pop(k) for k in ("partial", "maxima", "sums", "output")
         )
         q_scale, kv_scale = args.pop("q_scale"), args.pop("kv_scale")
-        reduce_packed_splits(partial, maxima, sums, output, q_scale, kv_scale, **args)
+        reduce_packed_splits(
+            partial, maxima, sums, output, q_scale, kv_scale, use_pdl=False, **args
+        )

@@ -28,7 +28,7 @@ from ..ops.gemm.k3_fp8w_lowm_mxfp8_push import k3_fp8w_lowm_mxfp8_push as k3_fp8
 from ..ops.gemm.k3_fp8w_mid_gemm import k3_fp8w_mid_gemm as k3_fp8w_mid_gemm_op
 from ..ops.gemm.k3_fp8w_mid_gemm_push import k3_fp8w_mid_gemm_push as k3_fp8w_mid_gemm_push_op
 from ..ops.gemm.k3_mxfp8_gemm import k3_mxfp8_gemm as k3_mxfp8_gemm_op
-from .features import active as _features
+from .constants import K3Sm107Constants
 from .layers import (
     Bf16Linear,
     Fp8BlockScaleLinear,
@@ -37,27 +37,6 @@ from .layers import (
     low_m_gemm_scale,
     prepare_fp8_block_weight,
 )
-
-_F = _features()
-
-# FP8 weight-read projections with few rows (per-shape, per-architecture limit, see
-# k3_fp8w_lowm_gemm.max_m_for) run the CuTe low-M GEMM: on SM100/SM103 instead of DeepGEMM
-# swap-AB, on SM107 instead of the CuTe MXFP8 GEMM (with a DeepGEMM-packed copy of the weight
-# scale, built at post-load, see _Fp8BlockScaleWeightReadLinear.prepare_lowm_gemm).
-_K3_FP8W_LOWM_GEMM = _F.fp8w_lowm_gemm
-
-# Fused latent projection (cute_dsl_kernels/blackwell/k3_latent_fp8_gemm.py), for token counts
-# in [_K3_LD_FUSED_MIN_M, _K3_LD_FUSED_MAX_M]:
-#   TRTLLM_K3_LD_FUSED: latent_down + the routed experts' NVFP4 input quantization in one chain
-#     (the k3_latent_down_fp4 entry), bit-exact with fp8_swap_ab_gemm followed by fp4_quantize.
-# It fuses only where the unfused projection would run fp8_swap_ab_gemm, not where it runs the
-# low-M kernel (TRTLLM_K3_FP8W_LOWM_GEMM). On SM107 the op runs the low-M kernel's split-K GEMM
-# with the fused epilogue up to k3_latent_fp8_gemm.lowm_route_max_m tokens (bit-exact with that
-# GEMM at the same tactic followed by fp4_quantize) and the persistent kernel above; both read a
-# DeepGEMM-packed copy of the weight scale built at post-load
-# (_Fp8BlockScaleWeightReadLinear.prepare_lowm_gemm).
-_K3_LD_FUSED = _F.ld_fused
-
 
 # ---------------------------------------------------------------------------
 # FP8 block-scale weight read for attention and replicated MoE-layer MLP projections.
@@ -111,10 +90,11 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
     ``layers.fp8_block_scale_gemm``.
 
     The Rubin agentic kernels sit in front of that dispatch: the K3 low-M GEMM
-    (``TRTLLM_K3_FP8W_LOWM_GEMM``, ``kernels/k3_fp8w_lowm_gemm.py``) with its gated,
-    sigmoid, MXFP8-input and all-reduce-push variants. With ``TRTLLM_K3_FP8W_LOWM_GEMM``
-    set the K3 low-M GEMM owns the low-M rows exactly as on that branch and the generic low-M GEMM is not
-    prepared; with it unset the generic one serves them as on main.
+    (``fp8w_lowm_gemm``, ``kernels/k3_fp8w_lowm_gemm.py``) with its gated, sigmoid,
+    MXFP8-input and all-reduce-push variants. With ``fp8w_lowm_gemm`` set the K3 low-M GEMM
+    owns the low-M rows (per-shape, per-architecture limit, see
+    ``k3_fp8w_lowm_gemm.max_m_for``) and the generic low-M GEMM is not prepared; with it unset
+    the generic one serves them.
     """
 
     def __init__(
@@ -151,10 +131,16 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         # Copied from the source ``Linear`` (the MLA fused q_a/kv_a projection sets it): the
         # low-M GEMM may serve this weight although N is not a multiple of 128.
         self.fp8w_lowm_partial_n_tile = False
-        # Whether the fused latent projection (TRTLLM_K3_LD_FUSED) may replace this one (set when
-        # it is swapped in).
+        # Whether the K3 low-M GEMM owns the low-M rows (the target's ``fp8w_lowm_gemm``; set
+        # when the projection is swapped in, ``_swap_linear_to_fp8_weight_read``).
+        self.fp8w_lowm_gemm = False
+        # Whether the fused latent projection may replace this one (the target's ``ld_fused``, on
+        # ``routed_expert_down_proj``; set when it is swapped in): latent_down + the routed
+        # experts' NVFP4 input quantization in one chain (the k3_latent_down_fp4 entry),
+        # bit-exact with the unfused GEMM followed by fp4_quantize. It reads
+        # ``lowm_weight_scale``.
         self.k3_latent_fused = False
-        # SM107 with TRTLLM_K3_FP8W_LOWM_GEMM or ``k3_latent_fused``: the weight scale in the
+        # SM107 with ``fp8w_lowm_gemm`` or ``k3_latent_fused``: the weight scale in the
         # DeepGEMM-packed UE8M0 layout of the low-M GEMM and the fused latent projections
         # (``weight_scale`` holds the CuTe MXFP8 layout there).
         self.lowm_weight_scale: Optional[torch.Tensor] = None
@@ -290,11 +276,11 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
 
         On SM107 that scale is a copy (N * K / 128 bytes) derived from the MXFP8
         ``weight_scale``; row views of a fused KDA projection have none (the fused module
-        serves decode). Not prepared under ``TRTLLM_K3_FP8W_LOWM_GEMM``: the K3 low-M GEMM
+        serves decode). Not prepared with ``fp8w_lowm_gemm``: the K3 low-M GEMM
         owns those rows then (see the class docstring).
         """
         self._low_m_max, self._low_m_weight_scale = 0, None
-        if _K3_FP8W_LOWM_GEMM:
+        if self.fp8w_lowm_gemm:
             return
         n, k = self.out_features, self.in_features
         low_m_max = low_m_gemm_rows(n, k)
@@ -305,7 +291,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             self._low_m_weight_scale = low_m_gemm_scale(self.weight_scale, n, k)
 
     def prepare_lowm_gemm(self) -> bool:
-        """Build ``lowm_weight_scale`` on SM107 if TRTLLM_K3_FP8W_LOWM_GEMM is set or a fused
+        """Build ``lowm_weight_scale`` on SM107 if ``fp8w_lowm_gemm`` is set or a fused
         latent projection may replace this one (``k3_latent_fused``).
 
         Derived from the transformed MXFP8 scale, so it follows weight reloads; rebuilt on
@@ -313,7 +299,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         the FP8 weight). SM100/SM103 run these GEMMs on ``weight_scale`` itself.
         """
         self.lowm_weight_scale = None
-        if not ((_K3_FP8W_LOWM_GEMM or self.k3_latent_fused) and _rubin_mxfp8_is_available()):
+        if not ((self.fp8w_lowm_gemm or self.k3_latent_fused) and _rubin_mxfp8_is_available()):
             return False
         if self._fused_projection is not None:
             # A row view of the KDA fused q/k/v/g weight; the fused module serves forward.
@@ -450,12 +436,12 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         out_buffer, self.next_output = self.next_output, None
         ar_push = self._take_next_ar_push(x_flat)
 
-        # The K3 low-M GEMM (``TRTLLM_K3_FP8W_LOWM_GEMM``) up to its per-shape M gate, on SM107
+        # The K3 low-M GEMM (``fp8w_lowm_gemm``) up to its per-shape M gate, on SM107
         # with ``lowm_weight_scale``, on SM100 / SM103 with ``weight_scale``; else the low-M /
         # MXFP8 (SM107) / swap-AB (SM100 / SM103) GEMM of ``layers.fp8_block_scale_gemm``.
         lowm_scale = self.lowm_weight_scale if _rubin_mxfp8_is_available() else self.weight_scale
         if (
-            _K3_FP8W_LOWM_GEMM
+            self.fp8w_lowm_gemm
             and lowm_scale is not None
             and self._lowm_gemm_applies(x_flat, lowm_scale)
         ):
@@ -512,7 +498,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         """The weight scale :meth:`forward` runs the K3 low-M GEMM with on the BF16 rows
         ``x_flat`` (``lowm_weight_scale`` on SM107, ``weight_scale`` on SM100/SM103), or None
         where :meth:`forward` runs another GEMM."""
-        if not _K3_FP8W_LOWM_GEMM or x_flat.dtype != torch.bfloat16:
+        if not self.fp8w_lowm_gemm or x_flat.dtype != torch.bfloat16:
             return None
         if self.lowm_weight_scale is not None:
             scale = self.lowm_weight_scale
@@ -527,7 +513,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         input-independent part of its dispatch: the low-M GEMM on, not the Rubin CuTe MXFP8
         path, ``num_rows`` within the low-M kernel's range). On SM107 forward runs it on
         ``lowm_weight_scale`` up to the per-shape gate (``max_m_for``)."""
-        if not _K3_FP8W_LOWM_GEMM:
+        if not self.fp8w_lowm_gemm:
             return False
         if _rubin_mxfp8_is_available() and self.lowm_weight_scale is None:
             return False
@@ -560,7 +546,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         switch on, above the low-M cut-over, up to the per-shape gate) when it has one 128-row
         scale block, else None. A producer may then store the rows' MXFP8 form in that GEMM's
         layout (``mid_prequant_plan``) for :meth:`forward_mxfp8` / :meth:`forward_mid_mxfp8`."""
-        if not _K3_FP8W_LOWM_GEMM:
+        if not self.fp8w_lowm_gemm:
             return None
         if self.lowm_weight_scale is None:
             return None
@@ -615,7 +601,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         low-M kernel's cut-over with the staged MXFP8 low-M GEMM: :meth:`forward` runs the mid-M
         path of ``k3_fp8w_lowm_gemm`` there, whose bits the staged kernel reproduces
         (``k3_fp8w_lowm_mxfp8.staged_matches_mid_m``)."""
-        if not _K3_FP8W_LOWM_GEMM or self.lowm_weight_scale is None:
+        if not self.fp8w_lowm_gemm or self.lowm_weight_scale is None:
             return False
         from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm, k3_fp8w_lowm_mxfp8
 
@@ -850,10 +836,14 @@ def _swap_linear_to_fp8_weight_read(
     parent: nn.Module,
     attr: str,
     linear_types: Tuple[type, ...] = (nn.Linear,),
+    *,
+    constants: K3Sm107Constants,
 ) -> int:
     """Replace ``parent.<attr>`` with an FP8 weight-read module if it is a
     plain linear of one of ``linear_types``; return the number of modules
-    converted (0 or 1), so callers can accumulate a conversion count.
+    converted (0 or 1), so callers can accumulate a conversion count. The
+    module takes ``fp8w_lowm_gemm`` and (``routed_expert_down_proj``)
+    ``ld_fused`` from the target's ``constants``.
 
     Transfer checkpoint FP8 storage or release the original BF16 storage
     after conversion. The loader's transient parameter map must not retain
@@ -863,7 +853,8 @@ def _swap_linear_to_fp8_weight_read(
     if not isinstance(child, linear_types):
         return 0
     converted = _Fp8BlockScaleWeightReadLinear.from_linear(child)
-    converted.k3_latent_fused = attr == "routed_expert_down_proj" and _K3_LD_FUSED
+    converted.fp8w_lowm_gemm = constants.fp8w_lowm_gemm
+    converted.k3_latent_fused = attr == "routed_expert_down_proj" and constants.ld_fused
     setattr(parent, attr, converted)
     child.weight.data = child.weight.data.new_empty(0)
     return 1
@@ -880,7 +871,7 @@ def _has_weights(module: nn.Module) -> bool:
 
 
 def _convert_moe_mlps_to_fp8_weight_read(
-    model: nn.Module, include_fused_gate_up: bool = True
+    model: nn.Module, include_fused_gate_up: bool = True, *, constants: K3Sm107Constants
 ) -> int:
     """Swap the replicated MoE-layer MLP projections to an FP8 weight read.
 
@@ -915,10 +906,10 @@ def _convert_moe_mlps_to_fp8_weight_read(
                 if isinstance(child, Bf16Linear) and child.tp_size != 1:
                     continue
                 count += _swap_linear_to_fp8_weight_read(
-                    shared, attr, linear_types=(nn.Linear, Bf16Linear)
+                    shared, attr, linear_types=(nn.Linear, Bf16Linear), constants=constants
                 )
         for attr in ("routed_expert_down_proj", "routed_expert_up_proj"):
-            count += _swap_linear_to_fp8_weight_read(moe, attr)
+            count += _swap_linear_to_fp8_weight_read(moe, attr, constants=constants)
 
     # Return the freed BF16 blocks to the driver so the raw (non-caching-
     # allocator) allocations made during executor creation succeed on the

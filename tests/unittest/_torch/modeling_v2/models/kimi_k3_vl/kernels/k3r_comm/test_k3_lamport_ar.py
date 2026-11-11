@@ -456,7 +456,15 @@ def _run_rank_cells(world_size):
                 ws_args = (ws.uc_local, ws.flags.data_ptr())
                 with validating(attn_res):
                     got = attn_res(
-                        prefix, *ws_args, block, *weights, *eps, *tail, mxfp8=mxfp8, updated=updated
+                        prefix,
+                        *ws_args,
+                        block,
+                        *weights,
+                        *eps,
+                        *tail,
+                        mxfp8=mxfp8,
+                        updated=updated,
+                        early_trigger=spec["early_trigger"],
                     )
                 ref = attn_res.reference(prefix, xs, block, *weights, *eps, *tail, mxfp8=mxfp8)
                 check(attn_res, cell, len(got) == len(ref), "number of outputs")

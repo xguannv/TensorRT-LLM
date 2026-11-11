@@ -32,20 +32,18 @@ backbone is this package's: the weights live in ``layers.py`` containers
         (dspark_tail_v2: both RoPEs and the store       k3_dspark_mla_block_rope, bmm_out)
       split-KV plan (first layer of a step)             the MLA decode's planner kernel
       latent attention over context + block             cute_dsl_mla_decode_fp16_blackwell
-      helix: merge of the rank partials                 _helix_post_process / k3_helix_tail
+      helix: merge of the rank partials                 _helix_post_process
       V up-projection                                   bmm_out (or einsum)
       o_proj, all-reduce + residual + RMSNorm           pushed split-K site, or cuBLAS + MNNVL
-      gate_up GEMM, SwiGLU, down GEMM                   cuBLAS / pinned split-K, silu_and_mul
+      gate_up GEMM, SwiGLU, down GEMM                   cuBLAS, silu_and_mul
     final RMSNorm (+ the last down all-reduce)
 
 and the context latents of the target hidden states are fc (+ all-reduce with the RMSNorm fused)
 -> one GEMM over the stacked ``kv_a`` weights of every layer -> ``k3_dspark_mla_ctx_norm_rope``.
 
-Features (``features.py``): ``dspark_draft_gemm`` pins GEMMs, ``draft3_glue`` takes
-per-step glue off the critical path, ``spec_tail_fusion`` / ``dspark_tail_v2`` fuse the block
-stores and RoPE, ``ull2_draft_a2a`` / ``ull2_draft_store`` the helix page-sharded latent cache. The
-TP fusions (q_a / kv_a as one GEMM, the pushed all-reduce sites, the TP-sharded fc) change the
-drafter's rounding only; target verification keeps the output lossless.
+The target's constants (``K3Sm107Constants``): ``spec_tail_fusion`` / ``dspark_tail_v2`` fuse the
+block stores and RoPE. The TP fusions (q_a / kv_a as one GEMM, the pushed all-reduce sites, the
+TP-sharded fc) change the drafter's rounding only; target verification keeps the output lossless.
 
 No registry entries: main's registry keeps resolving its own drafter classes (the backbone is
 registered only while the base ``__init__`` builds it, under a private name); the K3 shell builds
@@ -66,28 +64,6 @@ the gathered logits fit it.
 Resolution of the DSpark drafter head switches from a drafter's pretrained config.
 
 DSpark vanilla Markov head: the per-step token-bigram logit bias and the intra-block chain.
-
-The MLA DSpark drafter's helix layer on the target's exchange, with fewer launches.
-
-Under helix the MLA drafter keeps one latent per token, so its context pages are sharded over the
-whole repurposed group (``Mapping.helix_mapping_for_kv_heads(1)``): every rank attends all heads
-over its pages and the per-rank partials are merged by a helix exchange. Switches (environment,
-default off; each falls back to the current path where it does not apply):
-
-* ``TRTLLM_K3_ULL2_DRAFT_A2A=1``: the drafter's helix mapping takes the cp_config of the target's
-  helix mapping (``inherit_cp_config``), so its exchange runs on the target's transport, e.g. the
-  MNNVL FIFO all-to-all + ``helix_post_process_native`` for ``use_nccl_for_alltoall: false``,
-  instead of the NCCL all-to-all with its torch reformats. Same values: both combines run the
-  same arithmetic on the same records. With an MNNVL cp_config, the V up-projection, the
-  exchange and the combine of a layer are then one launch of the Kimi-K3 helix tail kernel
-  (``k3_helix_tail``, rows copied, no fold), on the receive buffers of the target's tail when the
-  mappings match. The V up-projection sums in another FP32 order than the cuBLAS BMM: drafter
-  rounding only.
-* ``TRTLLM_K3_ULL2_DRAFT_STORE=1`` (with ``TLLM_DSPARK_TAIL_V2=1``): under helix too, one kernel
-  rotates the query's rope half, normalizes and rotates the block latents into a scratch row
-  buffer, and one masked scatter stores the rows this rank's pages hold
-  (``scatter_rows_to_pool(rows_mask=owned)``), instead of the separate RoPE launches and a
-  gather / where / index_put round trip of the pool. Same values.
 
 Helix CP post-processing: all-to-all exchange and combine of partial attention outputs.
 
@@ -115,7 +91,7 @@ DSpark drafter and a draft embedded in the target keep main's drafter and worker
 target stays identical to main for them.
 
 Contract with the text model (``KimiK3DefaultForCausalLM._install_private_spec``): call
-``install_k3_dspark(self, model_config)`` once, right after
+``install_k3_dspark(self, model_config, constants)`` once, right after
 ``SpecDecOneEngineForCausalLM.__init__`` and before the helix CP mapping is restored, so
 the private drafter sees the mapping main's drafter was built under. It swaps
 ``draft_model`` / ``spec_worker`` in ``self.epilogue`` too, calls
@@ -158,22 +134,11 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..kernels.k3r_spec.dspark_markov_fused import fused_markov_supported
-from ..kernels.k3r_spec.spec_tail_kernels import (
-    DraftBlockPlacement,
-    spec_tail_fusion_enabled,
-    tail_v2_enabled,
-)
+from ..kernels.k3r_spec.spec_tail_kernels import DraftBlockPlacement
 from ..ops.spec.k3_fused_markov_chain_logits import k3_fused_markov_chain_logits
 from ..ops.spec.k3_scatter_rows_to_pool import k3_scatter_rows_to_pool
-from .dflash import (
-    DraftArSites,
-    HelixDraftShard,
-    K3DFlashWorker,
-    dflash_draft_slot_ids,
-    draft3_glue_enabled,
-    draft_gemm,
-)
-from .features import active as _features
+from .constants import K3Sm107Constants
+from .dflash import DraftArSites, HelixDraftShard, K3DFlashWorker, dflash_draft_slot_ids
 from .layers import (
     Bf16Linear,
     EmbeddingTable,
@@ -331,81 +296,6 @@ def dspark_markov_chain(
     return torch.stack(sampled, dim=1), torch.cat(corrected, dim=1)
 
 
-def draft_helix_a2a_enabled() -> bool:
-    """Whether the drafter's helix mapping inherits the target's cp_config."""
-    return _features().ull2_draft_a2a
-
-
-def draft_helix_store_enabled() -> bool:
-    """Whether a helix drafter takes the fused block RoPE with an owner-masked pool store."""
-    return _features().ull2_draft_store
-
-
-def draft_helix_tail(
-    mapping: Mapping,
-    rows: torch.Tensor,
-    stats: torch.Tensor,
-    w_uv: torch.Tensor,
-    zero_kv_mask: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
-    """One drafter layer's helix V up-projection, exchange and combine in one launch, or None.
-
-    Args:
-        mapping: The drafter's helix mapping (tp 1, cp = the repurposed group).
-        rows: BF16 ``[T, H, kv_lora_rank]`` (or any view with T * H contiguous rows) latent
-            attention output of this rank's pages, every head.
-        stats: FP32 ``[T, H, 2]`` ``(max, sum)`` of ``rows``, as ``_helix_post_process`` takes them.
-        w_uv: BF16 ``[H, v_head_dim, kv_lora_rank]`` V up-projection.
-        zero_kv_mask: Optional bool ``[T]``, True where this rank holds no key of the token.
-
-    Returns:
-        BF16 ``[T, H / cp * v_head_dim]``: this rank's heads after the merge, what the BMM +
-        ``_helix_post_process`` return; None when the switch is off or the call does not fit the
-        kernel (the caller keeps that path). The decision depends only on shapes and settings, so
-        every rank takes the same branch.
-    """
-    if not draft_helix_a2a_enabled():
-        return None
-    if not mapping.has_cp_helix() or mapping.cp_config.get("use_nccl_for_alltoall", True):
-        return None
-    if get_sm_version() not in (100, 103, 107):
-        return None
-    from ..kernels.k3r_helix import k3_helix_tail as kernel
-    from .mla import K3HelixTail
-
-    if w_uv.dim() != 3 or rows.dtype != torch.bfloat16 or w_uv.dtype != torch.bfloat16:
-        return None
-    num_heads, v_dim, latent_dim = w_uv.shape
-    cp_size = mapping.cp_size
-    if not kernel.can_run(cp_size, num_heads, latent_dim, v_dim):
-        return None
-    if not rows.is_contiguous() or not stats.is_contiguous() or not w_uv.is_contiguous():
-        return None
-    num_tokens = rows.numel() // (num_heads * latent_dim)
-    if num_tokens == 0 or stats.numel() != num_tokens * num_heads * 2:
-        return None
-    tail = K3HelixTail._cache.get(mapping)
-    if tail is None:
-        if torch.cuda.is_current_stream_capturing():
-            # The receive buffer is allocated collectively, outside graph capture; an eager
-            # forward on every rank creates it first.
-            logger.warning_once(
-                "DSpark drafter helix tail: no receive buffer before graph capture, the "
-                "captured drafter keeps the separate exchange.",
-                key="dspark_ull2_tail_capture",
-            )
-            return None
-        tail = K3HelixTail.get(mapping)
-    if num_tokens * cp_size * kernel.record_bytes(num_heads // cp_size, v_dim) > tail.half_bytes:
-        return None
-    return tail(
-        rows.reshape(num_tokens, num_heads, latent_dim),
-        stats.reshape(num_tokens, num_heads, 2),
-        w_uv,
-        zero_kv_mask,
-    )
-
-
 k3_dspark_mla_block_rope = None
 k3_dspark_mla_ctx_norm_rope = None
 if IS_CUTLASS_DSL_AVAILABLE:
@@ -414,7 +304,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     )
 
     # Main's DSpark RMSNorm + RoPE kernel compiled for row-strided input, and
-    # TLLM_DSPARK_TAIL_V2's MLA RoPE kernels.
+    # the dspark_tail_v2 MLA RoPE kernels.
     from ..ops.spec.k3_dspark_mla_block_rope import k3_dspark_mla_block_rope
     from ..ops.spec.k3_dspark_mla_ctx_norm_rope import k3_dspark_mla_ctx_norm_rope
     from ..ops.spec.k3_dspark_rmsnorm_rope import k3_dspark_rmsnorm_rope
@@ -475,11 +365,8 @@ class _PendingDown(NamedTuple):
     mlp: GatedMlp
 
     def partial(self) -> torch.Tensor:
-        """The un-reduced down projection: the pinned split-K GEMM where it applies, else
-        cuBLAS."""
-        weight = self.mlp.down_proj.weight
-        out = draft_gemm(self.h2, weight, "down")
-        return out if out is not None else bf16_linear(self.h2, weight)
+        """The un-reduced down projection (cuBLAS)."""
+        return bf16_linear(self.h2, self.mlp.down_proj.weight)
 
 
 def _draft_mlp(
@@ -490,21 +377,18 @@ def _draft_mlp(
 ):
     """The drafter MLP on ``x``: ``mlp(x, final_all_reduce_params=down_all_reduce_params)``.
 
-    Where the caller reduces the down projection itself (``enable_allreduce=False``) the gate_up /
-    down GEMMs are the pinned split-K ones of ``dspark_draft_gemm`` where they apply, around the
-    same ``silu_and_mul``, and with ``defer_down`` the down projection is returned unrun, as a
-    :class:`_PendingDown`, for the all-reduce site that consumes it.
+    Where the caller reduces the down projection itself (``enable_allreduce=False``) and asks for
+    ``defer_down``, the gate_up GEMM and ``silu_and_mul`` run and the down projection is returned
+    unrun, as a :class:`_PendingDown`, for the all-reduce site that consumes it.
     """
-    h1 = None
-    if down_all_reduce_params is not None and not down_all_reduce_params.enable_allreduce:
-        weight = mlp.gate_up_proj.weight
-        h1 = draft_gemm(x, weight, "gate_up")
-        if h1 is None and defer_down:
-            h1 = bf16_linear(x, weight)
-    if h1 is None:
-        return mlp(x, final_all_reduce_params=down_all_reduce_params)
-    pending = _PendingDown(gated_activation(h1, "silu"), mlp)
-    return pending if defer_down else pending.partial()
+    if (
+        defer_down
+        and down_all_reduce_params is not None
+        and not down_all_reduce_params.enable_allreduce
+    ):
+        h1 = bf16_linear(x, mlp.gate_up_proj.weight)
+        return _PendingDown(gated_activation(h1, "silu"), mlp)
+    return mlp(x, final_all_reduce_params=down_all_reduce_params)
 
 
 def _mla_rope_into(
@@ -1442,7 +1326,7 @@ class _K3DFlashDrafterMixin:
 
 
 def _latent_cache_helix_mapping(
-    mapping: Mapping, helix_mapping: Optional[Mapping], inherit_cp_config: bool = False
+    mapping: Mapping, helix_mapping: Optional[Mapping]
 ) -> Optional[Mapping]:
     """The mapping that splits a one-latent-per-token cache by pages over a helix group.
 
@@ -1453,10 +1337,7 @@ def _latent_cache_helix_mapping(
     that does not apply: no helix, attention DP, pipeline parallelism, a single rank, or
     a draft TP group that does not divide the target's CP (target tp > 1).
 
-    ``inherit_cp_config=True`` gives the result ``helix_mapping``'s cp_config (its
-    all-to-all transport, e.g. ``use_nccl_for_alltoall: false`` for the MNNVL exchange)
-    with cp_type HELIX; otherwise its cp_config is ``{cp_type: HELIX}`` alone, the NCCL
-    all-to-all.
+    The result's cp_config is ``{cp_type: HELIX}`` alone: the NCCL all-to-all.
     """
     if (
         helix_mapping is None
@@ -1467,15 +1348,12 @@ def _latent_cache_helix_mapping(
         or helix_mapping.cp_size % mapping.tp_size != 0
     ):
         return None
-    cp_config = {"cp_type": CpType.HELIX}
-    if inherit_cp_config:
-        cp_config = {**helix_mapping.cp_config, **cp_config}
     return Mapping(
         world_size=mapping.world_size,
         rank=mapping.rank,
         gpus_per_node=mapping.gpus_per_node,
         cp_size=mapping.tp_size,
-        cp_config=cp_config,
+        cp_config={"cp_type": CpType.HELIX},
         tp_size=1,
         pp_size=1,
         moe_tp_size=mapping.moe_tp_size,
@@ -1495,19 +1373,14 @@ def _shard_context_kv_by_helix(draft_config, helix_mapping: Optional[Mapping]) -
     unified draft cache the pages follow the target manager's helix ledger, which the DFlash
     worker requires to be this mapping's. Returns the sharding, or None.
     """
-    # ull2_draft_a2a: exchange on the target's helix transport.
-    mapping = _latent_cache_helix_mapping(
-        draft_config.mapping, helix_mapping, inherit_cp_config=draft_helix_a2a_enabled()
-    )
+    mapping = _latent_cache_helix_mapping(draft_config.mapping, helix_mapping)
     if mapping is None:
         return None
     frozen, draft_config._frozen = draft_config._frozen, False
     draft_config.mapping = mapping
     draft_config._frozen = frozen
-    transport = "NCCL" if mapping.cp_config.get("use_nccl_for_alltoall", True) else "MNNVL"
     logger.info(
-        f"MLA DSpark: latent cache pages sharded over helix cp={mapping.cp_size} "
-        f"({transport} all-to-all)"
+        f"MLA DSpark: latent cache pages sharded over helix cp={mapping.cp_size} (NCCL all-to-all)"
     )
     return mapping
 
@@ -1552,6 +1425,7 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
         self,
         draft_config,
         *,
+        constants: K3Sm107Constants,
         dflash_attention_backend: str = "AUTO",
         helix_mapping: Optional[Mapping] = None,
     ):
@@ -1567,6 +1441,8 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
         self._fc_shard = None
         # The helix page sharding of the latent cache, or None.
         self._helix_mapping = helix
+        # The target's constants; spec_tail_fusion / dspark_tail_v2 select the fused tails.
+        self.k3_constants = constants
         self._init_dspark_heads(cfg)
 
         attn0 = self.model.layers[0].self_attn
@@ -1715,9 +1591,7 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
             )
         self._cute_dsl_checked_shape = key
 
-    def _mla_split_kv_plan(
-        self, fixup, block_size, stream: Optional[torch.cuda.Stream] = None
-    ) -> Optional[torch.Tensor]:
+    def _mla_split_kv_plan(self, fixup, block_size) -> Optional[torch.Tensor]:
         """Per-request split-KV counts for the block decode of ``fixup``'s step.
 
         The decode kernel's grid holds the uniform split of its tactic, sized
@@ -1727,9 +1601,7 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
         layer of a step decodes the same lengths, so the first layer launches
         the plan and the others reuse it; a new fixup -- the next step, or a
         CUDA graph capture -- plans again. None (the uniform split) for a
-        batch beyond the planner's request capacity. ``stream``:
-        launch the plan there (the output is allocated on the current stream;
-        the caller joins ``stream`` before a decode reads it).
+        batch beyond the planner's request capacity.
         """
         cached = self._mla_split_plan
         if cached is not None and cached[0] is fixup:
@@ -1741,14 +1613,13 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
         plan = None
         if batch <= _SPLIT_PLAN_MAX_REQUESTS:
             plan = torch.empty(batch, dtype=torch.int32, device=seq_lens.device)
-            with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
-                _launch_mla_split_plan(
-                    seq_lens,
-                    plan,
-                    num_heads=self._num_heads,
-                    seq_len_q=block_size,
-                    piece_cost=_MLA_SPLIT_PLAN_PIECE_COST_TILES,
-                )
+            _launch_mla_split_plan(
+                seq_lens,
+                plan,
+                num_heads=self._num_heads,
+                seq_len_q=block_size,
+                piece_cost=_MLA_SPLIT_PLAN_PIECE_COST_TILES,
+            )
         self._mla_split_plan = (fixup, plan)
         return plan
 
@@ -1843,7 +1714,7 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
             pool[pages, offsets] = torch.where(
                 fixup.owned.reshape(-1, 1), blk_rows, pool[pages, offsets]
             )
-        elif spec_tail_fusion_enabled() and blk_kv.is_contiguous():
+        elif self.k3_constants.spec_tail_fusion and blk_kv.is_contiguous():
             k3_scatter_rows_to_pool(blk_kv.view(-1, blk_kv.shape[-1]), pool, pages, offsets)
         else:
             pool[pages, offsets] = blk_rows
@@ -1893,8 +1764,14 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
         freqs = self._mla_freqs_cis(device)
         return torch.view_as_real(freqs).reshape(freqs.shape[0], freqs.shape[-1], 2)
 
+    @property
+    def _tail_v2(self) -> bool:
+        """Whether the fused MLA RoPE kernels (``dspark_tail_v2``, on top of ``spec_tail_fusion``)
+        are selected; :meth:`_mla_tail_v2_supported` says whether the shapes fit them."""
+        return self.k3_constants.spec_tail_fusion and self.k3_constants.dspark_tail_v2
+
     def _mla_tail_v2_supported(self, device) -> bool:
-        """Whether the shapes fit the fused MLA RoPE kernels of ``TLLM_DSPARK_TAIL_V2``.
+        """Whether the shapes fit the fused MLA RoPE kernels of ``dspark_tail_v2``.
 
         False without the CuTe DSL (no ``k3_dspark_mla_block_rope`` /
         ``k3_dspark_mla_ctx_norm_rope``).
@@ -1999,11 +1876,9 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
         weight_dtype = self._fused_kv_weight.dtype
         if projected_hidden.dtype != weight_dtype:
             projected_hidden = projected_hidden.to(weight_dtype)
-        latent = draft_gemm(projected_hidden, self._fused_kv_weight, "ctx_latent")
-        if latent is None:
-            latent = F.linear(projected_hidden, self._fused_kv_weight)
+        latent = F.linear(projected_hidden, self._fused_kv_weight)
         latent = latent.view(n, num_layers, self._head_dim)
-        if tail_v2_enabled() and self._mla_tail_v2_supported(latent.device):
+        if self._tail_v2 and self._mla_tail_v2_supported(latent.device):
             # Every layer in one launch, the RoPE table read by position in the
             # kernel; bitwise the per-layer launches below.
             return k3_dspark_mla_ctx_norm_rope(
@@ -2089,24 +1964,15 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
         device = noise_embedding.device
         num_heads = self._num_heads
         latent_dim = self.kv_lora_rank
-        # draft3_glue: per-step glue off the critical path (same values).
-        glue = draft3_glue_enabled()
-        # A caller-built fixup carries what the decode reads; the slots are not read then.
-        slots = None if glue and block_fixup is not None else ctx_cache_batch_idx.long()
+        slots = ctx_cache_batch_idx.long()
         helix = self._helix_mapping
         # dspark_tail_v2: per layer, one kernel rotates the query's rope half,
         # normalizes and rotates the block latents and stores them in the pool
         # (reading the RoPE table by position), and the cute-dsl decode follows
         # directly. Same values as the separate launches. Its store writes every
         # block position, so a helix-sharded cache, where other ranks' positions
-        # must keep their slot's value, takes the separate launches, unless
-        # ull2_draft_store stores the rows through scratch with the rank's
-        # ownership mask.
-        fused_block_rope = (
-            tail_v2_enabled()
-            and (helix is None or draft_helix_store_enabled())
-            and self._mla_tail_v2_supported(device)
-        )
+        # must keep their slot's value, takes the separate launches.
+        fused_block_rope = self._tail_v2 and helix is None and self._mla_tail_v2_supported(device)
         if fused_block_rope:
             blk_freqs = None
             freqs_real = self._mla_freqs_real(device)
@@ -2129,17 +1995,6 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
             raise ValueError(
                 f"The MLA DSpark block decode reads a {noise_embedding.dtype} latent pool, "
                 f"got {ctx_kv_cache[0].dtype}."
-            )
-        # Under helix the fused RoPE kernel writes the block latents to scratch
-        # rows, and one scatter stores the positions this rank's pages hold.
-        block_scratch = fused_block_rope and helix is not None
-        if block_scratch:
-            num_block_tokens = batch * block_size
-            blk_scratch = torch.empty(
-                (num_block_tokens, 1, self._head_dim), dtype=torch.bfloat16, device=device
-            )
-            scratch_rows, scratch_offsets = self._block_scratch_index(
-                num_block_tokens, device, cached=glue
             )
         # The decode operands are layer-invariant: built once here.
         if block_fixup is not None:
@@ -2169,21 +2024,6 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
             "MLA DSpark block decode: one cute-dsl pass over context and block, no fixup",
             key="mla_dspark_block_decode_variant",
         )
-        # Helix: the tokens this rank holds no key of, layer-invariant. Built
-        # once here when an ull2_draft_* feature is on, else per layer.
-        helix_zero_kv = (
-            fixup.kv_bounds_i32 == 0
-            if helix is not None and (draft_helix_a2a_enabled() or draft_helix_store_enabled())
-            else None
-        )
-        # glue: the first decode's split-KV plan on the drafter's side stream, beside
-        # layer 0's projections, behind the context store the worker may have put
-        # there (draft3_side_launch); joined before layer 0's first pool write.
-        plan_stream = self._draft3_side_stream() if self._draft3_side_keep else None
-        if glue:
-            plan_stream = self._draft3_side_stream()
-            plan_stream.wait_stream(torch.cuda.current_stream())
-            self._mla_split_kv_plan(fixup, block_size, stream=plan_stream)
         hidden_states = noise_embedding
         residual = None
         # A TP-sharded drafter over MNNVL: o_proj and down_proj return their
@@ -2201,9 +2041,7 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
             if partial is None:
                 hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
             if residual is None:
-                # glue: the noise embedding is this forward's own buffer, read only
-                # here; the pushed sites write new residual tensors.
-                residual = hidden_states if glue and sites is not None else hidden_states.clone()
+                residual = hidden_states.clone()
                 hs_normed = layer.input_layernorm(hs_flat)
             elif partial is not None:
                 res_flat = residual.reshape(-1, residual.shape[-1])
@@ -2221,18 +2059,14 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
                 # q_a and kv_a read the same normed input: one GEMM, split after.
                 # Both halves are consumed as row-strided views (q_a_layernorm
                 # and the fused RMSNorm+RoPE read strided rows), so no copies.
-                q_kv_a = draft_gemm(hs_normed, fused_a, "q_kv_a")
-                if q_kv_a is None:
-                    q_kv_a = bf16_linear(hs_normed, fused_a)
+                q_kv_a = bf16_linear(hs_normed, fused_a)
                 q_a = q_kv_a[:, : attn.q_lora_rank]
                 blk_latent_rows = q_kv_a[:, attn.q_lora_rank :]
             else:
                 q_a = attn.q_a_proj(hs_normed)
                 blk_latent_rows = None
             q_a_normed = attn.q_a_layernorm(q_a)
-            q = draft_gemm(q_a_normed, attn.q_b_proj.weight, "q_b")
-            if q is None:
-                q = attn.q_b_proj(q_a_normed)
+            q = attn.q_b_proj(q_a_normed)
             q = q.view(batch, block_size, num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim)
             if fused_block_rope:
                 query = torch.empty(
@@ -2243,9 +2077,6 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
                 if blk_latent_rows is None:
                     blk_latent_rows = attn.kv_a_proj_with_mqa(hs_normed)
                 num_tokens = batch * block_size
-                kv_pool = ctx_kv_cache[layer_idx][:, 0, 0]
-                if plan_stream is not None and not block_scratch:
-                    plan_stream = self._draft3_join_side()
                 k3_dspark_mla_block_rope(
                     q.view(num_tokens, num_heads, q.shape[-1]),
                     query.view(num_tokens, num_heads, query.shape[-1]),
@@ -2253,21 +2084,11 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
                     attn.kv_a_layernorm.weight,
                     flat_positions,
                     freqs_real,
-                    blk_scratch if block_scratch else kv_pool,
-                    scratch_rows if block_scratch else fixup.pages.reshape(-1),
-                    scratch_offsets if block_scratch else fixup.offsets.reshape(-1),
+                    ctx_kv_cache[layer_idx][:, 0, 0],
+                    fixup.pages.reshape(-1),
+                    fixup.offsets.reshape(-1),
                     attn.kv_a_layernorm.variance_epsilon,
                 )
-                if plan_stream is not None:
-                    plan_stream = self._draft3_join_side()
-                if block_scratch:
-                    k3_scatter_rows_to_pool(
-                        blk_scratch.view(num_tokens, -1),
-                        kv_pool,
-                        fixup.pages.reshape(-1),
-                        fixup.offsets.reshape(-1),
-                        rows_mask=fixup.owned,
-                    )
                 bmm_out(
                     q[..., : self.qk_nope_head_dim]
                     .view(num_tokens, num_heads, self.qk_nope_head_dim)
@@ -2338,21 +2159,13 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
                     blk_freqs,
                     norm_dim=latent_dim,
                 )
-                if plan_stream is not None:
-                    plan_stream = self._draft3_join_side()
                 ctx_out = self._mla_paged_attention(
                     query, blk_kv, ctx_kv_cache[layer_idx], fixup, block_size
                 )
             stats = None
-            merged = None
             if helix is not None:
                 ctx_out, stats = ctx_out
-                zero_kv = helix_zero_kv if helix_zero_kv is not None else fixup.kv_bounds_i32 == 0
-                # ull2_draft_a2a: V up-projection, exchange and combine in one launch.
-                merged = draft_helix_tail(helix, ctx_out, stats, attn._v_b_proj, zero_kv)
-            if merged is not None:
-                attn_out = merged
-            elif spec_tail_fusion_enabled():
+            if self.k3_constants.spec_tail_fusion:
                 # Same batched GEMM as the einsum, written straight into the
                 # [tokens, heads, v] rows o_proj reads, so no reshape copy.
                 attn_out = torch.empty(
@@ -2367,7 +2180,7 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
                 )
             else:
                 attn_out = torch.einsum("bshc,hvc->bshv", ctx_out, attn._v_b_proj.to(ctx_out.dtype))
-            if helix is not None and merged is None:
+            if helix is not None:
                 # V is linear, so the per-rank partials merge after it: the
                 # all-to-all moves v_head_dim (128), not kv_lora_rank (512).
                 attn_out = _draft_helix_post_process(
@@ -2376,7 +2189,7 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
                     helix,
                     attn.num_heads_tp_cp,
                     self.v_head_dim,
-                    zero_kv,
+                    fixup.kv_bounds_i32 == 0,
                 )
 
             res_flat = residual.reshape(-1, residual.shape[-1])
@@ -2418,51 +2231,7 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
             hidden_states_out, _ = self.model.norm(
                 hidden_states.reshape(-1, hidden_states.shape[-1]), res_flat
             )
-        if plan_stream is not None:
-            self._draft3_join_side()
         return hidden_states_out
-
-    def _block_scratch_index(self, num_tokens: int, device, cached: bool):
-        """Pages ``arange(num_tokens)`` and offsets ``0`` of the block scratch rows (a
-        ``[num_tokens, 1, D]`` pool view). ``cached``: built once per shape outside graph
-        capture and reused (they depend on the shape only)."""
-        cache = self.__dict__.setdefault("_draft3_scratch_index", {})
-        key = (num_tokens, device)
-        if cached and key in cache:
-            return cache[key]
-        rows = torch.arange(num_tokens, device=device)
-        index = (rows, torch.zeros_like(rows))
-        if cached and not torch.cuda.is_current_stream_capturing():
-            cache[key] = index
-        return index
-
-    def _draft3_side_stream(self) -> torch.cuda.Stream:
-        stream = self.__dict__.get("_draft3_stream")
-        if stream is None:
-            stream = self.__dict__["_draft3_stream"] = torch.cuda.Stream()
-        return stream
-
-    @property
-    def _draft3_side_keep(self) -> list:
-        return self.__dict__.setdefault("_draft3_keep", [])
-
-    def draft3_side_launch(self, launch: Callable[[], None], keep=()) -> None:
-        """Run ``launch()`` on the drafter's side stream after the current stream's work
-        (``draft3_glue``). The next ``dflash_forward`` joins the side stream before its first
-        draft-pool write; ``keep`` (the tensors the launch reads) stays referenced until then, so
-        the caching allocator does not hand their memory to the current stream while the side
-        stream may still read it."""
-        stream = self._draft3_side_stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            launch()
-        self._draft3_side_keep.append(tuple(keep))
-
-    def _draft3_join_side(self) -> None:
-        """The current stream waits for the side stream; the kept tensors are released."""
-        torch.cuda.current_stream().wait_stream(self._draft3_side_stream())
-        self._draft3_side_keep.clear()
-        return None
 
     def _draft_fused_all_reduce(self) -> Optional[TpAllReduce]:
         """The all-reduce the block decode fuses with residual + RMSNorm, or None.
@@ -2650,7 +2419,9 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, DFlashForC
         self.lm_head = target_model.lm_head
 
 
-def build_k3_dspark_draft(model_config, draft_config, lm_head, model) -> nn.Module:
+def build_k3_dspark_draft(
+    model_config, draft_config, lm_head, model, constants: K3Sm107Constants
+) -> nn.Module:
     """Build the Kimi-K3 standalone MLA DSpark drafter.
 
     The K3 shell routes only the standalone MLA drafter here; every other
@@ -2662,6 +2433,7 @@ def build_k3_dspark_draft(model_config, draft_config, lm_head, model) -> nn.Modu
         draft_config: the drafter's own ``ModelConfig``.
         lm_head: unused; the drafter shares the target's head at weight-load time.
         model: unused; kept for the draft-builder signature.
+        constants: the target's constants (``spec_tail_fusion`` / ``dspark_tail_v2``).
 
     Returns:
         The :class:`K3MLADSparkForCausalLM` drafter.
@@ -2684,6 +2456,7 @@ def build_k3_dspark_draft(model_config, draft_config, lm_head, model) -> nn.Modu
         )
     return K3MLADSparkForCausalLM(
         draft_config,
+        constants=constants,
         dflash_attention_backend=spec_config.attention_backend,
         # The target's helix CP original, set while its modules are built on the repurposed
         # mapping (KimiK3DefaultForCausalLM._setup_helix_mappings).
@@ -3103,7 +2876,9 @@ def _replace_in_epilogue(target: nn.Module, old: Optional[nn.Module], new: nn.Mo
     target.epilogue.append(new)
 
 
-def install_k3_dspark(target: nn.Module, model_config: ModelConfig) -> bool:
+def install_k3_dspark(
+    target: nn.Module, model_config: ModelConfig, constants: K3Sm107Constants
+) -> bool:
     """Replace main's DSpark drafter and worker on ``target`` with the private ones.
 
     Args:
@@ -3112,6 +2887,8 @@ def install_k3_dspark(target: nn.Module, model_config: ModelConfig) -> bool:
             ``epilogue``, ``lm_head``, ``logits_processor`` and ``model``).
         model_config: the target's ``ModelConfig``, with the mapping main's drafter was
             built under still in place.
+        constants: the target's constants; the drafter and the worker keep them
+            (``k3_constants``) and read ``spec_tail_fusion`` / ``dspark_tail_v2`` from them.
 
     Returns:
         True when the private drafter and worker were installed; False when the
@@ -3133,7 +2910,9 @@ def install_k3_dspark(target: nn.Module, model_config: ModelConfig) -> bool:
     # worker modules (and the kernel modules they import) at import time.
     from .drafter import K3DSparkWorker, build_k3_dspark_draft
 
-    draft_model = build_k3_dspark_draft(model_config, draft_config, target.lm_head, target.model)
+    draft_model = build_k3_dspark_draft(
+        model_config, draft_config, target.lm_head, target.model, constants
+    )
     if spec_config.spec_dec_mode.is_parallel_draft():
         draft_model.logits_processor = target.logits_processor
     # The drafter runs on every row: the mapping main hands get_spec_worker.
@@ -3141,6 +2920,7 @@ def install_k3_dspark(target: nn.Module, model_config: ModelConfig) -> bool:
         spec_config,
         model_config.mapping.mapping_for_full_rows(),
         target.use_separate_draft_kv_cache,
+        constants=constants,
     )
 
     _replace_in_epilogue(target, target.draft_model, draft_model)

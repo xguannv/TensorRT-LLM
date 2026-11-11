@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""K3's token-embedding gather (``ops/embedding/k3_embedding_gather``, ``features.embedding_gather``)
+"""K3's token-embedding gather (``ops/embedding/k3_embedding_gather``, ``spec_head_fusion``)
 is bitwise ``F.embedding``: every cell of ``k3_embedding_gather.CELLS`` under ``validating`` against
 the entry's reference (out-of-range ids give zero rows), and small tables at 0..32 ids."""
 

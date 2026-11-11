@@ -7,7 +7,8 @@ reference's ``_apply_attn_res``). The functions here pick the kernel for each mi
 per-token and persistent fused kernels with the RMSNorm fused in, the PDL kernels that also
 finish a pending all-reduce (a Lamport push, the row-parallel MoE tail, a deferred MoE
 residual), and the FP32 reference outside the kernels' limits. ``_DeferredMoEResidual`` and
-``_DeferredRpTail`` carry a MoE layer's residual update to the next mix.
+``_DeferredRpTail`` carry a MoE layer's residual update to the next mix. Where a target runs the
+K3 PDL kernels its ``AttnResPdl`` is passed down (``pdl``); ``None`` keeps them off.
 """
 
 from __future__ import annotations
@@ -26,11 +27,7 @@ from tensorrt_llm.logger import logger
 from ..ops.comm.k3_attn_res_lamport import k3_attn_res_lamport
 from ..ops.moe.k3_moe_residual_add import k3_moe_residual_add as k3_moe_residual_add_op
 from ..ops.norm.k3_attn_res_norm import k3_attn_res_norm
-from .features import active as _features
 from .layers import LamportPending, RMSNormWeight, rms_norm
-
-_F = _features()
-
 
 # ---------------------------------------------------------------------------
 # attn_res: per-token snapshot mixing (HF `_apply_attn_res`).
@@ -43,7 +40,7 @@ _F = _features()
 #   trtllm::attn_res_add_rmsnorm_persistent_fwd, where it implements the shape (H == 7168 and
 #   2 <= N <= 9);
 # * elsewhere trtllm::attn_res_fwd and the RMSNorm, or the FP32 reference past that op's contract.
-# The K3 PDL kernels (TRTLLM_K3_ATTN_RES_PDL) take precedence up to their own token limit.
+# The K3 PDL kernels (``AttnResPdl``) take precedence up to their own token limit.
 _FUSED_ATTN_RES_MAX_TOKENS = 32
 
 
@@ -118,7 +115,7 @@ def _note_attn_res_fusion(site: str, fused: bool, M: int, H: int, N: int) -> Non
     )
 
 
-# TRTLLM_K3_ATTN_RES_PDL: up to TRTLLM_K3_ATTN_RES_PDL_MAX_M tokens, the fused attn_res(+add)
+# The K3 PDL kernels: up to ``AttnResPdl.max_m`` tokens, the fused attn_res(+add)
 # +RMSNorm runs as the k3_attn_res_norm entry (kernels/k3_attn_res.py):
 # a CTA cluster per token that loads the weights and snapshot rows and reduces their statistics
 # before griddepcontrol.wait, i.e. under the kernel in front of it. It takes precedence over the
@@ -128,8 +125,17 @@ def _note_attn_res_fusion(site: str, fused: bool, M: int, H: int, N: int) -> Non
 # It also leaves the MoE residual update residual + bf16(routed + shared) of the BF16-add path
 # (kimi_k3_moe_residual) to the next layer's pre-attention mix, which computes it bit-identically
 # (k3_attn_res_moe_add_rmsnorm) behind the latent-up GEMM.
-_K3_ATTN_RES_PDL = _F.attn_res_pdl
-_K3_ATTN_RES_PDL_MAX_M = _F.attn_res_pdl_max_m
+
+
+class AttnResPdl(NamedTuple):
+    """How a target runs the K3 PDL attention-residual kernels."""
+
+    # Largest token count they serve.
+    max_m: int
+    # Release the dependent grid right after ``griddepcontrol.wait`` (k3_attn_res
+    # ``early_trigger``).
+    early_trigger: bool
+
 
 # Where the mix after attention (A_mid) adds the attention output to the running prefix sum, the
 # attention block pushes its o_proj output into the o_proj all-reduce's MNNVL Lamport workspace
@@ -139,16 +145,6 @@ _K3_ATTN_RES_PDL_MAX_M = _F.attn_res_pdl_max_m
 # between. Where o_proj's GEMM has no push epilogue (the MXFP8 GEMM on a prequantized KDA output)
 # a copy kernel pushes its output. The sums have the order and rounding of the finish kernel, so
 # A_mid produces the same bits.
-# TRTLLM_K3_ULL_OPROJ_SANDWICH=1: A_mid finishes the pushed o_proj all-reduce before its
-# griddepcontrol.wait (k3_attn_res ``early_poll``): it becomes resident when
-# the o_proj push GEMM passes its own wait, polls every rank's slots while o_proj runs, and only
-# its stores wait for the o_proj grid, so the o_proj -> A_mid boundary leaves the critical path
-# (the post-attention collective sandwich as two PDL grids). Same bits.
-_K3_ULL_OPROJ_SANDWICH = _F.ull_oproj_sandwich
-# TRTLLM_K3_ULL_TAIL_SANDWICH=1: the next layer's pre-attention mix
-# finishes the row-parallel MoE tail's pushed all-reduce the same way (the pre-attention sandwich:
-# tail GEMM + push, then the early-polling mix). Same bits.
-_K3_ULL_TAIL_SANDWICH = _F.ull_tail_sandwich
 
 
 class _DeferredMoEResidual(NamedTuple):
@@ -175,9 +171,17 @@ class _DeferredRpTail(NamedTuple):
         return self.residual + self.result.materialize().view(self.residual.shape)
 
 
-def _defer_moe_residual(num_tokens: int) -> bool:
+def _pdl_serves(pdl: Optional[AttnResPdl], num_tokens: int) -> bool:
+    return pdl is not None and num_tokens <= pdl.max_m
+
+
+def _early_trigger(pdl: Optional[AttnResPdl]) -> bool:
+    return pdl is not None and pdl.early_trigger
+
+
+def _defer_moe_residual(num_tokens: int, pdl: Optional[AttnResPdl]) -> bool:
     """Whether a MoE layer leaves its BF16 residual update to the next layer."""
-    return _K3_ATTN_RES_PDL and num_tokens <= _K3_ATTN_RES_PDL_MAX_M
+    return _pdl_serves(pdl, num_tokens)
 
 
 def _materialize_prefix_sum(hidden_states):
@@ -193,10 +197,12 @@ def _k3_attn_res_pdl(
     proj: nn.Linear,
     norm: RMSNormWeight,
     output_norm: RMSNormWeight,
+    *,
+    pdl: Optional[AttnResPdl],
 ):
     """``k3_attn_res_norm`` (with ``addend`` as the one addend) when enabled and applicable,
     else ``None``."""
-    if not _K3_ATTN_RES_PDL or prefix_sum.shape[0] > _K3_ATTN_RES_PDL_MAX_M:
+    if not _pdl_serves(pdl, prefix_sum.shape[0]):
         return None
     from ..kernels.k3r_attn_res import k3_attn_res
 
@@ -206,7 +212,15 @@ def _k3_attn_res_pdl(
         return None
     eps = float(norm.eps)
     out_eps = float(output_norm.eps)
-    return k3_attn_res_norm(prefix_sum, addends, block_residual, *weights, eps, out_eps)
+    return k3_attn_res_norm(
+        prefix_sum,
+        addends,
+        block_residual,
+        *weights,
+        eps,
+        out_eps,
+        early_trigger=pdl.early_trigger,
+    )
 
 
 def _k3_attn_res_lamport_applies(
@@ -215,10 +229,12 @@ def _k3_attn_res_lamport_applies(
     proj: nn.Linear,
     norm: RMSNormWeight,
     output_norm: RMSNormWeight,
+    *,
+    pdl: Optional[AttnResPdl],
 ) -> bool:
     """Whether A_mid on ``prefix_sum`` can read its addend from a Lamport workspace: the
     vectorized PDL attn_res kernel serves the ADD_PREFIX mix."""
-    if not _K3_ATTN_RES_PDL or prefix_sum.shape[0] > _K3_ATTN_RES_PDL_MAX_M:
+    if not _pdl_serves(pdl, prefix_sum.shape[0]):
         return False
     from ..kernels.k3r_attn_res import k3_attn_res
 
@@ -233,19 +249,19 @@ def _k3_attn_res_pdl_lamport(
     proj: nn.Linear,
     norm: RMSNormWeight,
     output_norm: RMSNormWeight,
-    entry_trigger: bool = False,
+    *,
+    pdl: Optional[AttnResPdl],
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """``(prefix_sum + all-reduce result, normed mix)``: the mix finishes the pushed all-reduce and
     reads the result from the Lamport workspace (``k3_attn_res_lamport``), or
-    ``None`` if that does not apply. ``entry_trigger``: release the dependent at kernel entry (the
-    caller checked that the next launch is the ULL front's head)."""
+    ``None`` if that does not apply."""
     if tuple(addend.shape) != tuple(prefix_sum.shape) or not _k3_attn_res_lamport_applies(
-        prefix_sum, block_residual, proj, norm, output_norm
+        prefix_sum, block_residual, proj, norm, output_norm, pdl=pdl
     ):
         return None
     M, H = prefix_sum.shape
     _note_attn_res_fusion(
-        "add+attn_res+norm/pdl/lamport_finish" + ("/entry" if entry_trigger else ""),
+        "add+attn_res+norm/pdl/lamport_finish",
         True,
         M,
         H,
@@ -264,8 +280,7 @@ def _k3_attn_res_pdl_lamport(
         float(output_norm.eps),
         *addend.finish_args,
         False,
-        _K3_ULL_OPROJ_SANDWICH,
-        entry_trigger,
+        early_trigger=pdl.early_trigger,
     )
 
 
@@ -276,17 +291,14 @@ def _k3_attn_res_pdl_rp_tail(
     norm: RMSNormWeight,
     output_norm: RMSNormWeight,
     mxfp8: bool = False,
-    entry_trigger: bool = False,
-    prefix_out: Optional[torch.Tensor] = None,
+    *,
+    pdl: Optional[AttnResPdl],
 ) -> Optional[Tuple[torch.Tensor, ...]]:
     """``(prefix_sum, normed mix)`` of a deferred row-parallel MoE tail: the mix finishes the
     pushed all-reduce, reads it from the Lamport workspace and adds it to the residual with a
     round-to-nearest BF16 add; ``None`` if the
     vectorized PDL kernel does not serve the shape. With ``mxfp8``, ``(prefix_sum, normed mix, xq,
-    xs)``. ``entry_trigger`` (with ``mxfp8``): the kernel releases its dependent at entry (a KDA
-    QKVG projection that stages its weights, as in ``_k3_attn_res_pdl_moe_add``). ``prefix_out``
-    (``TRTLLM_K3_ULL_HYGIENE``, a contiguous buffer of the residual's shape outside
-    ``block_residual``): the kernel stores ``prefix_sum`` there (the same bits)."""
+    xs)``."""
     residual, result = deferred
     if tuple(result.shape) != tuple(residual.shape):
         return None
@@ -304,8 +316,6 @@ def _k3_attn_res_pdl_rp_tail(
         int(block_residual.shape[0]) + 1,
     )
     ws = result.workspace
-    # TRTLLM_K3_ULL2_COLL_CP_TAIL: the call carries the column-parallel tail's all-gather rows.
-    finish_ag = result.finish_ag
     return k3_attn_res_lamport(
         residual,
         ws.uc_local,
@@ -316,11 +326,8 @@ def _k3_attn_res_pdl_rp_tail(
         float(output_norm.eps),
         *result.finish_args,
         True,
-        _K3_ULL_TAIL_SANDWICH or finish_ag,
-        entry_trigger and mxfp8,
-        finish_ag,
         mxfp8=mxfp8,
-        updated=prefix_out,
+        early_trigger=_early_trigger(pdl),
     )
 
 
@@ -333,6 +340,8 @@ def _k3_attn_res_pdl_moe_add(
     mxfp8: bool = False,
     entry_trigger: bool = False,
     mx_atom: bool = False,
+    *,
+    pdl: Optional[AttnResPdl],
 ) -> Optional[Tuple[torch.Tensor, ...]]:
     """``(prefix_sum, normed mix)`` of a deferred MoE residual update, or ``None``; with
     ``mxfp8``, ``(prefix_sum, normed mix, xq, xs)`` (the MXFP8 form of the mix).
@@ -340,7 +349,7 @@ def _k3_attn_res_pdl_moe_add(
     (``k3_attn_res_norm``), for a KDA QKVG projection that stages its weights.
     ``mx_atom`` (with ``mxfp8``): ``xs`` in the mid-M GEMM's layout."""
     residual, routed, shared = deferred
-    if residual.shape[0] > _K3_ATTN_RES_PDL_MAX_M:
+    if not _pdl_serves(pdl, residual.shape[0]):
         return None
     from ..kernels.k3r_attn_res import k3_attn_res
 
@@ -360,6 +369,7 @@ def _k3_attn_res_pdl_moe_add(
             mxfp8=True,
             entry_trigger=entry_trigger,
             mx_atom=mx_atom,
+            early_trigger=pdl.early_trigger,
         )
     return k3_attn_res_norm(
         residual,
@@ -368,6 +378,7 @@ def _k3_attn_res_pdl_moe_add(
         *weights,
         float(norm.eps),
         float(output_norm.eps),
+        early_trigger=pdl.early_trigger,
     )
 
 
@@ -377,6 +388,8 @@ def _apply_attn_res_rmsnorm_fused(
     proj: nn.Linear,
     norm: RMSNormWeight,
     output_norm: RMSNormWeight,
+    *,
+    pdl: Optional[AttnResPdl],
 ) -> Optional[torch.Tensor]:
     """Fuse attention-residual mixing with its immediately following norm."""
     if (
@@ -391,7 +404,7 @@ def _apply_attn_res_rmsnorm_fused(
     # The fused path is taken for M <= _FUSED_ATTN_RES_MAX_TOKENS, H == 7168 and
     # N <= 12, which is the measured window; larger token counts have not been
     # measured and fall back to the unfused add + attn_res_fwd + RMSNorm path.
-    pdl_out = _k3_attn_res_pdl(prefix_sum, None, block_residual, proj, norm, output_norm)
+    pdl_out = _k3_attn_res_pdl(prefix_sum, None, block_residual, proj, norm, output_norm, pdl=pdl)
     if pdl_out is not None:
         _note_attn_res_fusion("attn_res+norm/pdl", True, M, H, N)
         return pdl_out
@@ -435,6 +448,8 @@ def _apply_attn_res_add_rmsnorm_fused(
     proj: nn.Linear,
     norm: RMSNormWeight,
     output_norm: RMSNormWeight,
+    *,
+    pdl: Optional[AttnResPdl],
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Fuse ``prefix_sum + addend``, attention-residual, and trailing norm.
 
@@ -457,7 +472,7 @@ def _apply_attn_res_add_rmsnorm_fused(
     K = int(block_residual.shape[0])
     N = K + 1
     # Same measured window as _apply_attn_res_rmsnorm_fused above.
-    pdl_out = _k3_attn_res_pdl(prefix_sum, addend, block_residual, proj, norm, output_norm)
+    pdl_out = _k3_attn_res_pdl(prefix_sum, addend, block_residual, proj, norm, output_norm, pdl=pdl)
     if pdl_out is not None:
         _note_attn_res_fusion("add+attn_res+norm/pdl", True, M, H, N)
         return pdl_out
@@ -538,9 +553,13 @@ def _apply_attn_res_and_rmsnorm(
     proj: nn.Linear,
     norm: RMSNormWeight,
     output_norm: RMSNormWeight,
+    *,
+    pdl: Optional[AttnResPdl],
 ) -> torch.Tensor:
     """Apply attention-residual selection and the next RMSNorm."""
-    fused = _apply_attn_res_rmsnorm_fused(prefix_sum, block_residual, proj, norm, output_norm)
+    fused = _apply_attn_res_rmsnorm_fused(
+        prefix_sum, block_residual, proj, norm, output_norm, pdl=pdl
+    )
     if fused is not None:
         return fused
     mixed = _apply_attn_res(prefix_sum, block_residual, proj, norm)
@@ -554,26 +573,27 @@ def _apply_attn_res_add_and_rmsnorm(
     proj: nn.Linear,
     norm: RMSNormWeight,
     output_norm: RMSNormWeight,
-    entry_trigger: bool = False,
+    *,
+    pdl: Optional[AttnResPdl],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Add an attention output to the running residual, then select and norm.
 
     ``addend`` may be a ``LamportPending``: the attention block's pushed all-reduce, which the PDL
     attn_res kernel finishes where it serves the mix and the finish kernel turns into a tensor
-    otherwise. ``entry_trigger``: see :func:`_k3_attn_res_pdl_lamport`."""
+    otherwise."""
     if isinstance(addend, LamportPending):
         fused = _k3_attn_res_pdl_lamport(
-            prefix_sum, addend, block_residual, proj, norm, output_norm, entry_trigger
+            prefix_sum, addend, block_residual, proj, norm, output_norm, pdl=pdl
         )
         if fused is not None:
             return fused
         addend = addend.materialize()
     fused = _apply_attn_res_add_rmsnorm_fused(
-        prefix_sum, addend, block_residual, proj, norm, output_norm
+        prefix_sum, addend, block_residual, proj, norm, output_norm, pdl=pdl
     )
     if fused is not None:
         return fused
     updated_prefix_sum = prefix_sum + addend
     return updated_prefix_sum, _apply_attn_res_and_rmsnorm(
-        updated_prefix_sum, block_residual, proj, norm, output_norm
+        updated_prefix_sum, block_residual, proj, norm, output_norm, pdl=pdl
     )

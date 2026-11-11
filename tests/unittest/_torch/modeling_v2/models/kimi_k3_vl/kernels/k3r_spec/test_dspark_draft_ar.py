@@ -64,6 +64,9 @@ def _differ(ref, out):
 def _run_rank(world_size):
     os.environ["TLLM_TEST_MNNVL"] = "1"
     os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_gemm.low_m_bf16_splitk import (  # noqa: E501
+        run_splitk_dense,
+    )
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_spec.dspark_draft_ar import (  # noqa: E501
         ar_norm_config,
     )
@@ -75,9 +78,6 @@ def _run_rank(world_size):
     )
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec.k3_draft_gemm_push import (  # noqa: E501
         k3_draft_gemm_push,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.spec.k3_splitk_dense import (  # noqa: E501
-        k3_splitk_dense,
     )
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.sm107_parts.dflash import (  # noqa: E501
         DraftArSites,
@@ -169,7 +169,7 @@ def _run_rank(world_size):
             y = run_gemm(x, w, torch.empty(m, HIDDEN, device="cuda", dtype=torch.bfloat16), tactic)
             if m <= 32:
                 y_vendored = torch.empty_like(y)
-                k3_splitk_dense(x, w.t(), None, y_vendored, True, tactic)
+                run_splitk_dense(x, w.t(), None, y_vendored, True, tactic)
                 bad += _differ(y_vendored, y)
             ref_out, ref_res = reference(y, res)
             target = lamport_push_target(allreduce, m, HIDDEN)

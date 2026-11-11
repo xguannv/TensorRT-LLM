@@ -30,7 +30,7 @@ One forward of ``T`` tokens (the first ``T_ctx`` context rows):
 
 1. **Front**: the fused q_a / kv_a projection (on the MXFP8 layer input the decoder layer hands
    over, where its GEMM takes it; a BF16 one is ``trtllm::cublas_mm``), the q_a RMSNorm
-   (FlashInfer, or with ``features.mla_q_norm_pdl`` its PDL-at-launch variant) beside the kv_a
+   (FlashInfer, or with ``K3Sm107Constants.mla_q_norm_pdl`` its PDL-at-launch variant) beside the kv_a
    RMSNorm on the attention aux stream, then q_b (the context rows of a Helix rank: its head range
    only) beside the latent row ``concat(kv_a_norm, k_pe)``.
 2. **Context** rows: ``forward_context``.
@@ -90,12 +90,6 @@ Sizes and features:
 * o_proj's operand: where the side-stream output gate is joined before the tail, the receivers
   also store the MXFP8 form of ``bf16(out * gate)`` (``mx_out``), and o_proj runs the MXFP8
   low-M GEMM with the all-reduce push epilogue on it (bitwise the gated low-M GEMM + push).
-* ``features.ull2_mla_tail``: the senders stage the task plan before the grid wait, fold any
-  number of split tasks with one code path and pad the latent rows for the V up-projection
-  (``k3_helix_tail`` ``ull2``; bitwise the default). Read at every call; FP16 split partials
-  (``features.fp4_mla_f16_partials``) always take that path. For a batch of at most
-  :data:`_LATE_TAIL_MAX_TOKENS` tokens the decode before the tail then does not release it early
-  (:func:`decode_releases_tail_early`).
 
 Kimi K3 MLA context attention: one kernel chain per cache state.
 
@@ -198,7 +192,7 @@ from ..ops.attention import _fp4_mla_decode as fp4_mla_decode
 from ..ops.attention import k3_fp4_mla_decode as _decode_op
 from ..ops.attention.k3_context_fmha import k3_context_fmha
 from ..ops.attention.static_quantize_e4m3 import static_quantize_e4m3
-from .features import active as _features
+from .constants import K3Sm107Constants
 from .layers import fork_join, rms_norm
 
 try:
@@ -678,7 +672,6 @@ __all__ = [
     "tail_output_buffer",
     "K3MLAAttention",
     "identity_rope_table",
-    "ull3_gate_place",
 ]
 
 
@@ -1061,28 +1054,6 @@ def forward_context(
     return context_default(layer, q, compressed_kv, md, output, latent_cache)
 
 
-# Batches of at most this many tokens (helix n4 batches included) start the tail after the decode
-# instead of at the decode's entry (the decode then releases it from its epilogue, once its last KV
-# tile is done; ``ops/attention/_fp4_mla_decode``).
-_LATE_TAIL_MAX_TOKENS = 32
-
-
-def ull2_tail_enabled() -> bool:
-    return _features().ull2_mla_tail
-
-
-def decode_releases_tail_early(num_tokens: int) -> bool:
-    """Whether the FP4 decode before the fused tail releases it at the decode's entry
-    (``DeferredPackedReduce.release_early``, with ``features.fp4_mla_reduce_pdl``).
-
-    With ``features.ull2_mla_tail`` and at most :data:`_LATE_TAIL_MAX_TOKENS` tokens it does not:
-    a tail grid that is resident during the whole decode folds and projects 2-4 us slower once
-    the decode completes than one launched at its end, more than the early launch hides. Larger
-    batches launch most of their tail CTAs at the decode's end anyway and gain from the others.
-    """
-    return not (ull2_tail_enabled() and num_tokens <= _LATE_TAIL_MAX_TOKENS)
-
-
 def _check_cu_result(cu_func_ret):
     """The values a CUDA driver call returned after its status, raising if it failed."""
     if isinstance(cu_func_ret, tuple):
@@ -1222,7 +1193,6 @@ class K3HelixTail:
             timestamps=timestamps,
             loopback=self.loopback,
             mx_atom=mx_atom,
-            ull2=ull2_tail_enabled(),
         )
         return out
 
@@ -1260,8 +1230,6 @@ def fold_inputs_of(deferred, rows: torch.Tensor, stats: torch.Tensor):
     )
 
 
-_gen_F = _features()
-
 # Largest generation batch (tokens) the fused query serves (the kernel takes up to 16).
 _Q_FUSED_MAX_TOKENS = 16
 
@@ -1272,15 +1240,14 @@ class HelixGenHooks:
 
     ``zero_kv_mask_fn`` returns the zero-local-KV mask computed ahead on the side stream (called
     where the exchange needs it); ``pre_exchange_fn`` forks the output gate; ``pre_tail_fn`` joins
-    it before the fused tail and returns it (None if not forked yet); ``gate_place`` is the
-    ``features.ull3_mla_gate_at`` placement. Back: ``tail_mx``, the MXFP8 o_proj operand
+    it before the fused tail and returns it (None if not forked yet). Back: ``tail_mx``, the MXFP8
+    o_proj operand
     ``(xq, xs)`` the fused tail stored, and ``gen_output``, the combined all-to-all output."""
 
     __slots__ = (
         "zero_kv_mask_fn",
         "pre_exchange_fn",
         "pre_tail_fn",
-        "gate_place",
         "tail_mx",
         "gen_output",
     )
@@ -1290,12 +1257,10 @@ class HelixGenHooks:
         zero_kv_mask_fn: Callable[[], Optional[torch.Tensor]],
         pre_exchange_fn: Callable[[], None],
         pre_tail_fn: Callable[[], Optional[torch.Tensor]],
-        gate_place: str,
     ) -> None:
         self.zero_kv_mask_fn = zero_kv_mask_fn
         self.pre_exchange_fn = pre_exchange_fn
         self.pre_tail_fn = pre_tail_fn
-        self.gate_place = gate_place
         self.tail_mx: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self.gen_output: Optional[torch.Tensor] = None
 
@@ -1386,11 +1351,9 @@ def helix_tail_applies(layer, num_tokens: int) -> bool:
     )
 
 
-def gen_attention(
-    layer, q: torch.Tensor, md: AttentionMetadata, q_rows_external: bool = False, **kwargs
-) -> torch.Tensor:
+def gen_attention(layer, q: torch.Tensor, md: AttentionMetadata, **kwargs) -> torch.Tensor:
     """The absorbed decode: K3's packed FP4 decode on an FP4 cache with the CuTe DSL FP4 MLA
-    backend, ``TrtllmAttention.forward`` otherwise."""
+    backend (with the layer's ``constants``), ``TrtllmAttention.forward`` otherwise."""
     if fp4_mla_decode.applies(layer.mqa):
         assert kwargs.get("out_scale") is None
         return _decode_op.k3_fp4_mla_decode(
@@ -1398,7 +1361,8 @@ def gen_attention(
             q,
             md,
             softmax_stats_tensor=kwargs.get("softmax_stats_tensor"),
-            q_rows_external=q_rows_external,
+            page_plan=layer.constants.fp4_mla_page_plan,
+            reduce_pdl=layer.constants.fp4_mla_reduce_pdl,
         )
     return layer.mqa.forward(q, None, None, md, forward_args=AttentionForwardArgs(**kwargs))
 
@@ -1408,7 +1372,6 @@ def _helix_gen(
     q: torch.Tensor,
     md: AttentionMetadata,
     helix_v_up: bool,
-    q_rows_external: bool,
     hooks: Optional[HelixGenHooks],
     **kwargs,
 ) -> torch.Tensor:
@@ -1417,7 +1380,7 @@ def _helix_gen(
         (q.shape[0], layer.num_heads_tp, 2), device=q.device, dtype=torch.float32
     )
     kwargs["softmax_stats_tensor"] = softmax_stats
-    partial_o = gen_attention(layer, q, md, q_rows_external, **kwargs)
+    partial_o = gen_attention(layer, q, md, **kwargs)
     assert partial_o.shape[-1] == layer.num_heads_tp * layer.kv_lora_rank
     if hooks is not None:
         zero_kv_mask = hooks.zero_kv_mask_fn()
@@ -1438,15 +1401,14 @@ def _helix_gen_fused_tail(
     layer,
     q: torch.Tensor,
     md: AttentionMetadata,
-    q_rows_external: bool,
     output: Optional[torch.Tensor],
     hooks: Optional[HelixGenHooks],
     **kwargs,
 ) -> torch.Tensor:
     """The decode with its split reduction deferred, then one tail kernel (fold, V
-    up-projection, exchange, combine) writing ``output`` where it can. With the side gate forked
-    early (gate place other than "exchange") the tail also stores o_proj's MXFP8 operand
-    ``bf16(out * gate)`` where o_proj's gated MXFP8 GEMM takes it."""
+    up-projection, exchange, combine) writing ``output`` where it can. With the side gate
+    (``hooks``), forked before the decode and joined before the tail, the tail also stores
+    o_proj's MXFP8 operand ``bf16(out * gate)`` where o_proj's gated MXFP8 GEMM takes it."""
     from ..kernels.k3r_fp4_mla.fp4_mla_packed_reduce import DeferredPackedReduce
 
     num_tokens = q.shape[0]
@@ -1454,23 +1416,17 @@ def _helix_gen_fused_tail(
         (num_tokens, layer.num_heads_tp, 2), device=q.device, dtype=torch.float32
     )
     kwargs["softmax_stats_tensor"] = softmax_stats
-    gate_early = hooks is not None and hooks.gate_place != "exchange"
-    if gate_early:
+    if hooks is not None:
         hooks.pre_exchange_fn()
-    with DeferredPackedReduce(release_early=decode_releases_tail_early(num_tokens)) as deferred:
-        partial_o = gen_attention(layer, q, md, q_rows_external, **kwargs)
+    with DeferredPackedReduce() as deferred:
+        partial_o = gen_attention(layer, q, md, **kwargs)
     assert partial_o.shape[-1] == layer.num_heads_tp * layer.kv_lora_rank
     fold = fold_inputs_of(deferred, partial_o, softmax_stats)
     if hooks is not None:
         zero_kv_mask = hooks.zero_kv_mask_fn()
     else:
         zero_kv_mask = helix_gen_zero_kv_mask(md, num_tokens)
-    gate = None
-    if hooks is not None:
-        if gate_early:
-            gate = hooks.pre_tail_fn()
-        else:
-            hooks.pre_exchange_fn()
+    gate = hooks.pre_tail_fn() if hooks is not None else None
     cols = layer.num_heads_tp_cp * layer.v_head_dim
     out = tail_output_buffer(output, num_tokens, cols)
     mx_out = None
@@ -1500,7 +1456,6 @@ def attn_forward_gen(
     md: AttentionMetadata,
     *,
     helix_v_up: bool,
-    q_rows_external: bool = False,
     output: Optional[torch.Tensor] = None,
     hooks: Optional[HelixGenHooks] = None,
     **kwargs,
@@ -1512,11 +1467,11 @@ def attn_forward_gen(
     ``output``: the layer's buffer for the combined rows, which the fused tail writes."""
     num_tokens = q.shape[0]
     if helix_v_up and helix_tail_applies(layer, num_tokens):
-        out = _helix_gen_fused_tail(layer, q, md, q_rows_external, output, hooks, **kwargs)
+        out = _helix_gen_fused_tail(layer, q, md, output, hooks, **kwargs)
     elif layer.mapping.has_cp_helix():
-        out = _helix_gen(layer, q, md, helix_v_up, q_rows_external, hooks, **kwargs)
+        out = _helix_gen(layer, q, md, helix_v_up, hooks, **kwargs)
     else:
-        return gen_attention(layer, q, md, q_rows_external, **kwargs)
+        return gen_attention(layer, q, md, **kwargs)
     if helix_v_up and hooks is not None:
         hooks.gen_output = out
     return out
@@ -1846,11 +1801,7 @@ def forward_gen_q_fused(
         rows_per_seq=rows_per_seq or gen_len * heads,
         use_pdl=get_env_enable_pdl(),
         norm=(norm.weight, norm.variance_epsilon) if fuse_norm else None,
-        # features.ull2_mla_decode_pdl: the decode (a programmatic dependent reading only the
-        # query after its wait) starts its prologue as this kernel's CTAs finish.
-        early_trigger=_gen_F.ull2_mla_decode_pdl,
     )
-    fp4_mla_decode.mark_query_launch(md)
     if kv_stream is not None:
         kv_ready.wait()
     fused_q = torch.empty([num_tokens, heads, lora + rope], dtype=q.dtype, device=device)
@@ -1861,7 +1812,6 @@ def forward_gen_q_fused(
         fused_q.view([num_tokens, heads * (lora + rope)]),
         md,
         helix_v_up=True,
-        q_rows_external=True,
         hooks=hooks,
         attention_input_type=AttentionInputType.generation_only,
         out_scale=None,
@@ -1880,45 +1830,10 @@ def forward_gen_q_fused(
     return attn_out
 
 
-_F = _features()
-
 # Generation-only Helix batches of at most this many rows (V up-projection before the
 # all-to-all) take the side-gate forward: the zero-KV mask and the output gate
 # sigmoid(g_proj(x)) run on a side stream, and o_proj gates its input in its GEMM.
 _K3_MLA_GATE_SIDE_MAX_M = 128
-# features.mla_q_norm_pdl: the q_a RMSNorm releases the q_b GEMM at launch instead of after its
-# store (``q_norm_pdl``; same kernel code), so q_b streams its weights while q_a and the norm run.
-_K3_MLA_Q_NORM_PDL = _F.mla_q_norm_pdl
-# features.ull3_mla_gate_at (side-gate forward with the fused Helix tail): when the side-stream
-# output gate GEMM is forked. "decode" (default): right before the decode, joined before the
-# tail; "start": at the layer start with the zero-KV mask, beside q_a / kv_a; "exchange": right
-# after the decode is launched and joined before o_proj, which then gates its input itself. A
-# value "<place>:<T>,<place>" picks the first placement up to T tokens (default 16) and the
-# second above, e.g. "exchange:16,start". Scheduling only.
-_ULL3_GATE_PLACES = ("decode", "start", "exchange")
-
-
-def _parse_ull3_gate_at(value: str) -> Tuple[str, int, str]:
-    small, _, large = value.partition(",")
-    small, _, limit = small.partition(":")
-    large = large or small
-    if small not in _ULL3_GATE_PLACES or large not in _ULL3_GATE_PLACES:
-        raise ValueError(
-            f"features.ull3_mla_gate_at={value!r}: expected <place>[:<tokens>][,<place>] with "
-            f"places {_ULL3_GATE_PLACES}"
-        )
-    return small, int(limit) if limit else 16, large
-
-
-_K3_ULL3_MLA_GATE_AT = _parse_ull3_gate_at(_F.ull3_mla_gate_at)
-
-
-def ull3_gate_place(num_tokens: int) -> str:
-    """The features.ull3_mla_gate_at placement of a batch of ``num_tokens`` tokens."""
-    small, limit, large = _K3_ULL3_MLA_GATE_AT
-    return small if num_tokens <= limit else large
-
-
 # One side stream per device, shared by all MLA layers (their side work never overlaps).
 _GATE_SIDE_STREAMS: dict[int, torch.cuda.Stream] = {}
 
@@ -2061,9 +1976,13 @@ class K3MLAAttention(nn.Module):
         model_config: ModelConfig,
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
         mapping_with_cp: Optional[Mapping] = None,
+        constants: K3Sm107Constants,
     ) -> None:
         super().__init__()
         config = model_config
+        # The target's constants: ``mla_q_norm_pdl`` (q_a_norm) and the FP4 decode's
+        # ``fp4_mla_page_plan`` / ``fp4_mla_reduce_pdl`` (gen_attention).
+        self.constants = constants
         self.layer_idx = layer_idx
         self.layer_idx_str = str(layer_idx)
         self.dtype = dtype
@@ -2251,8 +2170,6 @@ class K3MLAAttention(nn.Module):
         self.fp4_kv = False
         self.fp8_cached_kv_context = False
         self._weights_transformed = False
-        # features.ull4_mla_plan_early: event of the step metadata the model pre-launched.
-        self.step_metadata_ready: Optional[torch.cuda.Event] = None
         # Side-gate forward: fork / join of the zero-KV mask and the gate on the side stream.
         self._gate_events = tuple(torch.cuda.Event() for _ in range(4))
         # Fused query: fork of the KV half after q_a, join before the decode.
@@ -2478,10 +2395,11 @@ class K3MLAAttention(nn.Module):
         return proj(hidden_states)
 
     def q_a_norm(self, q: torch.Tensor) -> torch.Tensor:
-        """The q_a RMSNorm (FlashInfer); with ``features.mla_q_norm_pdl`` and PDL the same kernel
-        releasing its dependent (q_b) at launch."""
+        """The q_a RMSNorm (FlashInfer); with ``constants.mla_q_norm_pdl`` and PDL the same kernel
+        releasing its dependent (q_b) at launch instead of after its store, so q_b streams its
+        weights while q_a and the norm run."""
         norm = self.q_a_layernorm
-        if _K3_MLA_Q_NORM_PDL and IS_FLASHINFER_AVAILABLE and get_env_enable_pdl():
+        if self.constants.mla_q_norm_pdl and IS_FLASHINFER_AVAILABLE and get_env_enable_pdl():
             from ..kernels.k3r_mla_q.q_norm_pdl import can_use
             from ..ops.attention.rmsnorm_release_at_launch import rmsnorm_release_at_launch
 
@@ -2604,11 +2522,11 @@ class K3MLAAttention(nn.Module):
         """Generation forward with the zero-KV mask and the output gate on a side stream.
 
         The mask (one small kernel) is forked once the layer input is written; the gate (one GEMM
-        with a sigmoid epilogue) is forked when the all-to-all is enqueued (or per
-        ``features.ull3_mla_gate_at``), so it runs on the SMs the all-to-all leaves idle. The main
+        with a sigmoid epilogue) is forked when the all-to-all is enqueued (with the fused Helix
+        tail: right before the decode), so it runs on the SMs the all-to-all leaves idle. The main
         stream waits for the mask where the exchange reads it and for the gate before o_proj; with
-        the fused Helix tail and an early gate, before the tail kernel, so o_proj depends on the
-        tail alone and gates its input in its GEMM (``forward_gated(_mxfp8)``)."""
+        the fused Helix tail, before the tail kernel, so o_proj depends on the tail alone and
+        gates its input in its GEMM (``forward_gated(_mxfp8)``)."""
         num_tokens = hidden_states.shape[0]
         mask_fork, mask_ready, gate_fork, gate_ready = self._gate_events
         multi_stream = do_multi_stream()
@@ -2639,8 +2557,6 @@ class K3MLAAttention(nn.Module):
             return zero_kv_mask
 
         def pre_exchange():
-            if gates:
-                return  # already forked (gate place "start")
             if multi_stream:
                 gate_fork.record()
                 with torch.cuda.stream(side):
@@ -2656,10 +2572,7 @@ class K3MLAAttention(nn.Module):
                 gate_joined[0] = True
             return gates[0] if gates else None
 
-        gate_place = ull3_gate_place(num_tokens) if multi_stream else "decode"
-        if gate_place == "start":
-            pre_exchange()
-        hooks = HelixGenHooks(zero_kv_mask_fn, pre_exchange, pre_tail, gate_place)
+        hooks = HelixGenHooks(zero_kv_mask_fn, pre_exchange, pre_tail)
         if q_fused_applies(self, hidden_states, md):
             attn_out = forward_gen_q_fused(self, hidden_states, md, hooks)
         else:
@@ -2680,25 +2593,6 @@ class K3MLAAttention(nn.Module):
             return self.o_proj.forward_gated(attn_out, gate)
         return self.o_proj(attn_out * gate)
 
-    def prelaunch_step_metadata(self, attn_metadata: AttentionMetadata) -> bool:
-        """``features.ull4_mla_plan_early``: launch, on the current stream, the step metadata the
-        first FP4 MLA generation kernel would write (generation lengths fused with the packed
-        split plan of this layer's query heads, then the device page table). Returns whether
-        anything was launched; the caller sets :attr:`step_metadata_ready` to an event recorded
-        after it."""
-        if not fp4_mla_decode.applies(self.mqa) or attn_metadata.num_contexts != 0:
-            return False
-        use_helix = (
-            getattr(attn_metadata, "helix_position_offsets", None) is not None
-            or getattr(attn_metadata, "helix_is_inactive_rank", None) is not None
-        )
-        return fp4_mla_decode.prelaunch_generation_metadata(
-            attn_metadata,
-            num_heads=self.num_heads_tp,
-            use_helix=use_helix,
-            device=self.o_proj.weight.device,
-        )
-
     def forward(
         self,
         position_ids: Optional[torch.Tensor],
@@ -2710,11 +2604,6 @@ class K3MLAAttention(nn.Module):
         assert position_ids is None, "Kimi K3 MLA is NoPE"
         if not isinstance(hidden_states, torch.Tensor):
             raise TypeError(f"Kimi K3 MLA takes BF16 rows, got {type(hidden_states).__name__}")
-        ready = self.step_metadata_ready
-        if ready is not None:
-            # features.ull4_mla_plan_early: the step metadata written on the model's side stream.
-            self.step_metadata_ready = None
-            torch.cuda.current_stream().wait_event(ready)
         try:
             if self._side_gate_applies(hidden_states, attn_metadata):
                 return self._forward_side_gate(hidden_states, attn_metadata)
@@ -2822,6 +2711,8 @@ class K3MLARuntime(nn.Module):
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
         mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
+        *,
+        constants: K3Sm107Constants,
     ) -> None:
         super().__init__()
 
@@ -2900,6 +2791,7 @@ class K3MLARuntime(nn.Module):
             model_config=attention_config,
             aux_stream_dict=aux_stream_dict,
             mapping_with_cp=mapping_with_cp,
+            constants=constants,
         )
 
     def forward(

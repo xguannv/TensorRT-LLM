@@ -1050,9 +1050,6 @@ class LamportPushTarget:
         # Set by ``lamport_push_target(deferred=True)``: the one-shot transport, finished by the
         # consumer (``LamportPending``).
         self.deferred = False
-        # The call carries all-gather rows (``k3_lamport_ar`` "ag", one-shot transport): its
-        # result is ``bf16(y + bf16(sum of the slots))``.
-        self.ag = False
 
 
 class LamportPending:
@@ -1087,11 +1084,6 @@ class LamportPending:
             ws.rank,
         )
 
-    @property
-    def finish_ag(self) -> bool:
-        """Whether the call carries all-gather rows (``finish_ag`` of ``k3_attn_res_lamport``)."""
-        return getattr(self.target, "ag", False)
-
     def materialize(self) -> torch.Tensor:
         """Finish the all-reduce into a BF16 tensor (the finish kernel on the current stream)."""
         from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
@@ -1104,7 +1096,6 @@ class LamportPending:
             self.target.one_shot,
             use_pdl=get_env_enable_pdl(),
             cpp_one_shot=self.target.cpp_one_shot,
-            ag=self.finish_ag,
         )
 
 

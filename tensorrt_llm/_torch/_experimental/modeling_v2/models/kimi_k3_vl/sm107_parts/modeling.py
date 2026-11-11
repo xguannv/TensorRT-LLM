@@ -5,8 +5,8 @@
 ``KimiK3Sm107ForConditionalGeneration`` serves every deployment ``routing.py`` admits on SM107:
 one-rank DWDP context servers, generation over Helix CP8, over Helix CP16 with the routed
 experts split MoE TP4 x EP4, and attention DP over 16 ranks. The layout comes from the engine's
-``Mapping``; the deployment's optimizations come from its ``features.py`` profile, selected
-before this module is imported.
+``Mapping``; the deployment's optimizations come from its target's ``K3Sm107Constants``
+(``K3_CONSTANTS`` of the target class, a subclass of this one).
 
 It is the vision-language model: the vision tower (MoonViT3d) and its projector, and the text
 model ``KimiK3DefaultForCausalLM``:
@@ -50,10 +50,11 @@ Checkpoint loading is in ``weights.py``.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import math
 import os
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -75,7 +76,6 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
 )
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, MetaInitException
-from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
@@ -84,7 +84,7 @@ from tensorrt_llm.logger import logger
 from ..kernels.k3r_spec.spec_decode_head import spec_decode_head
 from ..ops.attention import _fp4_mla_decode as fp4_mla_decode
 from .attn_res import (
-    _K3_ULL_TAIL_SANDWICH,
+    AttnResPdl,
     _apply_attn_res,
     _apply_attn_res_add_and_rmsnorm,
     _apply_attn_res_and_rmsnorm,
@@ -96,8 +96,8 @@ from .attn_res import (
     _k3_attn_res_pdl_rp_tail,
     _materialize_prefix_sum,
 )
+from .constants import K3Sm107Constants
 from .drafter import install_k3_dspark
-from .features import active as _features
 from .kda import K3KDALinearAttention, K3MambaMetadata
 from .layers import (
     EmbeddingTable,
@@ -108,16 +108,12 @@ from .layers import (
     subgroup_mapping,
 )
 from .mla import K3MLARuntime, resolve_attention_quant_config
-from .moe_runtime import _K3_ULL2_COLL_CP_TAIL, K3MoERuntime
+from .moe_runtime import K3MoERuntime
 from .text_config import _get_text_config, _is_kda_layer, _is_mla_layer
 from .weights import KimiK3DefaultTextWeights, KimiK3DefaultWeights
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
-
-_F = _features()
-
-_K3_FUSE_MOE_RESIDUAL = _F.fuse_moe_residual
 
 # CUDA stream priority of the MoE input stream (latent_down chain, routed-output memset).
 # Negative values rank above the main and shared-expert streams, so the latent chain that
@@ -172,56 +168,12 @@ drafter's config records which capture convention it was distilled against."""
 
 _AUX_ATTN_RES_STREAM_ENABLED = os.environ.get(KIMI_K3_AUX_ATTN_RES_STREAM_ENV, "1") == "1"
 
-# TRTLLM_K3_ATTN_RES_MXFP8=1: the pre-attention mix that folds in the previous MoE residual
-# (k3_attn_res_moe_add_rmsnorm_mx) also stores the MXFP8 form of its output, and the
-# attention's first projection (KDA fused QKVG, MLA fused q_a / kv_a) runs the low-M GEMM on it
-# (k3_fp8w_lowm_mxfp8) instead of quantizing the BF16 rows itself: bitwise the same projection,
-# generation-only batches where the projection runs the low-M kernel.
-_K3_ATTN_RES_MXFP8 = _F.attn_res_mxfp8
 
-# TRTLLM_K3_ULL_HYGIENE=1 (decode launch hygiene; the same bits): in CUDA-graph decode steps
-# (multi-stream on)
-# - the DSpark hidden-state taps (``maybe_capture_hidden_states``, a strided copy into the capture
-#   buffer) run on a side stream forked after their source and joined at the end of the model
-#   forward, instead of between the mix and the input norm of the tapped layer;
-# - at an attention-residual block boundary served by the fused column-parallel / row-parallel tail
-#   mix (``_k3_attn_res_pdl_rp_tail``), the mix writes the updated prefix sum straight into the
-#   snapshot slot of the bank, so the snapshot copy (a memcpy graph node, which also cuts the PDL
-#   edge to the next layer's first GEMM) is gone.
-_K3_ULL_HYGIENE = _F.ull_hygiene
-
-
-class _SideCopies:
-    """``TRTLLM_K3_ULL_HYGIENE``: copies that nothing reads before the end of the forward run on a
-    side stream. Each is forked after its source; the sources stay referenced until
-    :meth:`join` makes the current stream wait for every pending copy, so the caching allocator
-    cannot hand their memory to a later kernel while a copy may still read it."""
-
-    def __init__(self, stream: torch.cuda.Stream):
-        self.stream = stream
-        self._pending: List[Tuple[torch.Tensor, torch.cuda.Event]] = []
-
-    @staticmethod
-    def active() -> bool:
-        """Side copies only where the model forks side streams (CUDA graph capture)."""
-        return do_multi_stream()
-
-    def run(self, fn: Callable[[], None], source: torch.Tensor) -> None:
-        """Run ``fn`` (a copy reading ``source``) on the side stream."""
-        fork = torch.cuda.Event()
-        fork.record()
-        done = torch.cuda.Event()
-        with torch.cuda.stream(self.stream):
-            self.stream.wait_event(fork)
-            fn()
-            done.record()
-        self._pending.append((source, done))
-
-    def join(self) -> None:
-        current = torch.cuda.current_stream()
-        for _, done in self._pending:
-            current.wait_event(done)
-        self._pending.clear()
+def _attn_res_pdl(constants: K3Sm107Constants) -> Optional[AttnResPdl]:
+    """How the target runs the K3 PDL attention-residual kernels (``None``: it does not)."""
+    if not constants.attn_res_pdl:
+        return None
+    return AttnResPdl(constants.attn_res_pdl_max_m, constants.attn_res_early_trigger)
 
 
 # ---------------------------------------------------------------------------
@@ -230,17 +182,18 @@ class _SideCopies:
 
 
 class KimiK3DefaultDecoderLayer(nn.Module):
-    # TRTLLM_K3_ULL_HYGIENE: the model's side-stream copies (``None``: off).
-    _side_copies: Optional[_SideCopies] = None
-
     def __init__(
         self,
         model_config: ModelConfig,
         cfg,
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+        *,
+        constants: K3Sm107Constants,
     ):
         super().__init__()
+        self._constants = constants
+        self._attn_res_pdl = _attn_res_pdl(constants)
         self.layer_idx = layer_idx
         self.hidden_size = cfg.hidden_size
         dtype = torch.bfloat16
@@ -271,6 +224,7 @@ class KimiK3DefaultDecoderLayer(nn.Module):
                 allreduce_strategy=model_config.allreduce_strategy,
                 aux_stream=aux_stream_dict[AuxStreamType.Attention],
                 model_config=attention_config,
+                constants=constants,
             )
         else:
             self.self_attn = K3MLARuntime(
@@ -280,10 +234,13 @@ class KimiK3DefaultDecoderLayer(nn.Module):
                 aux_stream_dict=aux_stream_dict,
                 # CP original stashed by _setup_helix_mappings; None outside helix.
                 mapping_with_cp=getattr(model_config, "_helix_mapping_with_cp", None),
+                constants=constants,
             )
 
         if self.is_moe:
-            self.block_sparse_moe = K3MoERuntime(model_config, cfg, layer_idx, aux_stream_dict)
+            self.block_sparse_moe = K3MoERuntime(
+                model_config, cfg, layer_idx, aux_stream_dict, constants=constants
+            )
         else:
             # The dense MLP (layer 0): BF16 gate_up GEMM, SiTU-and-mul, down GEMM and, on a TP
             # group, the down projection's all-reduce. Attention DP replicates it (ranks own
@@ -329,9 +286,14 @@ class KimiK3DefaultDecoderLayer(nn.Module):
 
     def _attn_takes_mxfp8(self, num_rows: int, attn_metadata: AttentionMetadata) -> bool:
         """Whether the pre-attention mix should also emit its MXFP8 form for the attention mixer
-        (``TRTLLM_K3_ATTN_RES_MXFP8``; generation-only batches): the KDA fused QKVG projection
-        (``qkvg_takes_mxfp8``) or the MLA fused q_a / kv_a projection (``q_a_takes_mxfp8``)."""
-        if not _K3_ATTN_RES_MXFP8 or attn_metadata.num_contexts != 0:
+        (the target's ``attn_res_mxfp8``; generation-only batches): the KDA fused QKVG projection
+        (``qkvg_takes_mxfp8``) or the MLA fused q_a / kv_a projection (``q_a_takes_mxfp8``).
+
+        The mix that folds in the previous MoE residual (k3_attn_res_moe_add_rmsnorm_mx) then also
+        stores the MXFP8 form of its output, and that projection runs the low-M GEMM on it
+        (k3_fp8w_lowm_mxfp8) instead of quantizing the BF16 rows itself: bitwise the same
+        projection."""
+        if not self._constants.attn_res_mxfp8 or attn_metadata.num_contexts != 0:
             return False
         if self.is_kda:
             return self.linear_attn.qkvg_takes_mxfp8(num_rows)
@@ -347,27 +309,10 @@ class KimiK3DefaultDecoderLayer(nn.Module):
             mx_atom = getattr(self.self_attn.mixer, "q_a_mx_atom", None)
         return mx_atom is not None and bool(mx_atom(num_rows))
 
-    def _snapshot_slot(
-        self, block_residual: torch.Tensor, num_snapshots: int
-    ) -> Optional[torch.Tensor]:
-        """``TRTLLM_K3_ULL_HYGIENE``: on a block-boundary layer, the bank slot this layer's
-        snapshot goes to, for the fused pre-attention mix to store the prefix sum into (no copy)."""
-        if (
-            not _K3_ULL_HYGIENE
-            or self.layer_idx % self.attn_res_block_size != 0
-            or num_snapshots >= block_residual.shape[0]
-        ):
-            return None
-        return block_residual[num_snapshots]
-
-    def _capture_hidden_states(self, capture: Tuple[Any, int], value: torch.Tensor) -> None:
-        """The DSpark tap of ``capture[1]``; on the model's side stream with
-        ``TRTLLM_K3_ULL_HYGIENE`` (joined at the end of the model forward, before the drafter)."""
-        side = self._side_copies
-        if side is None or not side.active():
-            capture[0].maybe_capture_hidden_states(capture[1], value, None)
-            return
-        side.run(lambda: capture[0].maybe_capture_hidden_states(capture[1], value, None), value)
+    @staticmethod
+    def _capture_hidden_states(capture: Tuple[Any, int], value: torch.Tensor) -> None:
+        """The DSpark tap of ``capture[1]``."""
+        capture[0].maybe_capture_hidden_states(capture[1], value, None)
 
     def forward(
         self,
@@ -382,7 +327,7 @@ class KimiK3DefaultDecoderLayer(nn.Module):
         ``block_residual`` is a preallocated snapshot bank in kernel-native
         ``[K_max, M, H]`` layout. Returns the running prefix sum and the
         number of valid bank rows. The prefix sum (input and output) can be a
-        ``_DeferredMoEResidual`` (``TRTLLM_K3_ATTN_RES_PDL``).
+        ``_DeferredMoEResidual`` or ``_DeferredRpTail`` (the target's ``attn_res_pdl``).
 
         ``capture`` is ``(spec_metadata, layer_id)`` and taps the DSpark aux
         stream for the layer BEFORE this one: the aggregated stream for layer j
@@ -408,13 +353,7 @@ class KimiK3DefaultDecoderLayer(nn.Module):
                     self.self_attention_res_norm,
                     self.input_layernorm,
                     mxfp8=mxfp8,
-                    # TRTLLM_K3_ULL_TAIL_SANDWICH: release the staging KDA QKVG GEMM at kernel
-                    # entry, as the MoE-residual mix does.
-                    entry_trigger=(_K3_ULL_TAIL_SANDWICH or _K3_ULL2_COLL_CP_TAIL)
-                    and mxfp8
-                    and self.is_kda
-                    and self.linear_attn.qkvg_stages_weights(rows),
-                    prefix_out=self._snapshot_slot(block_residual, num_snapshots),
+                    pdl=self._attn_res_pdl,
                 )
                 if fused is not None:
                     hidden_states, normed, *attn_input_mxfp8 = fused
@@ -437,6 +376,7 @@ class KimiK3DefaultDecoderLayer(nn.Module):
                     and self.is_kda
                     and self.linear_attn.qkvg_stages_weights(rows),
                     mx_atom=mxfp8 and self._attn_mx_atom(rows),
+                    pdl=self._attn_res_pdl,
                 )
                 if fused is not None:
                     hidden_states, normed, *attn_input_mxfp8 = fused
@@ -480,6 +420,7 @@ class KimiK3DefaultDecoderLayer(nn.Module):
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
                 self.input_layernorm,
+                pdl=self._attn_res_pdl,
             )
         else:
             hidden_states = rms_norm(
@@ -487,10 +428,7 @@ class KimiK3DefaultDecoderLayer(nn.Module):
             )
 
         if self.layer_idx % self.attn_res_block_size == 0:
-            snapshot = block_residual[num_snapshots]
-            if prefix_sum.data_ptr() != snapshot.data_ptr():
-                # (TRTLLM_K3_ULL_HYGIENE: the fused mix above may have stored it there already.)
-                snapshot.copy_(prefix_sum)
+            block_residual[num_snapshots].copy_(prefix_sum)
             num_snapshots += 1
             valid_block_residual = block_residual[:num_snapshots]
             prefix_sum = None
@@ -509,6 +447,7 @@ class KimiK3DefaultDecoderLayer(nn.Module):
             self.mlp_res_proj,
             self.mlp_res_norm,
             self.post_attention_layernorm,
+            pdl=self._attn_res_pdl,
         )
         if self.is_kda:
             if attn_input_mxfp8:
@@ -528,15 +467,9 @@ class KimiK3DefaultDecoderLayer(nn.Module):
                 self.mlp_res_proj,
                 self.mlp_res_norm,
                 self.post_attention_layernorm,
+                pdl=self._attn_res_pdl,
             )
         else:
-            # Where the MoE front's head is the next launch after A_mid, A_mid releases it at entry.
-            releases_early = (
-                getattr(self.block_sparse_moe, "ull_front_releases_early", None)
-                if self.is_moe
-                else None
-            )
-            front_early = releases_early is not None and releases_early(prefix_sum)
             prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
                 prefix_sum,
                 hidden_states,
@@ -544,14 +477,14 @@ class KimiK3DefaultDecoderLayer(nn.Module):
                 self.mlp_res_proj,
                 self.mlp_res_norm,
                 self.post_attention_layernorm,
-                entry_trigger=front_early,
+                pdl=self._attn_res_pdl,
             )
-        if self.is_moe and _K3_FUSE_MOE_RESIDUAL:
+        if self.is_moe and self._constants.fuse_moe_residual:
             prefix_sum = self.block_sparse_moe(
                 hidden_states,
                 all_rank_num_tokens,
                 residual=prefix_sum,
-                defer_residual=_defer_moe_residual(prefix_sum.shape[0]),
+                defer_residual=_defer_moe_residual(prefix_sum.shape[0], self._attn_res_pdl),
                 # The row-parallel tail serves generation-only batches.
                 rp_tail_ok=getattr(attn_metadata, "num_contexts", 1) == 0,
             )
@@ -584,19 +517,11 @@ class KimiK3DefaultDecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-# TRTLLM_K3_ULL4_MLA_PLAN_EARLY=1: in a generation-only step (multi-stream) the model writes the
-# FP4 MLA step metadata (generation lengths + packed split plan, device page table) on a side
-# stream at the step start; the first FP4 MLA layer joins it instead of launching those kernels on
-# its critical path. The same kernels with the same inputs: bitwise.
-_K3_ULL4_MLA_PLAN_EARLY = _F.ull4_mla_plan_early
-
-
 class KimiK3DefaultModelingV2(DecoderModel):
-    # TRTLLM_K3_ULL_HYGIENE: side-stream copies of the decode step (``None``: off).
-    _side_copies: Optional[_SideCopies] = None
-
-    def __init__(self, model_config: ModelConfig):
+    def __init__(self, model_config: ModelConfig, *, constants: K3Sm107Constants):
         super().__init__(model_config)
+        self._constants = constants
+        self._attn_res_pdl = _attn_res_pdl(constants)
         cfg = _get_text_config(model_config.pretrained_config)
         self._text_cfg = cfg
         dtype = torch.bfloat16
@@ -614,23 +539,16 @@ class KimiK3DefaultModelingV2(DecoderModel):
             AuxStreamType.MoeOutputMemset: aux_stream_list[3],
         }
 
-        # The whole vocabulary on every rank: a row gather (``embedding_gather`` with the profile's
-        # ``embedding_gather``, ``F.embedding`` otherwise).
+        # The whole vocabulary on every rank: a row gather (``gather_embedding`` with the target's
+        # ``spec_head_fusion``, ``F.embedding`` otherwise).
         self.embed_tokens = EmbeddingTable(cfg.vocab_size, cfg.hidden_size, dtype=dtype)
         self.layers = nn.ModuleList(
             [
-                KimiK3DefaultDecoderLayer(model_config, cfg, layer_idx, self.aux_stream_dict)
+                KimiK3DefaultDecoderLayer(
+                    model_config, cfg, layer_idx, self.aux_stream_dict, constants=constants
+                )
                 for layer_idx in range(cfg.num_hidden_layers)
             ]
-        )
-        # TRTLLM_K3_ULL_HYGIENE: one side stream for the DSpark taps of every layer.
-        self._side_copies = _SideCopies(torch.cuda.Stream()) if _K3_ULL_HYGIENE else None
-        for layer in self.layers:
-            layer._side_copies = self._side_copies
-        # TRTLLM_K3_ULL4_MLA_PLAN_EARLY: the side stream and events of the step-metadata prelaunch.
-        self._mla_plan_stream = torch.cuda.Stream() if _K3_ULL4_MLA_PLAN_EARLY else None
-        self._mla_plan_events = (
-            (torch.cuda.Event(), torch.cuda.Event()) if _K3_ULL4_MLA_PLAN_EARLY else None
         )
         # The final norm, fused into the output attention-residual mix where that kernel serves.
         self.norm = RMSNormWeight(cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype)
@@ -650,32 +568,6 @@ class KimiK3DefaultModelingV2(DecoderModel):
             key="kimi_k3_aux_capture_mode",
         )
 
-    def _prelaunch_mla_step_metadata(self, attn_metadata: AttentionMetadata) -> None:
-        """TRTLLM_K3_ULL4_MLA_PLAN_EARLY: fork the step's FP4 MLA metadata kernels to a side stream
-        here; the first FP4 MLA layer joins it (``step_metadata_ready``)."""
-        if not do_multi_stream():
-            return
-        mixer = None
-        for layer in self.layers:
-            if layer.is_kda:
-                continue
-            candidate = getattr(layer.self_attn, "mixer", None)
-            mqa = getattr(candidate, "mqa", None)
-            if getattr(mqa, "uses_fp4_mla_attention", False) and hasattr(
-                candidate, "prelaunch_step_metadata"
-            ):
-                mixer = candidate
-                break
-        if mixer is None:
-            return
-        fork, done = self._mla_plan_events
-        fork.record()
-        with torch.cuda.stream(self._mla_plan_stream):
-            fork.wait()
-            mixer.prelaunch_step_metadata(attn_metadata)
-            done.record()
-        mixer.step_metadata_ready = done
-
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -690,7 +582,7 @@ class KimiK3DefaultModelingV2(DecoderModel):
 
         if inputs_embeds is None:
             weight = self.embed_tokens.weight
-            if _F.embedding_gather and input_ids.dim() == 1 and weight.is_contiguous():
+            if self._constants.spec_head_fusion and input_ids.dim() == 1 and weight.is_contiguous():
                 # The F.embedding rows, copied with 16-byte accesses.
                 inputs_embeds = gather_embedding(input_ids, weight)
             else:
@@ -699,8 +591,6 @@ class KimiK3DefaultModelingV2(DecoderModel):
 
         # The FP4 MLA decode plan of the previous step is stale.
         fp4_mla_decode.begin_step(attn_metadata)
-        if self._mla_plan_stream is not None and attn_metadata.num_contexts == 0:
-            self._prelaunch_mla_step_metadata(attn_metadata)
 
         block_residual = hidden_states.new_empty(
             self.num_attn_res_snapshots,
@@ -766,11 +656,8 @@ class KimiK3DefaultModelingV2(DecoderModel):
             self.output_attn_res_proj,
             self.output_attn_res_norm,
             self.norm,
+            pdl=self._attn_res_pdl,
         )
-        if self._side_copies is not None:
-            # TRTLLM_K3_ULL_HYGIENE: the DSpark taps land before anything after the model (the
-            # drafter) reads the capture buffer.
-            self._side_copies.join()
         return output
 
 
@@ -790,24 +677,16 @@ class KimiK3DefaultForCausalLM(
 
     @property
     def runtime_hooks(self) -> Optional[RuntimeHooks]:
-        """The base hooks plus the ones the target's profile turns on: the speculative decode
-        step's head in one kernel (``embedding_gather``, ``decode_prologue``) and the decode
-        step's small input uploads, the one-model sampler's Philox seeds and offsets included,
-        as one upload and one scatter at the graph replay (``pack_step_inputs``,
-        ``pack_spec_rng_uploads``)."""
-        features = _features()
-        changes = {}
-        if features.embedding_gather:
-            changes["decode_prologue"] = spec_decode_head
-        if features.pack_step_inputs:
-            changes["pack_step_inputs"] = True
-            changes["pack_spec_rng_uploads"] = True
+        """The base hooks plus, with the target's ``spec_head_fusion``, the speculative decode
+        step's head in one kernel (``decode_prologue``)."""
         hooks = super().runtime_hooks
-        if not changes:
+        if not self.k3_constants.spec_head_fusion:
             return hooks
-        return replace(hooks or DEFAULT_RUNTIME_HOOKS, **changes)
+        return replace(hooks or DEFAULT_RUNTIME_HOOKS, decode_prologue=spec_decode_head)
 
-    def __init__(self, model_config: ModelConfig):
+    def __init__(self, model_config: ModelConfig, *, constants: K3Sm107Constants):
+        # The target's constants (``K3Sm107Constants``); every layer gets the same instance.
+        self.k3_constants = constants
         mlp_fp8 = os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV, "0")
         if mlp_fp8 not in ("0", "1"):
             raise ValueError(
@@ -843,7 +722,7 @@ class KimiK3DefaultForCausalLM(
             or spec_config.spec_dec_mode.is_dspark()
         ), "Kimi K3 supports speculative decoding only with SA, DFlash or DSpark"
         super().__init__(
-            KimiK3DefaultModelingV2(model_config),
+            KimiK3DefaultModelingV2(model_config, constants=constants),
             model_config,
             hidden_size=cfg.hidden_size,
             vocab_size=cfg.vocab_size,
@@ -881,7 +760,7 @@ class KimiK3DefaultForCausalLM(
         through :func:`~.drafter.install_k3_dspark`, which keeps that contract; every other
         configuration keeps main's.
         """
-        install_k3_dspark(self, model_config)
+        install_k3_dspark(self, model_config, self.k3_constants)
 
     def _setup_helix_mappings(
         self,
@@ -1025,41 +904,6 @@ class KimiK3DefaultForCausalLM(
         model_config._helix_mapping_with_cp = self.mapping_with_cp
         model_config._frozen = True
 
-    @classmethod
-    def get_model_defaults(cls, llm_args) -> dict:
-        # - Keep block reuse opt-in because its combination with SA
-        #   speculative decoding is not validated. Both settings use V2
-        #   with the default use_kv_cache_manager_v2=True. The "auto"
-        #   setting follows the model preference and can resolve to V1.
-        # - tokens_per_block=64: keep the validated K3 page size. Earlier
-        #   releases needed it to avoid a legacy MLA fallback that could not
-        #   serve attention-DP's 96 query heads. The current FlashInfer
-        #   TRTLLM-Gen backend declines H=96 at either page size, allowing
-        #   the updated legacy TRTLLM-Gen autotuner to select a Q16 kernel.
-        return {
-            "kv_cache_config": {
-                "enable_block_reuse": False,
-                "tokens_per_block": 64,
-            }
-        }
-
-    @classmethod
-    def get_preferred_transceiver_runtime(
-        cls,
-        pretrained_config: Any = None,
-    ) -> Literal["PYTHON"]:
-        """Kimi K3 disaggregated serving requires the Python transceiver.
-
-        Only the Python NIXL transceiver (KvCacheTransceiverV2) can move
-        the KDA recurrent state; the C++ transceiver has no KDA support.
-        Adopted when the user leaves
-        ``cache_transceiver_config.transceiver_runtime`` at 'auto' and the
-        effective backend is NIXL. An explicit non-Python runtime is
-        rejected by ``get_kv_cache_manager_cls`` rather than silently
-        routed to a path that cannot transfer the recurrent state.
-        """
-        return "PYTHON"
-
 
 class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel):
     """Kimi K3 NVFP4 on SM107, sharded as the engine's mapping says.
@@ -1070,7 +914,13 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
     attributes the engine reads off the outer model (``draft_model``, ``lm_head``,
     ``runtime_hooks``, ...) are the text model's. Weight loading is the
     ``KimiK3DefaultWeights`` mixin's (``weights.py``).
+
+    Abstract: a target subclasses it and sets ``K3_CONSTANTS``, the constants the whole model
+    runs with.
     """
+
+    # The target's constants; set by every target class, read once in ``__init__``.
+    K3_CONSTANTS: ClassVar[K3Sm107Constants]
 
     _LANG_PREFIX = "language_model."
     _VISION_MODEL_CLS = KimiK3VisionModel
@@ -1089,11 +939,15 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
         cls,
         pretrained_config: Any = None,
     ) -> Literal["PYTHON"]:
-        """Default to the Python (v2) KV-cache transceiver (as Kimi K2.5).
+        """Kimi K3 disaggregated serving requires the Python transceiver.
 
-        Only adopted when the user leaves
+        Only the Python NIXL transceiver (KvCacheTransceiverV2) can move
+        the KDA recurrent state; the C++ transceiver has no KDA support.
+        Adopted when the user leaves
         ``cache_transceiver_config.transceiver_runtime`` at 'auto' and the
-        effective backend is NIXL; otherwise the C++ transceiver is used.
+        effective backend is NIXL. An explicit non-Python runtime is
+        rejected by ``get_kv_cache_manager_cls`` rather than silently
+        routed to a path that cannot transfer the recurrent state.
         """
         return "PYTHON"
 
@@ -1103,6 +957,13 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
         *args,
         **kwargs,
     ) -> None:
+        constants = getattr(type(self), "K3_CONSTANTS", None)
+        if not isinstance(constants, K3Sm107Constants):
+            raise TypeError(
+                f"{type(self).__name__} has no K3_CONSTANTS: build a Kimi K3 SM107 target class "
+                "(a subclass that sets K3_CONSTANTS to its K3Sm107Constants), not "
+                "KimiK3Sm107ForConditionalGeneration itself"
+            )
         config = model_config.pretrained_config
         # PreTrainedModel.__init__ resolves config._attn_implementation and
         # rejects the default "sdpa" unless the class declares support. This
@@ -1159,7 +1020,7 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
             text_model_config.skip_create_weights_in_init = True
         text_model_config._frozen = True
 
-        self.llm = KimiK3DefaultForCausalLM(text_model_config)
+        self.llm = KimiK3DefaultForCausalLM(text_model_config, constants=constants)
 
         self._media_placeholder_token_id = getattr(
             config, "media_placeholder_token_id", _MEDIA_PLACEHOLDER_TOKEN_ID
@@ -1199,8 +1060,16 @@ class KimiK3Sm107ForConditionalGeneration(KimiK3DefaultWeights, PreTrainedModel)
 
     @property
     def runtime_hooks(self) -> Optional[RuntimeHooks]:
-        """The text model's step-loop hooks: the engine reads them off the outer model."""
-        return self.llm.runtime_hooks
+        """The text model's step-loop hooks (the engine reads them off the outer model) and the
+        target's ``torch_mem_safety_margin``."""
+        hooks = self.llm.runtime_hooks
+        # TODO(runtime R03): drop this check once RuntimeHooks.torch_mem_safety_margin is on the branch
+        if "torch_mem_safety_margin" not in {f.name for f in dataclasses.fields(RuntimeHooks)}:
+            return hooks
+        return replace(
+            hooks or DEFAULT_RUNTIME_HOOKS,
+            torch_mem_safety_margin=self.llm.k3_constants.torch_mem_safety_margin,
+        )
 
     def set_guided_decoder(self, *args, **kwargs):
         return self.llm.set_guided_decoder(*args, **kwargs)

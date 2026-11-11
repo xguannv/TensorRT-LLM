@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The Kimi K3 MLA drafter's fused RMSNorm + RoPE kernels (``TLLM_DSPARK_TAIL_V2``).
+"""The Kimi K3 MLA drafter's fused RMSNorm + RoPE kernels (the ``dspark_tail_v2`` constant).
 
 Per row they compute what ``DSparkRMSNormRoPEKernel`` (``attention/kernels/blackwell/
 dspark_rmsnorm_rope.py``) computes, with every load of a row issued before its first store, so the

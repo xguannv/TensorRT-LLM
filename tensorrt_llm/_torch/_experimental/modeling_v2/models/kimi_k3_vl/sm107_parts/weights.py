@@ -1109,7 +1109,9 @@ class KimiK3DefaultTextWeights:
                 attention = layer.self_attn.mixer
             for name, linear in attention.named_children():
                 if _is_fp8_block_projection(linear):
-                    _swap_linear_to_fp8_weight_read(attention, name, (type(linear),))
+                    _swap_linear_to_fp8_weight_read(
+                        attention, name, (type(linear),), constants=self.k3_constants
+                    )
             fused = getattr(attention, "qkvg_proj", None)
             if isinstance(fused, _Fp8BlockScaleWeightReadLinear):
                 offset = 0
@@ -1129,6 +1131,7 @@ class KimiK3DefaultTextWeights:
             converted = _convert_moe_mlps_to_fp8_weight_read(
                 self.model,
                 include_fused_gate_up=self.model_config.mapping.enable_attention_dp,
+                constants=self.k3_constants,
             )
             logger.info(f"Kimi K3: quantized {converted} BF16 shared/latent MLP projections to FP8")
 

@@ -44,6 +44,7 @@ class K3AttnResLamport(OpWrapper):
                 entry_trigger=entry_trigger,
                 mxfp8=mxfp8,
                 into=into,
+                early_trigger=False,
                 rms_eps=1e-6,
                 out_eps=1e-6,
             ),
@@ -122,6 +123,25 @@ class K3AttnResLamport(OpWrapper):
                 True,
             ),
         )
+    ) + (
+        Cell(
+            why="helix8 A_mid, release after the grid wait: 16 rows, N=5, one-shot",
+            spec=dict(
+                rows=16,
+                candidates=5,
+                hidden=7168,
+                two_shot=False,
+                cpp_one_shot=True,
+                add_rn=False,
+                early_poll=False,
+                entry_trigger=False,
+                mxfp8=False,
+                into=False,
+                early_trigger=True,
+                rms_eps=1e-6,
+                out_eps=1e-6,
+            ),
+        ),
     )
 
     note = """
@@ -134,11 +154,13 @@ class K3AttnResLamport(OpWrapper):
     add_rn: round-to-nearest FP32 add (the MoE residual update), else the C++
     kernels' fast-math add. early_poll: finish the call and compute the mix
     before griddepcontrol.wait, store after it (same bits). entry_trigger:
-    release the dependent at kernel entry. finish_ag (one-shot): the call
+    release the dependent at kernel entry. early_trigger: release it right
+    after griddepcontrol.wait. finish_ag (one-shot): the call
     carries all-gather rows, addend = bf16(y + bf16(slot sum)); reached only
     through the column-parallel MoE tail and not in this entry's cells.
     Process-wide compile cache as k3_attn_res_norm (keyed also by world, chunk,
-    transport, add_rn, early_poll, finish_ag); compile each key before capture.
+    transport, add_rn, early_poll, finish_ag, early_trigger); compile each key
+    before capture.
     Applies where kernels/k3_attn_res.can_use_k3_attn_res holds for the
     one-addend mix (H 7168, 2 <= N <= 12, contiguous BF16).
     """
@@ -165,6 +187,7 @@ class K3AttnResLamport(OpWrapper):
         finish_ag: bool = False,
         mxfp8: bool = False,
         updated: Optional[torch.Tensor] = None,
+        early_trigger: bool = False,
     ) -> Tuple[torch.Tensor, ...]:
         if updated is not None:
             return _kernel.k3_attn_res_lamport_add_rmsnorm_into(
@@ -188,6 +211,7 @@ class K3AttnResLamport(OpWrapper):
                 early_poll,
                 entry_trigger,
                 finish_ag,
+                early_trigger=early_trigger,
             )
         op = (
             _kernel.k3_attn_res_lamport_add_rmsnorm_mx
@@ -213,6 +237,7 @@ class K3AttnResLamport(OpWrapper):
             early_poll,
             entry_trigger,
             finish_ag,
+            early_trigger=early_trigger,
         )
 
     def reference(
@@ -237,6 +262,7 @@ class K3AttnResLamport(OpWrapper):
         mxfp8: bool = False,
         updated: Optional[torch.Tensor] = None,
         ag_rows: Optional[torch.Tensor] = None,
+        early_trigger: bool = False,
     ) -> Tuple[torch.Tensor, ...]:
         """The collective exception: every rank's pushed rows in rank order replace the workspace
         addresses ``uc_local`` / ``flags``; ``ag_rows`` is the all-gathered ``y`` with
@@ -277,6 +303,7 @@ class K3AttnResLamport(OpWrapper):
         finish_ag: bool = False,
         mxfp8: bool = False,
         updated: Optional[torch.Tensor] = None,
+        early_trigger: bool = False,
     ) -> None:
         # The launcher does not re-validate: operands outside the kernel's shape are read as
         # dense rows of 7168 and give a plausible wrong mix.

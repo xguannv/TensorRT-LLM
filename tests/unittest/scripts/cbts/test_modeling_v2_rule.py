@@ -32,8 +32,24 @@ _PY = "tensorrt_llm/_torch/_experimental/modeling_v2"
 _CPP = "cpp/tensorrt_llm/modeling_v2"
 _UNIT = "unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm TIMEOUT (30)"
 _COMM = "unittest/_torch/modeling_v2/comm"
-# The SM107 Kimi K3 target directory, relative to the family's unit test directory.
-_K3_SM107_TARGET = "kimi_k3_nvfp4__sm_107__default/"
+
+
+def _k3_sm107(name: str) -> bool:
+    """Whether a test path under the family's unit directory is an SM107 Kimi K3 test.
+
+    They are the SM107 targets' tests and those of the family code the SM107 targets share:
+    ``sm107_parts/``, ``kernels/k3r_*/`` and the SM107 operations' tests in ``ops/``, whose names
+    do not start with ``test_modeling_v2_`` (the SM100 operations' do).
+    """
+    if name.startswith(("kimi_k3_nvfp4__sm_107__", "sm107_parts/", "kernels/k3r_")):
+        return True
+    return (
+        name.startswith("ops/")
+        and not name.rpartition("/")[2].startswith("test_modeling_v2_")
+        and name != "ops/comm/test_k3_mnnvl_comm.py"
+    )
+
+
 _NATIVE_UNIT = "unittest/_torch/modeling_v2/models/glm_moe_dsa/test_modeling_v2_glm_native.py"
 _GPT_OSS_TARGET = "gpt_oss_120b__sm_10x__default"
 _DEEPSEEK_ACCURACY = (
@@ -223,7 +239,7 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
         p.relative_to(repo / "tests" / prefix).as_posix()
         for p in (repo / "tests" / prefix).rglob("test_*.py")
     )
-    expected = {p for p in paths if not p.startswith(_K3_SM107_TARGET)}
+    expected = {p for p in paths if not _k3_sm107(p)}
     # The 4-GPU tests, by path under the family's unit directory: they run on GB300, every other GPU test on B300.
     collective_tests = {
         "kernels/k3_fused_moe/test_k3_fused_moe_push.py",
@@ -264,8 +280,8 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
                     ), (block.yaml_stem, entry)
                 continue
             name = target.removeprefix(prefix)
-            if name.startswith(_K3_SM107_TARGET):
-                # The SM107 target's tests have their own stages; see the test below.
+            if _k3_sm107(name):
+                # The SM107 targets' tests have their own stages; see the test below.
                 continue
             assert name not in seen, (block.yaml_stem, name)
             seen.add(name)
@@ -296,13 +312,13 @@ def test_k3_sm107_target_runs_once_on_gr100_cpu_or_gb300():
     stage; its cpu_only cases run in l0_cpu.
     """
     repo = Path(__file__).resolve().parents[4]
-    prefix = f"unittest/_torch/modeling_v2/models/kimi_k3_vl/{_K3_SM107_TARGET}"
+    prefix = "unittest/_torch/modeling_v2/models/kimi_k3_vl/"
     index = YAMLIndex.load(repo / "tests/integration/test_lists/test-db")
     seen = {}
     for block in index.blocks:
         for entry in block.tests:
             target = entry.split()[0].split("::")[0]
-            if not target.startswith(prefix):
+            if not target.startswith(prefix) or not _k3_sm107(target.removeprefix(prefix)):
                 continue
             assert block.yaml_stem in ("l0_gr100", "l0_cpu", "l0_gb300_multi_gpus"), (
                 block.yaml_stem,
@@ -310,4 +326,4 @@ def test_k3_sm107_target_runs_once_on_gr100_cpu_or_gb300():
             )
             assert (target, block.yaml_stem) not in seen, (block.yaml_stem, entry)
             seen[(target, block.yaml_stem)] = entry
-    assert any(stem == "l0_gr100" for _, stem in seen), "no GR100 entry for the SM107 target"
+    assert any(stem == "l0_gr100" for _, stem in seen), "no GR100 entry for the SM107 targets"

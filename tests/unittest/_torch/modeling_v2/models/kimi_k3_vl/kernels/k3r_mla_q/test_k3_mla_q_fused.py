@@ -34,8 +34,7 @@ the BF16 W_UK BMM and the fused FP4 generation update with its query rows. Check
 * The ``k3_mla_q_fused`` entry on its ``.CELLS`` is within one FP4 step of its plain-torch
   reference.
 
-``test_k3_ull2_mla.py`` / ``test_k3_ull4_mla.py`` / ``test_k3_ull3_mla.py`` (same directory) build
-on the FP4 cache helpers here.
+``test_k3_fp4_mla_decode.py`` builds on the FP4 cache helpers here.
 """
 
 import functools
@@ -496,21 +495,22 @@ def test_projections_match_production_gemms(num_tokens):
 
 class _DecodeAsAttention:
     """``generation.attn_forward_gen`` stand-in: K3's FP4 generation decode of every head (no
-    Helix exchange), as ``generation.gen_attention`` runs it."""
+    Helix exchange), as ``generation.gen_attention`` runs it with the helix8 settings."""
 
     def __init__(self, md):
         self.md = md
-        self.q_rows_external = None
 
-    def __call__(
-        self, layer, fused_q, md, *, helix_v_up=False, q_rows_external=False, hooks=None, **kw
-    ):
+    def __call__(self, layer, fused_q, md, *, helix_v_up=False, hooks=None, **kw):
         assert helix_v_up and kw["latent_cache"] is not None
         assert md.fp4_mla_state.generation_cache_scattered
-        self.q_rows_external = q_rows_external
         stats = torch.empty(fused_q.shape[0], H, 2, device="cuda", dtype=torch.float32)
         out = k3_decode().run_generation(
-            _attention(), fused_q, md, softmax_stats_tensor=stats, q_rows_external=q_rows_external
+            _attention(),
+            fused_q,
+            md,
+            softmax_stats_tensor=stats,
+            page_plan=True,
+            reduce_pdl=True,
         )
         assert not md.fp4_mla_state.generation_cache_scattered
         return out
@@ -594,10 +594,6 @@ def test_forward_gen_q_fused_matches_default_chain(n, monkeypatch):
         with with_multi_stream(True):
             out = generation.forward_gen_q_fused(mla, qkv, md)
         torch.cuda.synchronize()
-        # The fused query wrote the query rows and marked its launch for the decode
-        # (features.ull2_mla_decode_pdl).
-        assert decode.q_rows_external is True
-        assert k3_decode()._step(md).query_launch_mark is not None
         for p, ref in zip(_pools(mgr), ref_pools):
             assert torch.equal(p, ref)
         rel = float((out.float() - ref_out.float()).norm() / ref_out.float().norm())
@@ -679,7 +675,7 @@ def test_k3_mla_q_fused_cells(cell):
     if norm is None:
         x = _flashinfer_norm(x, w.q_norm)
     args = (x, w.w_qb, w.qb_exp, w.w_uk, gs, rot, positions, q_fp4, q_sf, gen_len, rows_per_seq,
-            True, norm, spec["early_trigger"])  # fmt: skip
+            True, norm)  # fmt: skip
     ref_q, ref_sf = op.reference(*args)
     with validating(op):
         op(*args)

@@ -28,42 +28,16 @@ at its first position.
 Jonas's selection: target and greedy draft tokens come from the private
 ``K3VocabParallelHead`` (MNNVL pair exchange, one-launch Markov chains,
 temperature-only sampling) wherever the target LM head is a plain vocab shard;
-main's head is not used. His switches, read where he read them; unset, the
-rest of the worker is main's:
+main's head is not used. The target's constants (``K3Sm107Constants``) select the
+fused tails; without them the rest of the worker is main's:
 
-* ``TLLM_SPEC_TAIL_FUSION=1`` (+ ``TLLM_DSPARK_TAIL_V2``): fused strict
-  acceptance, fused selection + acceptance, the parallel block-table decode, the
-  context latents on a side stream and ``_prepare_gen_drafter_inputs_fused`` in
-  place of main's ``_prepare_paged_latent_gen_inputs``.
-* ``TLLM_DSPARK_DRAFT_GEMM``, ``TRTLLM_K3_DRAFT3_GLUE``: drafter LM-head / glue
-  variants inside those paths; the drafter embedding there runs as the pushed
-  MNNVL lookup where it applies.
+* ``spec_tail_fusion`` (+ ``dspark_tail_v2``): fused strict acceptance, fused
+  selection + acceptance, the parallel block-table decode, the context latents
+  on a side stream and ``_prepare_gen_drafter_inputs_fused`` in place of main's
+  ``_prepare_paged_latent_gen_inputs``. The drafter embedding there runs as the
+  pushed MNNVL lookup where it applies.
 
 Optional attention dependencies used by DFlash's private context cache.
-
-Per-step glue of the MLA DSpark drafter off its critical path (``draft3_glue``).
-
-Same values: the split-KV plan of the block decode on a side stream (joined before the first
-decode), the shape-only scratch indices built once per shape, no copy of the first layer's
-residual, no unused dtype conversion of the slots, the drafter LM head reading a contiguous row
-range of the block output in place of a gather.
-
-Pinned GEMM kernels for the DSpark MLA drafter's BF16 projections.
-
-The drafter's projections run at 7 to 32 token rows. The generic low-M BF16
-dispatcher picks a kernel per shape from an isolated timing race, which does
-not see what the decode graph sees: cold weights (the drafter streams ~80 MB
-per layer) and a PDL head start from the predecessor. Under those conditions
-(measured on GB300 as predecessor RMSNorm + GEMM in a CUDA graph with PDL,
-weights rotated beyond L2) the low-M split-K tensor-core kernel at the tactics
-below beats the dispatcher's in-graph choices -- the SIMT direct kernel for
-q_b runs 6.8 us in the decode graph against 2.2 us here, and the fused
-[q_a | kv_a] projection, created after the dispatcher labelled the modules,
-falls back to cuBLAS (8-10 us against 6.6 us).
-
-``TLLM_DSPARK_DRAFT_GEMM=1`` selects them. They change the drafter's GEMM
-accumulation order (split-K partial sums), i.e. draft-token rounding only; the
-target's verification keeps the output distribution unchanged.
 
 All-reduce sites of the DSpark MLA drafter on pushed MNNVL all-reduces.
 
@@ -74,7 +48,7 @@ Where the drafter's all-reduce runs fused with the residual add and RMSNorm over
   kernel finishes the all-reduce, adds the residual and applies the following RMSNorm
   (``dspark_draft_ar.DraftArNormKernel``). The site kernel is launched behind the GEMM with PDL and
   polls while the GEMM runs; its outputs are bitwise the MNNVL fused all-reduce
-  (``RESIDUAL_RMS_NORM``) of the GEMM output. The GEMM is the split-K kernel at the tactics below
+  (``RESIDUAL_RMS_NORM``) of the GEMM output. The GEMM is the split-K kernel at the push tactics
   instead of the module's GEMM, i.e. a different FP32 accumulation order of the partial (drafter
   rounding only).
 * the embedding of the draft block: the owner rank of each token multicasts its table row and every
@@ -134,7 +108,6 @@ workspace; this class allocates one the same way
 results are those of the shared-workspace all-reduce for the same inputs.
 """
 
-import functools
 import math
 import os
 import weakref
@@ -178,8 +151,6 @@ from ..kernels.k3r_spec.spec_tail_kernels import (
     BLOCK_TABLE_CHUNK,
     TAIL_V2_MAX_GENS,
     DraftBlockPlacement,
-    spec_tail_fusion_enabled,
-    tail_v2_enabled,
     vocab_shard_embedding_applies,
 )
 from ..kernels.k3r_spec.vocab_parallel_kernels import (
@@ -204,7 +175,7 @@ from ..ops.spec.k3_store_context_latents import k3_store_context_latents
 from ..ops.spec.k3_vocab_local_select import k3_vocab_local_select
 from ..ops.spec.k3_vocab_reduce_pairs import k3_vocab_reduce_pairs
 from ..ops.spec.k3_vocab_shard_embedding import k3_vocab_shard_embedding
-from .features import active as _features
+from .constants import K3Sm107Constants
 from .layers import TpAllReduce, mnnvl_serves, mnnvl_workspace_bytes
 
 _NUM_LAMPORT_BUFFERS = 3
@@ -875,165 +846,6 @@ def combine_helix_partials(
     return (merged / total.unsqueeze(-1)).to(out.dtype)
 
 
-def draft3_glue_enabled() -> bool:
-    """Whether the drafter forward takes its per-step glue off the critical path."""
-    return _features().draft3_glue
-
-
-# role -> ((max rows, kernel, split-K tactic (mma_m, mma_n, split_k, ab_stages)), ...)
-_PINS = {
-    # [q_a | kv_a]: 2112 x 7168
-    "q_kv_a": (
-        (8, "splitk", (64, 16, 4, 8)),
-        (16, "splitk", (64, 16, 4, 9)),
-        (32, "splitk", (64, 16, 2, 11)),
-    ),
-    # q_b: 768 x 1536 per rank
-    "q_b": ((16, "splitk", (64, 8, 4, 10)), (32, "splitk", (64, 16, 3, 10))),
-    # gate_up: 1792 x 7168 per rank
-    "gate_up": ((16, "splitk", (64, 16, 4, 8)), (32, "splitk", (64, 32, 4, 8))),
-    # down: 7168 x 896 per rank
-    "down": ((32, "cublas", None),),
-    # context latents of all layers: 2880 x 7168
-    "ctx_latent": (
-        (8, "splitk", (128, 8, 4, 6)),
-        (16, "splitk", (64, 16, 2, 10)),
-        (32, "splitk", (64, 32, 2, 9)),
-    ),
-    # the draft block's LM head shard: 10240 x 7168
-    "lm_head": ((16, "splitk", (128, 16, 1, 6)), (32, "splitk", (128, 32, 1, 5))),
-}
-
-
-# Rubin (SM107), the helix16 drafter's per-rank shapes, keyed by (N, K); same entry format. Takes
-# precedence over ``_PINS`` for these shapes on SM107. Measured as CUDA graphs of 12 back-to-back
-# GEMMs with PDL over > L2 of rotating weights, us per call, cuBLAS -> pinned split-K at 7 / 14 /
-# 28 rows.
-_PINS_SM107 = {
-    # [q_a | kv_a] (replicated; scripts/draftfuse/bench_gemm.py, job 2706844): 6.46 / 6.48 / 7.17
-    # -> 3.95 / 4.07 / 4.95.
-    (2112, 7168): (
-        (8, "splitk", (64, 8, 4, 12)),
-        (16, "splitk", (64, 16, 4, 10)),
-        (32, "splitk", (64, 32, 4, 8)),
-    ),
-    # context latents of all layers (replicated; job 2706844): 6.79 / 7.45 / 7.15 -> 4.61 / 4.71 /
-    # 5.38.
-    (2880, 7168): (
-        (8, "splitk", (64, 8, 2, 12)),
-        (16, "splitk", (64, 16, 4, 10)),
-        (32, "splitk", (64, 32, 4, 8)),
-    ),
-    # The MLP and LM head shards of the TP16 group (scripts/ull_shell/bench_draft_gemm.py
-    # BG_TP=16, hecate job 834542, HBM locked): gate_up 6.02 / 6.11 / 5.72 -> 3.66 / 3.86 / 4.54;
-    # down 4.22 / 3.31 / 3.37 -> 2.50 / 2.48 / 2.60; LM head 15.65 / 14.56 / 16.09 -> 14.12 /
-    # 14.14 / 14.45.
-    # gate_up: 2 x 896
-    (1792, 7168): (
-        (8, "splitk", (64, 8, 4, 12)),
-        (16, "splitk", (64, 16, 4, 10)),
-        (32, "splitk", (64, 32, 4, 8)),
-    ),
-    # down
-    (7168, 896): (
-        (8, "splitk", (64, 8, 1, 12)),
-        (16, "splitk", (64, 16, 1, 11)),
-        (32, "splitk", (64, 32, 1, 9)),
-    ),
-    # the draft block's LM head shard
-    (10240, 7168): (
-        (8, "splitk", (128, 8, 2, 6)),
-        (16, "splitk", (64, 16, 1, 11)),
-        (32, "splitk", (64, 32, 1, 9)),
-    ),
-    # q_b of a helix drafter (latent pages sharded over the group, every head on every rank):
-    # 64 heads x 192. cuBLAS -> pinned at 8 / 16 / 32 rows: 4.75 / 4.79 / 6.65 -> 4.26 / 4.34 /
-    # 4.49 us (scripts l0ull2drafter/bench_draft_gemm.py BG_TP=1, hecate job 838031, HBM locked).
-    (12288, 1536): (
-        (8, "splitk", (64, 8, 1, 12)),
-        (16, "splitk", (64, 16, 1, 11)),
-        (32, "splitk", (64, 32, 1, 9)),
-    ),
-}
-
-
-def _pins(role: str, n: int, k: int, device: torch.device):
-    if (n, k) in _PINS_SM107 and _sm107(device.index):
-        return _PINS_SM107[(n, k)]
-    return _PINS.get(role)
-
-
-@functools.cache
-def _sm107(device_index: int) -> bool:
-    return torch.cuda.get_device_capability(device_index) == (10, 7)
-
-
-def draft_gemm_enabled() -> bool:
-    """Whether ``TLLM_DSPARK_DRAFT_GEMM=1`` pins the drafter's GEMM kernels."""
-    return _features().dspark_draft_gemm
-
-
-def draft_gemm(
-    x: torch.Tensor, weight: torch.Tensor, role: str, strided: bool = False
-) -> Optional[torch.Tensor]:
-    """``x @ weight.T`` with the kernel pinned for ``role`` at this row count.
-
-    Returns None (the caller keeps its module path) when the switch is off, the
-    row count is above the pinned range, or the operands do not fit the kernel.
-    ``strided``: a 2-D ``x`` may be a row-major view with a 16-byte-aligned row
-    stride (e.g. the q_a columns of the [q_a | kv_a] rows), read in place.
-    """
-    if not draft_gemm_enabled() or weight.dim() != 2 or not x.is_cuda:
-        return None
-    k = x.shape[-1]
-    m = x.numel() // k if k else 0
-    pins = _pins(role, weight.shape[0], k, x.device)
-    pin = next((p for p in pins or () if 0 < m <= p[0]), None)
-    if (
-        pin is None
-        or x.dtype != torch.bfloat16
-        or weight.dtype != torch.bfloat16
-        or weight.dim() != 2
-        or weight.shape[1] != k
-        or not weight.is_contiguous()
-        or not x.is_cuda
-    ):
-        return None
-    _, kind, tactic = pin
-    if kind == "cublas":
-        return F.linear(x, weight)
-    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-
-    from ..kernels.k3r_gemm.low_m_bf16_splitk import SplitKTactic
-    from ..kernels.k3r_spec.dspark_draft_gemm_push import ensure_cute_runtime
-    from ..ops.spec.k3_splitk_dense import k3_splitk_dense
-
-    # detach(): the kernel's DLPack export refuses tensors that require grad,
-    # which module parameters do even under inference mode.
-    strided = strided and x.dim() == 2 and x.stride(1) == 1 and x.stride(0) % 8 == 0
-    x2d = x.detach() if strided else x.detach().reshape(m, k)
-    weight = weight.detach()
-    if (
-        not (strided or x2d.is_contiguous())
-        or k % 128
-        or x2d.data_ptr() % 32
-        or weight.data_ptr() % 32
-    ):
-        return None
-    out = torch.empty((m, weight.shape[0]), dtype=x.dtype, device=x.device)
-    ensure_cute_runtime()
-    k3_splitk_dense(
-        x2d,
-        weight.t(),
-        None,
-        out,
-        get_env_enable_pdl(),
-        SplitKTactic(*tactic),
-        strided_a=strided and not x2d.is_contiguous(),
-    )
-    return out.view(*x.shape[:-1], weight.shape[0])
-
-
 # Split-K tactics (mma_m, mma_n, split_k, ab_stages) of the push GEMM per (role, max rows); the
 # first entry whose row bound covers the call applies. Rubin, TP8 drafter shapes: o_proj
 # 7168 x 1024, down_proj 7168 x 1792. TP4 sweep, chain of 10 sites (GEMM + site) with cold
@@ -1381,6 +1193,9 @@ class K3DFlashWorker(SpecWorkerBase):
     model the full history of target features.
 
     Reference: https://arxiv.org/pdf/2602.06036
+
+    ``constants`` are the target's (``K3Sm107Constants``); ``spec_tail_fusion`` and
+    ``dspark_tail_v2`` select the fused tails.
     """
 
     def __init__(
@@ -1388,10 +1203,13 @@ class K3DFlashWorker(SpecWorkerBase):
         spec_config: "DFlashDecodingConfig",
         mapping: Mapping,
         use_separate_draft_kv_cache: bool = False,
+        *,
+        constants: K3Sm107Constants,
     ):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
+        self.k3_constants = constants
         self._resolved_mask_token_id = None
         self._resolved_block_size = None
         self._compute_block_size = None
@@ -1429,7 +1247,7 @@ class K3DFlashWorker(SpecWorkerBase):
         self._kv_rewind_amount = None
         self._kv_rewind_nc = None
         self._kv_rewind_bs = None
-        # TLLM_DSPARK_TAIL_V2: the rewind rides in the next-new-tokens kernel
+        # dspark_tail_v2: the rewind rides in the next-new-tokens kernel
         # (see _fused_select_accept, _fused_kv_rewind_operands).
         self._fused_kv_rewind_armed = False
         self._batch_to_slot_buffer = None
@@ -1513,6 +1331,22 @@ class K3DFlashWorker(SpecWorkerBase):
             f"{type(self).__name__} initialized with "
             f"use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
         )
+
+    @property
+    def _spec_tail_fusion(self) -> bool:
+        """Whether the fused strict acceptance, the shape-only scratch built once and the fused
+        drafter-input preparation run."""
+        return self.k3_constants.spec_tail_fusion
+
+    @property
+    def _tail_v2(self) -> bool:
+        """Whether the second set of fused tails runs (on top of ``_spec_tail_fusion``). They write
+        bitwise the values of the paths they replace: the MLA drafter's context and block RoPE
+        kernels with in-kernel table lookups and the block latents stored straight into the paged
+        pool, the column-parallel draft block-table decode, shape-only operands built once instead
+        of every step, and a TP-sharded drafter's context latents computed on a side stream,
+        concurrently with the target-token selection and acceptance."""
+        return self.k3_constants.spec_tail_fusion and self.k3_constants.dspark_tail_v2
 
     @property
     def max_draft_len(self) -> int:
@@ -1743,25 +1577,8 @@ class K3DFlashWorker(SpecWorkerBase):
         """
         K = num_draft_tokens
         markov_w1, markov_w2 = self._vocab_parallel_markov_weights(draft_model)
-        # TRTLLM_K3_DRAFT3_GLUE: a contiguous row range of the block output
-        # (one request) is read in place instead of gathered.
-        rows = (
-            self._block_gather_range(draft_model, num_gens, K, hidden_states_out.shape[0])
-            if draft3_glue_enabled()
-            else None
-        )
-        block_hidden = (
-            hidden_states_out[rows[0] : rows[1]]
-            if rows is not None
-            else hidden_states_out[gen_gather_ids]
-        )
-        local_block = (
-            draft_gemm(block_hidden, draft_head.lm_head.weight, "lm_head")
-            if getattr(draft_head.lm_head, "bias", None) is None
-            else None
-        )
-        if local_block is None:
-            local_block = draft_head.local_logits(block_hidden)
+        block_hidden = hidden_states_out[gen_gather_ids]
+        local_block = draft_head.local_logits(block_hidden)
         markov = draft_head.markov_tokens
         if (
             markov_w1 is not None
@@ -2081,8 +1898,8 @@ class K3DFlashWorker(SpecWorkerBase):
         # only on the python V2 backend, the cpp one already mapped
         # BAD_PAGE_INDEX to 0. The kernels remove the layer offset in int64
         # and leave the metadata's table unchanged.
-        if tail_v2_enabled():
-            # TLLM_DSPARK_TAIL_V2: the same decode with a row's columns spread
+        if self._tail_v2:
+            # dspark_tail_v2: the same decode with a row's columns spread
             # over programs.
             k3_draft_block_table(
                 src[self._ctx_pool_idx, :num_seqs, 0],
@@ -3041,7 +2858,7 @@ class K3DFlashWorker(SpecWorkerBase):
         if num_gens > 0 and drafts:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
                 # The fused preparations place the block in the pages: main's
-                # as a DraftBlockPlacement, TLLM_SPEC_TAIL_FUSION's as the MLA
+                # as a DraftBlockPlacement, spec_tail_fusion's as the MLA
                 # block fixup operands.
                 fixup_kwargs = (
                     {"block_fixup": inputs["mla_block_fixup"]}
@@ -3214,7 +3031,7 @@ class K3DFlashWorker(SpecWorkerBase):
         }
 
     def _launch_ctx_side(self, draft_model, spec_metadata, attn_metadata, total_target_tokens):
-        """``TLLM_DSPARK_TAIL_V2``: start the context-latent chain on a side stream.
+        """``dspark_tail_v2``: start the context-latent chain on a side stream.
 
         The step's context latents (TP-sharded fc + all-reduce with hidden_norm,
         the all-layer latent GEMM, RMSNorm + RoPE at ``ctx_len[slot] + j``) only
@@ -3227,7 +3044,7 @@ class K3DFlashWorker(SpecWorkerBase):
         when the path does not apply (then the main stream computes them).
         """
         if (
-            not tail_v2_enabled()
+            not self._tail_v2
             or draft_model is None
             or getattr(draft_model, "context_kv_only", False)
         ):
@@ -3288,7 +3105,7 @@ class K3DFlashWorker(SpecWorkerBase):
         return latent, positions_read, done
 
     def _fused_select_accept(self, logits, attn_metadata, spec_metadata):
-        """``TLLM_DSPARK_TAIL_V2``: target selection, strict acceptance and the
+        """``dspark_tail_v2``: target selection, strict acceptance and the
         drafter's KV-length prep in one kernel.
 
         Applies to vocab-parallel target selection through the private head
@@ -3307,7 +3124,7 @@ class K3DFlashWorker(SpecWorkerBase):
         path, in the same order.
         """
         self._fused_kv_rewind_armed = False
-        if not tail_v2_enabled() or not isinstance(logits, K3VocabShardedLogits):
+        if not self._tail_v2 or not isinstance(logits, K3VocabShardedLogits):
             return None
         if logits.head.exchange.backend != "mnnvl" and logits.head.exchange.tp_size > 1:
             return None
@@ -3402,7 +3219,7 @@ class K3DFlashWorker(SpecWorkerBase):
             or self._kv_rewind_amount is None
             or not hasattr(attn_metadata, "kv_lens_cuda")
             or self._kv_rewind_bs != batch_size
-            or not spec_tail_fusion_enabled()
+            or not self._spec_tail_fusion
         ):
             return None
         return attn_metadata.kv_lens_cuda, self._kv_rewind_amount, self._kv_rewind_nc
@@ -3446,12 +3263,12 @@ class K3DFlashWorker(SpecWorkerBase):
         batch_size: int,
         spec_metadata,
     ):
-        """``TLLM_SPEC_TAIL_FUSION=1``: main's strict acceptance and the force
+        """``spec_tail_fusion``: main's strict acceptance and the force
         override in one launch (``fused_strict_accept``), the same values.
 
-        Unset, or under main's ragged verification, main's implementation runs.
+        Without it, or under main's ragged verification, main's implementation runs.
         """
-        if not spec_tail_fusion_enabled() or (
+        if not self._spec_tail_fusion or (
             spec_metadata is not None and spec_metadata.is_ragged_verify
         ):
             return super()._sample_and_accept_draft_tokens_base(
@@ -3493,11 +3310,11 @@ class K3DFlashWorker(SpecWorkerBase):
     ) -> torch.Tensor:
         """The block-output rows gathered for the K draft logits per request.
 
-        Shape-only, so with ``TLLM_SPEC_TAIL_FUSION=1`` it is built once per
+        Shape-only, so with ``spec_tail_fusion`` it is built once per
         shape and reused instead of being recomputed every step.
         """
         key = (num_gens, block_size, num_draft_tokens, num_rows)
-        if spec_tail_fusion_enabled():
+        if self._spec_tail_fusion:
             cache = self.__dict__.setdefault("_block_gather_id_cache", {})
             if key in cache:
                 return cache[key]
@@ -3506,7 +3323,7 @@ class K3DFlashWorker(SpecWorkerBase):
         # off, slots run 1..K, so every request reads the next one's slot 0
         # and the last overruns. Degrades, never raises.
         ids = ids.clamp(max=num_rows - 1)
-        if spec_tail_fusion_enabled() and not torch.cuda.is_current_stream_capturing():
+        if self._spec_tail_fusion and not torch.cuda.is_current_stream_capturing():
             self._block_gather_id_cache[key] = ids
         return ids
 
@@ -3520,7 +3337,7 @@ class K3DFlashWorker(SpecWorkerBase):
     ):
         # batch_indices_cuda is the identity here (DFlashSpecMetadata.prepare).
         if (
-            spec_tail_fusion_enabled()
+            self._spec_tail_fusion
             and next_draft_tokens.shape[0] == batch_size
             and next_draft_tokens.is_contiguous()
             and accepted_tokens.stride(-1) == 1
@@ -3536,17 +3353,6 @@ class K3DFlashWorker(SpecWorkerBase):
         """The block slot whose hidden state predicts the first draft token
         (``_draft_slot_ids`` takes slots ``first .. first + K - 1`` of each block)."""
         return 1
-
-    def _block_gather_range(
-        self, draft_model, num_gens: int, num_draft_tokens: int, num_rows: int
-    ) -> Optional[tuple]:
-        """``(start, stop)`` when the gathered block rows are one contiguous range
-        (one request), else None."""
-        if num_gens != 1:
-            return None
-        first = self._draft_first_slot(draft_model)
-        stop = first + num_draft_tokens
-        return (first, stop) if stop <= num_rows else None
 
     def _draft_block_width(self, draft_model) -> int:
         """Block slots the draft forward must compute for K draft tokens.
@@ -3758,10 +3564,10 @@ class K3DFlashWorker(SpecWorkerBase):
             else None
         )
 
-        # One fused preparation at most: TLLM_SPEC_TAIL_FUSION=1 selects
-        # Jonas's, unset main's; each falls back to the eager path below.
+        # One fused preparation at most: spec_tail_fusion selects
+        # the K3 one, otherwise main's; each falls back to the eager path below.
         if num_gens > 0:
-            if spec_tail_fusion_enabled():
+            if self._spec_tail_fusion:
                 if self._fused_gen_drafter_inputs_applies(draft_model, spec_metadata):
                     return self._prepare_gen_drafter_inputs_fused(
                         accepted_tokens,
@@ -4070,14 +3876,14 @@ class K3DFlashWorker(SpecWorkerBase):
         return dflash_context_dtype(draft_model) if dtype == torch.float8_e4m3fn else dtype
 
     def _fused_gen_drafter_inputs_applies(self, draft_model, spec_metadata) -> bool:
-        """Whether ``_prepare_gen_drafter_inputs_fused`` (``TLLM_SPEC_TAIL_FUSION=1``)
+        """Whether ``_prepare_gen_drafter_inputs_fused`` (``spec_tail_fusion``)
         covers this step: a generation batch drafting from a single-latent (MLA)
         context that lives in the draft KV manager's paged pool.
 
         LiLiCorr drafters keep the eager path, which computes their anchor.
         """
         return (
-            spec_tail_fusion_enabled()
+            self._spec_tail_fusion
             and self._ctx_paged
             and self._ctx_block_tables is not None
             and getattr(draft_model, "_kv_factor", 2) == 1
@@ -4105,12 +3911,12 @@ class K3DFlashWorker(SpecWorkerBase):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The block fixup's upper-triangle mask and the gen rows' batch indices.
 
-        Shape-only. With ``TLLM_DSPARK_TAIL_V2=1`` they are built once per shape
+        Shape-only. With ``dspark_tail_v2`` they are built once per shape
         outside graph capture and reused, so no kernel recomputes them per step.
         """
         key = (num_contexts, num_gens, block_size)
         cache = self.__dict__.setdefault("_fused_prepare_constant_cache", {})
-        if tail_v2_enabled() and key in cache:
+        if self._tail_v2 and key in cache:
             return cache[key]
         idx = torch.arange(block_size, device="cuda")
         valid = (idx.view(1, block_size) > idx.view(block_size, 1)).view(
@@ -4119,7 +3925,7 @@ class K3DFlashWorker(SpecWorkerBase):
         batch_idx = torch.arange(
             num_contexts, num_contexts + num_gens, dtype=torch.long, device="cuda"
         )
-        if tail_v2_enabled() and not torch.cuda.is_current_stream_capturing():
+        if self._tail_v2 and not torch.cuda.is_current_stream_capturing():
             cache[key] = (valid, batch_idx)
         return valid, batch_idx
 
@@ -4136,7 +3942,7 @@ class K3DFlashWorker(SpecWorkerBase):
         trained_mask_embedding: Optional[torch.Tensor] = None,
     ) -> dict:
         """``prepare_1st_drafter_inputs`` for the paged single-latent context
-        (``TLLM_SPEC_TAIL_FUSION=1``; unset, main's
+        (``spec_tail_fusion``; without it, main's
         :meth:`_prepare_paged_latent_gen_inputs` runs instead).
 
         Produces the same drafter inputs and the same side effects (context
@@ -4237,17 +4043,7 @@ class K3DFlashWorker(SpecWorkerBase):
             prep["store_offsets"],
             prep["store_mask"],
         )
-        side_launch = getattr(draft_model, "draft3_side_launch", None)
-        if draft3_glue_enabled() and side_launch is not None:
-            # The store runs beside the drafter's first projections; dflash_forward
-            # joins it before its first draft-pool write (the store's masked rows
-            # zero slots the block latents then take).
-            side_launch(
-                lambda: k3_store_context_latents(*store_args, mla=True),
-                keep=(latent, prep["store_pages"], prep["store_offsets"], prep["store_mask"]),
-            )
-        else:
-            k3_store_context_latents(*store_args, mla=True)
+        k3_store_context_latents(*store_args, mla=True)
 
         valid, batch_idx = self._fused_prepare_constants(num_contexts, num_gens, block_size)
         block_fixup = _MLABlockFixup(
@@ -4276,9 +4072,5 @@ class K3DFlashWorker(SpecWorkerBase):
 
     @staticmethod
     def _blk_owned_mask(blk_owned: torch.Tensor) -> torch.Tensor:
-        """The ``[gens, block, 1]`` bool ownership mask of the prep kernel's 0 / 1 int8 rows:
-        reinterpreted in place under ``TRTLLM_K3_DRAFT3_GLUE`` (same bytes as the conversion),
-        else converted."""
-        if draft3_glue_enabled() and blk_owned.dtype in (torch.int8, torch.uint8):
-            return blk_owned.view(torch.bool).unsqueeze(-1)
+        """The ``[gens, block, 1]`` bool ownership mask of the prep kernel's 0 / 1 int8 rows."""
         return blk_owned.bool().unsqueeze(-1)

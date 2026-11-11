@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# GSM8K deployment of the kimi_k3_nvfp4__sm_107__default target
-# (accuracy/modeling_v2/kimi_k3_vl/kimi_k3_nvfp4__sm_107__default/test_accuracy.py):
+# GSM8K deployment of the kimi_k3_nvfp4__sm_107__dep16 (generation) and
+# kimi_k3_nvfp4__sm_107__tp1 (context) targets
+# (accuracy/modeling_v2/kimi_k3_vl/kimi_k3_nvfp4__sm_107__dep16/test_accuracy.py):
 # one generation server with attention DP over 16 ranks and routed experts over
 # EP16, batch 16, DSpark 5, fed by 16 one-GPU DWDP context servers. 8 Rubin
 # nodes. The test replaces the client with GSM8K against the disaggregated frontend.

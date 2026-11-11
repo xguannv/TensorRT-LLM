@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The token-embedding gather as a vectorized row copy (``features.embedding_gather``).
+"""The token-embedding gather as a vectorized row copy (the ``spec_head_fusion`` constant).
 
 ``F.embedding(ids, weight)`` for 1-D ids and a contiguous table: one program per (token, 1024
 hidden columns) copies the row with 16-byte accesses instead of the scalar-load index-select

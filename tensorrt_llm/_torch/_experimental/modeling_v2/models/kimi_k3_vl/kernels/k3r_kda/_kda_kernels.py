@@ -9,9 +9,9 @@
   called through the ``ops/ssm/kda_mtp_decode`` entry) on the replay caches main's cache manager
   allocates;
 * single-token decode: the fused CUDA decode kernel (``_kda_decode.py``);
-* the Triton prefill convolution (``fused_kda_conv_prefill``, features.kda_fused_conv_prefill)
+* the Triton prefill convolution (``fused_kda_conv_prefill``, the target's kda_fused_conv_prefill)
   and post-convolution layout (``fused_kda_post_conv``, with the chunk padding of
-  features.kda_prepad_prefill).
+  kda_prepad_prefill).
 
 The replay-cache helpers below (``copy`` / ``store`` / ``replay`` / ``commit`` of the verify
 kernel's replay caches and the batched seed plan) are kernels of the cache manager's buffers; the
@@ -163,7 +163,7 @@ def fused_kda_post_conv(
     A contiguous ``packed`` with ``normalize_qk`` runs the branch's Triton kernel (the CuTe DSL
     prefill path): contiguous ``[1, out_tokens, H, D]`` Q/K/V with Q and K L2-normalized, where
     ``out_tokens`` is ``padded_tokens`` when given (rows past ``T`` are exact zeros, the chunk
-    padding of features.kda_prepad_prefill), else ``T``; with ``beta`` (``[..., T, H]``, unit head
+    padding of kda_prepad_prefill), else ``T``; with ``beta`` (``[..., T, H]``, unit head
     stride) a fourth output holds it cast to fp32 and zero-padded to ``[1, out_tokens, H]``.
 
     Otherwise main's portable layout conversion runs (Q/K normalized only with
