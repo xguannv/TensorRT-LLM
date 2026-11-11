@@ -196,9 +196,10 @@ def test_cutedsl_against_fp32_reference(num_tokens):
 
 #: The finalize GEMM scatter-adds each token's ``TOP_K`` weighted expert rows into the BF16
 #: output with atomics, in an order that varies run to run; each add rounds at the scale of its
-#: partial sum. Two runs of one input differ by that alone: on GB300, 3.1 bf16 ulp of the row's
-#: largest on 27 of 98304 elements (96 tokens, top-8). Gates: 8 element / 0.5 RMS.
-ORDER_ULP, ORDER_RMS_ULP = 8, 0.5
+#: partial sum. Two runs of one input differ by that alone: on GB300, five runs of 24 / 200 tokens
+#: (top-8) differ in a third to a half of the elements, by up to 3.5 bf16 ulp of the row's largest
+#: and 0.97 ulp in relative RMS. Gates: 8 element / 2 RMS.
+ORDER_ULP, ORDER_RMS_ULP = 8, 2
 
 
 def test_cutedsl_joins_input_stream_and_chunks():
