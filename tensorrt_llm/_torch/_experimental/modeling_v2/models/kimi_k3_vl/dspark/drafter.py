@@ -264,11 +264,7 @@ def dspark_markov_chain(
 
 k3_dspark_mla_ctx_norm_rope = None
 if IS_CUTLASS_DSL_AVAILABLE:
-    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
-        is_fused_dspark_rmsnorm_rope_supported,
-    )
-
-    # Main's DSpark RMSNorm + RoPE kernel compiled for row-strided input, and the one-launch
+    # The DSpark RMSNorm + RoPE kernel compiled for row-strided input, and the one-launch
     # context-latent RMSNorm + RoPE of ``tail_v2``.
     from ..kimi_k3_nvfp4__sm_107__default.ops.spec.k3_dspark_mla_ctx_norm_rope import (
         k3_dspark_mla_ctx_norm_rope,
@@ -280,9 +276,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         build_rmsnorm_rope_into,
         k3_dspark_rmsnorm_rope_into,
     )
+    from .kernels.dspark_rmsnorm_rope import is_fused_dspark_rmsnorm_rope_supported
 
 # ----------------------------------------------------------------------------
-# Shared helpers of the block decode (the upper half of modeling_dspark.py).
+# Shared helpers of the block decode.
 # ----------------------------------------------------------------------------
 
 
