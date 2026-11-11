@@ -5939,6 +5939,22 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "or set to all_reusable. Invalid static settings fail at startup; "
         "per-request constraints reject the request.")
 
+    kv_transfer_num_threads: Optional[PositiveInt] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Sender worker threads of the Python transceiver, each driving its "
+        "own peer streams. None reads the TRTLLM_KV_TRANSFER_NUM_THREADS "
+        "environment variable (default 1).")
+
+    nixl_num_threads: Optional[PositiveInt] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Worker threads of the Python transceiver's NIXL transfer agent. "
+        "None reads the TRTLLM_NIXL_NUM_THREADS environment variable "
+        "(default 8).")
+
     ucx_cuda_ipc_cache_max_regions: Optional[PositiveInt] = Field(
         default=None,
         status="prototype",

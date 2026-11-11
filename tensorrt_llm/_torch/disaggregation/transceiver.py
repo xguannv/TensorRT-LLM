@@ -451,6 +451,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # arena shared by send and receive); 0 disables it.
                 agent_buffer_size_mb=cache_transceiver_config.kv_cache_bounce_size_mb,
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
+                kv_transfer_num_threads=cache_transceiver_config.kv_transfer_num_threads,
+                nixl_num_threads=cache_transceiver_config.nixl_num_threads,
             )
         )
         if enforce_physical_ownership:

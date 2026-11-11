@@ -659,6 +659,7 @@ class Sender(SenderBase):
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
         context_first_ownership: bool = False,
+        num_threads: Optional[int] = None,
     ) -> None:
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
@@ -691,7 +692,8 @@ class Sender(SenderBase):
         self._ownership_poison_lock = (
             threading.Lock() if retirement_watchdog is None else retirement_watchdog.lock
         )
-        self._num_threads = KV_TRANSFER_NUM_THREADS
+        # None: TRTLLM_KV_TRANSFER_NUM_THREADS (default 1).
+        self._num_threads = num_threads or KV_TRANSFER_NUM_THREADS
         self._send_task_queues: List[queue.Queue] = [
             queue.Queue() for _ in range(self._num_threads)
         ]
@@ -4586,8 +4588,10 @@ def _create_nixl_agent(
     world_size: int,
     agent_buffer_size_mb: int = 0,
     agent_bounce_params: Optional[Dict[str, str]] = None,
+    num_threads: Optional[int] = None,
 ) -> NixlTransferAgent:
-    num_threads = int(os.environ.get("TRTLLM_NIXL_NUM_THREADS", "8"))
+    if num_threads is None:
+        num_threads = int(os.environ.get("TRTLLM_NIXL_NUM_THREADS", "8"))
     kwargs = {}
     if "TRTLLM_NIXL_SPLIT_BATCH_SIZE" in os.environ:
         kwargs["split_batch_size"] = int(os.environ["TRTLLM_NIXL_SPLIT_BATCH_SIZE"])
@@ -4639,6 +4643,12 @@ class TransferWorkerConfig:
     # trailing _BYTES, lowercased); dict > env > default. Ignored when
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
+    # Sender worker threads (CacheTransceiverConfig.kv_transfer_num_threads);
+    # None reads TRTLLM_KV_TRANSFER_NUM_THREADS.
+    kv_transfer_num_threads: Optional[int] = None
+    # NIXL agent threads (CacheTransceiverConfig.nixl_num_threads); None reads
+    # TRTLLM_NIXL_NUM_THREADS.
+    nixl_num_threads: Optional[int] = None
 
 
 class TransferWorker:
@@ -4769,6 +4779,7 @@ class TransferWorker:
             world_size=mapping.world_size,
             agent_buffer_size_mb=self._config.agent_buffer_size_mb,
             agent_bounce_params=self._config.agent_bounce_params,
+            num_threads=self._config.nixl_num_threads,
         )
         # The pure-Python agent has no bounce_enabled attribute and already warns on its own.
         if (
@@ -4793,6 +4804,7 @@ class TransferWorker:
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
                 context_first_ownership=self._config.context_first_ownership,
+                num_threads=self._config.kv_transfer_num_threads,
             )
             self._receiver = Receiver(
                 self._peer_registrar,

@@ -478,6 +478,21 @@
           "title": "Kv Cache Bounce Size Mb",
           "type": "integer"
         },
+        "kv_transfer_num_threads": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Sender worker threads of the Python transceiver, each driving its own peer streams. None reads the TRTLLM_KV_TRANSFER_NUM_THREADS environment variable (default 1).",
+          "status": "prototype",
+          "title": "Kv Transfer Num Threads"
+        },
         "kv_transfer_poll_interval_ms": {
           "anyOf": [
             {
@@ -532,6 +547,21 @@
           "default": null,
           "description": "The max number of tokens the transfer buffer can fit.",
           "title": "Max Tokens In Buffer"
+        },
+        "nixl_num_threads": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Worker threads of the Python transceiver's NIXL transfer agent. None reads the TRTLLM_NIXL_NUM_THREADS environment variable (default 8).",
+          "status": "prototype",
+          "title": "Nixl Num Threads"
         },
         "transceiver_runtime": {
           "anyOf": [

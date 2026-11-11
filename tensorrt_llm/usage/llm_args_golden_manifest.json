@@ -149,6 +149,11 @@
     {
       "capture_policy": "int|none",
       "kind": "value",
+      "path": "cache_transceiver_config.kv_transfer_num_threads"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
       "path": "cache_transceiver_config.kv_transfer_poll_interval_ms"
     },
     {
@@ -165,6 +170,11 @@
       "capture_policy": "int|none",
       "kind": "value",
       "path": "cache_transceiver_config.max_tokens_in_buffer"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "cache_transceiver_config.nixl_num_threads"
     },
     {
       "allowed_values": [
