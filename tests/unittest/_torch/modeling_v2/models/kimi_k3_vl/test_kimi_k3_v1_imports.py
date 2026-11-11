@@ -300,8 +300,14 @@ def stale_pending(report: Report) -> List[str]:
 
 
 def test_scope_covers_every_sm107_target():
-    """Every target directory is scanned, except the two listed sm100 targets."""
-    targets = {p.name for p in _FAMILY_DIR.iterdir() if p.is_dir() and "__sm_" in p.name}
+    """Every target package is scanned, except the two listed sm100 targets.
+
+    A target is a package (``__init__.py``): a directory a checkout switch left with only
+    ``__pycache__`` in it is not one.
+    """
+    targets = {
+        p.name for p in _FAMILY_DIR.iterdir() if "__sm_" in p.name and (p / "__init__.py").is_file()
+    }
     assert EXEMPT_TARGETS <= targets, "an exempt target is gone: drop it from EXEMPT_TARGETS"
     scanned = targets - EXEMPT_TARGETS
     assert scanned and all("__sm_107__" in t for t in scanned), sorted(scanned)
