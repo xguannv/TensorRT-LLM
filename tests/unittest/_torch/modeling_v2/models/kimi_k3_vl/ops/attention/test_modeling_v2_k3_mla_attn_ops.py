@@ -370,7 +370,11 @@ def test_state_matches_backend_roles(kind):
             state.rope_duplicate_data,
         )
         assert backend.support_fp4_kv_cache() == state.support_fp4_kv_cache()
-        # Growing the identity table past the configured positions.
+    # Growing the identity table past the configured positions. The target builds both backend
+    # roles from one RopeParams, so the context role's growth raises the generation role's position
+    # count as well; each family state keeps its own (the op reads positions below either count).
+    for name, backend, state in (("context", mha, ctx), ("generation", mqa, gen)):
+        rope = backend.rope_params
         backend._ensure_rope_table_size(3 * MAX_POS)
         state._ensure_rope_table_size(3 * MAX_POS)
         _assert_same(f"{name}.grown rotary_cos_sin", backend.rotary_cos_sin, state.rotary_cos_sin)
@@ -704,7 +708,7 @@ def test_fp8_cached_prefix_context_matches_backend(chunk_size, fp8_inputs):
             bench.grow(cached)
         q, _, _, latent = _context_inputs(sum(cached), seed=2)
         for calls, bench in zip(sides, benches):
-            md = bench.metadata(cached, [0] * batch, context=True)
+            md = bench.metadata(cached, [0] * batch, context=True, cached_kv=True)
             calls.rope_append(q.clone(), latent, md)
         _assert_same_pools(*benches)
 
@@ -751,47 +755,65 @@ def _fp4_q_buffers(md):
     return out
 
 
-def test_nvfp4_context_and_generation_match_backend():
+def _nvfp4_context(benches, ctx_lens):
+    """The no-prefix NVFP4 context on both benches; checks outputs and pools."""
     from tensorrt_llm._torch.attention.backends.interface import (
         AttentionForwardArgs,
         AttentionInputType,
     )
 
     ops = _ops()
+    batch = len(ctx_lens)
+    mha, mqa = _backend_roles("nvfp4")
+    ctx, gen = _family_roles("nvfp4")
+    assert mha.uses_fp4_mla_attention and ctx.uses_fp4_mla_attention
+    for bench in benches:
+        bench.grow(ctx_lens)
+    mds = [b.metadata(ctx_lens, [0] * batch, context=True) for b in benches]
+    q, k, v, latent = _context_inputs(sum(ctx_lens), seed=5)
+    out_backend = torch.empty(sum(ctx_lens), H * VDIM, dtype=torch.bfloat16, device="cuda")
+    out_family = torch.empty_like(out_backend)
+    mha.forward(
+        q.clone(),
+        k.clone(),
+        v,
+        mds[0],
+        forward_args=AttentionForwardArgs(
+            attention_input_type=AttentionInputType.context_only,
+            latent_cache=latent,
+            out_scale=None,
+            output=out_backend,
+        ),
+    )
+    ops.cache.fp4_mla_context_attention(ctx, q.clone(), k.clone(), v, mds[1], out_family, latent)
+    torch.cuda.synchronize()
+    assert out_backend.abs().sum() > 0
+    _assert_same("context output", out_backend, out_family)
+    _assert_same_pools(*benches)
+    return mha, mqa, ctx, gen
+
+
+def test_nvfp4_context_matches_backend():
+    ctx_lens = [100, 300, 7]
+    benches = [_Bench("nvfp4", 128, max(ctx_lens) + 4, len(ctx_lens)) for _ in range(2)]
+    try:
+        _nvfp4_context(benches, ctx_lens)
+    finally:
+        for bench in benches:
+            bench.shutdown()
+
+
+@pytest.mark.skipif(
+    _sm_version() != 107, reason="the fused FP4 generation scatter (Q quantization) is SM107-only"
+)
+def test_nvfp4_generation_scatter_matches_backend():
+    ops = _ops()
     ctx_lens = [100, 300, 7]
     batch = len(ctx_lens)
     q_len = 1
     benches = [_Bench("nvfp4", 128, max(ctx_lens) + 4, batch) for _ in range(2)]
     try:
-        mha, mqa = _backend_roles("nvfp4")
-        ctx, gen = _family_roles("nvfp4")
-        assert mha.uses_fp4_mla_attention and ctx.uses_fp4_mla_attention
-        for bench in benches:
-            bench.grow(ctx_lens)
-        mds = [b.metadata(ctx_lens, [0] * batch, context=True) for b in benches]
-        q, k, v, latent = _context_inputs(sum(ctx_lens), seed=5)
-        out_backend = torch.empty(sum(ctx_lens), H * VDIM, dtype=torch.bfloat16, device="cuda")
-        out_family = torch.empty_like(out_backend)
-        mha.forward(
-            q.clone(),
-            k.clone(),
-            v,
-            mds[0],
-            forward_args=AttentionForwardArgs(
-                attention_input_type=AttentionInputType.context_only,
-                latent_cache=latent,
-                out_scale=None,
-                output=out_backend,
-            ),
-        )
-        ops.cache.fp4_mla_context_attention(
-            ctx, q.clone(), k.clone(), v, mds[1], out_family, latent
-        )
-        torch.cuda.synchronize()
-        assert out_backend.abs().sum() > 0
-        _assert_same("context output", out_backend, out_family)
-        _assert_same_pools(*benches)
-
+        _, mqa, _, gen = _nvfp4_context(benches, ctx_lens)
         lengths = [c + q_len for c in ctx_lens]
         for bench in benches:
             bench.grow(lengths)
@@ -838,8 +860,9 @@ def test_nvfp4_context_and_generation_match_backend():
 
 def test_nvfp4_split_k_context_append_and_prefix_gather_match_backend():
     ops = _ops()
-    cached = [256, 200]
-    new = [128, 184]
+    # The shared-tile FP4 context update needs 16-token-aligned chunk starts (K3 chunks are).
+    cached = [256, 192]
+    new = [128, 176]
     total = [c + n for c, n in zip(cached, new)]
     batch = len(cached)
     benches = [_Bench("nvfp4", 128, max(total), batch) for _ in range(2)]
@@ -858,7 +881,7 @@ def test_nvfp4_split_k_context_append_and_prefix_gather_match_backend():
         q, _, _, latent = _context_inputs(sum(cached), seed=7)
         qs = []
         for side, bench in enumerate(benches):
-            md = bench.metadata(cached, [0] * batch, context=True)
+            md = bench.metadata(cached, [0] * batch, context=True, cached_kv=True)
             qs.append(q.clone())
             append(side, qs[-1], latent, md)
         torch.cuda.synchronize()
