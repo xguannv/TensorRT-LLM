@@ -165,7 +165,7 @@ def test_untuned_tile_matches_bf16_then_quant(monkeypatch):
 @sm107
 @pytest.mark.parametrize(
     "cell",
-    importlib.import_module(f"{K3}.ops.gemm.k3_mxfp8_gemm_fp8_out").CELLS
+    importlib.import_module(f"{K3}.ops.gemm.k3_mxfp8_gemm_fp8_out").k3_mxfp8_gemm_fp8_out.CELLS
     if IS_CUTLASS_DSL_RUBIN_AVAILABLE
     else [],
     ids=lambda c: c.why[:48],
