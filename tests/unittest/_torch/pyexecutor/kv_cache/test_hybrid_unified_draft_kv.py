@@ -118,11 +118,6 @@ def _creator(*, manager_cls=_K3LikeManager, reads_pages=True, tp_size=16, is_dis
     return creator
 
 
-@pytest.fixture(autouse=True)
-def _shared_draft_kv_auto(monkeypatch):
-    monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", "auto")
-
-
 def test_k3_like_drafter_shares_the_hybrid_manager():
     creator = _creator()
 

@@ -2216,7 +2216,6 @@ class KvCacheCreator:
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
-        self._check_shared_draft_kv_request()
         unified_layer_specs = None
         shared_draft_block_width = None
         if self._should_unify_dflash_kv_cache():
@@ -2228,15 +2227,12 @@ class KvCacheCreator:
                 "share one KV cache manager "
                 f"({len(unified_layer_specs)} layers, disagg={self._is_disagg})."
             )
-        elif (self._is_disagg and
-              os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") in ("1", "auto")):
-            # The request check above only rejects the variable set to 1 with a
-            # drafter that can share; everything else resolves quietly.
+        elif self._is_disagg and self._speculative_config is not None:
+            # Both disaggregated workers decide from the same loaded models; log
+            # the reason so a handshake rejection can be traced to one side.
             logger.info(
-                f"TRTLLM_DISAGG_SHARED_DRAFT_KV="
-                f"{os.environ['TRTLLM_DISAGG_SHARED_DRAFT_KV']} resolved to a "
-                f"separate draft KV cache, because {self._dflash_unify_blocker()}."
-            )
+                "Shared draft KV: the draft layers keep a separate KV cache, "
+                f"because {self._dflash_unify_blocker()}.")
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=self._model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
@@ -2400,27 +2396,15 @@ class KvCacheCreator:
         """Whether this run can place target and DFlash or standalone DSpark
         layers in one V2 manager.
 
-        Disaggregated serving shares only when TRTLLM_DISAGG_SHARED_DRAFT_KV
-        is "1" or "auto".
+        Decided by what the loaded models declare: the drafter reads the
+        target manager's pages (``reads_managed_ctx_pages``) and the target's
+        manager class accepts appended draft layers. Disaggregated serving
+        decides the same way on both workers, so the context server's draft
+        pages travel with the target pages; workers that decide differently
+        are rejected at the KV transfer handshake
+        (``PeerRegistrar.validate_draft_layers_compatible``).
         """
-        if self._dflash_unify_blocker() is not None:
-            return False
-        return not (self._is_disagg
-                    and os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV")
-                    not in ("1", "auto"))
-
-    def _check_shared_draft_kv_request(self) -> None:
-        """Fail at startup when TRTLLM_DISAGG_SHARED_DRAFT_KV=1 cannot be honored."""
-        if (not self._is_disagg
-                or os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") != "1"
-                or self._speculative_config is None
-                or self._unified_drafter_attention_backend() is None):
-            return
-        blocker = self._dflash_unify_blocker()
-        if blocker is not None:
-            raise ValueError(
-                "TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires the target and draft "
-                f"KV layers to share one KV cache manager, but {blocker}.")
+        return self._dflash_unify_blocker() is None
 
     def _dflash_unify_blocker(self) -> Optional[str]:
         """The reason target and drafter layers cannot share one manager, or None."""

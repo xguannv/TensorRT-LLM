@@ -189,10 +189,9 @@ class PeerRegistrar:
             raise ValueError(
                 "PeerRegistrar: unified draft KV layer count differs "
                 f"(local={self._ri.num_draft_layers}, peer={peer_ri.num_draft_layers}); "
-                "both peers must use the same speculative decoding KV cache layout; "
-                "set TRTLLM_DISAGG_SHARED_DRAFT_KV identically on both workers, or "
-                "the 'auto' setting resolved differently on the two workers; "
-                "check the shared-draft-KV decision logged at startup."
+                "both peers must use the same speculative decoding KV cache layout: "
+                "the same drafter, and a configuration that lets both workers keep "
+                "the draft layers in the target's KV cache manager (or neither)."
             )
         # Draft layers carry the target's KV heads per rank, so they move with
         # the target's head mapping only when both sides shard heads alike. A
@@ -205,7 +204,7 @@ class PeerRegistrar:
             raise ValueError(
                 "PeerRegistrar: a shared draft KV cache needs the same attention TP size "
                 f"(local={self._ri.tp_size_per_dp_group}, peer={peer_ri.tp_size_per_dp_group}); "
-                "unset TRTLLM_DISAGG_SHARED_DRAFT_KV or shard attention alike on both workers."
+                "shard attention alike on both workers."
             )
 
     def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
