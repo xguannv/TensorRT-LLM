@@ -206,13 +206,6 @@ def _k3_latent_ar_workspace(
     return workspace
 
 
-# A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
-# instead of the min-latency fused GEMM op (read once at import).
-_K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
-    os.environ.get("TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", "0") == "1"
-)
-
-
 class K3MoEGate(nn.Module):
     """Kimi K3 gate: the router weight, the score-correction bias and the routing kernels.
 
@@ -617,22 +610,15 @@ class K3MoERuntime(nn.Module):
         situ_beta, situ_linear_beta = _resolve_kimi_situ_betas(cfg)
         dtype = torch.bfloat16
 
-        # Routing scores stay fp32; with attention-DP off the gate GEMM runs
-        # bf16xbf16 with fp32 accumulate/output (checkpoint stores the gate
-        # weight in bf16; saves a per-layer input cast + fp32 splitK pair on
-        # the bs1 decode path). Under attention-DP the legacy upcast-to-fp32
-        # GEMM is kept: the bf16-input min-latency GEMM's different reduction
-        # order flips borderline top-16 picks (GSM8K 96.7 -> 96.1/96.4,
-        # 3-run bisect on 62b20dd868), and the bs1-latency win is irrelevant
-        # at DEP batch sizes. helix_a2a ranks share requests and keep bf16.
-        # KIMI_K3_ROUTER_BF16=1/0 forces either path.
-        _router_bf16_env = os.environ.get("KIMI_K3_ROUTER_BF16")
-        _router_bf16 = (
-            _router_bf16_env == "1"
-            if _router_bf16_env is not None
-            else model_config.mapping.tp_group_shares_requests
+        # Routing scores stay fp32. ``router_bf16_gate``: the gate GEMM runs bf16xbf16 with fp32
+        # accumulate/output (the checkpoint stores the gate weight in bf16; saves a per-layer input
+        # cast + fp32 splitK pair on the bs1 decode path). Otherwise (attention DP) the upcast-to-fp32
+        # GEMM: the bf16-input min-latency GEMM's different reduction order flips borderline top-16
+        # picks (GSM8K 96.7 -> 96.1/96.4, 3-run bisect on 62b20dd868), and the bs1-latency win is
+        # irrelevant at DEP batch sizes.
+        self.gate = K3MoEGate(
+            cfg, logits_gemm_dtype=torch.bfloat16 if constants.router_bf16_gate else None
         )
-        self.gate = K3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16 if _router_bf16 else None)
 
         routed_moe_model_config = self._routed_moe_model_config(model_config)
         routed_quant_config = self._resolve_routed_quant_config(model_config, layer_idx)
@@ -677,6 +663,7 @@ class K3MoERuntime(nn.Module):
                 aux_stream=aux_stream_dict.get(AuxStreamType.MoeOutputMemset),
                 max_chunk_tokens=routed_moe_model_config.moe_max_num_tokens,
                 fc12_die_major=constants.fc12_die_major,
+                async_input_quant=constants.moe_async_input_quant,
             )
             # The routed latent partial sums, reduced over the TP group (Kimi orders this
             # collective after the shared expert's).
@@ -1207,7 +1194,7 @@ class K3MoERuntime(nn.Module):
 
     @staticmethod
     def _routed_projection(hidden_states: torch.Tensor, projection: nn.Module) -> torch.Tensor:
-        if _K3_DISABLE_MIN_LATENCY_LATENT_PROJ or not isinstance(projection, nn.Linear):
+        if not isinstance(projection, nn.Linear):
             return projection(hidden_states)
         return torch.ops.trtllm.dsv3_fused_a_gemm_op(
             hidden_states, projection.weight.t(), None, None
@@ -1221,8 +1208,7 @@ class K3MoERuntime(nn.Module):
         communication on SM107); the fusion itself does not depend on it.
         """
         if (
-            _K3_DISABLE_MIN_LATENCY_LATENT_PROJ
-            or not hidden_states.is_cuda
+            not hidden_states.is_cuda
             or self._attention_dp
             or self._moe_backend != "MEGAMOE_CUTEDSL"
             or not self._routed_fused_comm
@@ -1481,8 +1467,7 @@ class K3MoERuntime(nn.Module):
             # bf16 kernel per projection instead of cuBLAS's split-K GEMV +
             # splitKreduce pair (~17+3.6us -> ~8us for 7168->3584 at M=1);
             # for larger token counts the op falls back to cuBLAS internally.
-            # TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ=1 restores nn.Linear
-            # (A/B escape hatch). When the FP8 weight-read conversion has
+            # When the FP8 weight-read conversion has
             # replaced the projection module, call it directly: its weight is
             # an e4m3 buffer the bf16 dsv3 op must not read, and its forward
             # is already a single fused GEMM (fp8_swap_ab_gemm).

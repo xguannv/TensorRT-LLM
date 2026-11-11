@@ -59,7 +59,6 @@ What the Kimi K3 MoE routing hands to the routed experts of the same forward.
 ``SortTables`` where the routing kernel wrote them.
 """
 
-import os
 import threading
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -371,8 +370,8 @@ class K3Nvfp4Experts(nn.Module):
 #: The kernel sets :class:`K3RoutedExperts` runs, by ``moe_config.backend``.
 KERNEL_SETS = ("CUTEDSL", "CUTEDSL_FC12")
 
-# ``TLLM_MOE_ASYNC_INPUT_QUANT=0`` keeps the CUTEDSL input quantization on the main stream.
-_ASYNC_INPUT_QUANT = os.environ.get("TLLM_MOE_ASYNC_INPUT_QUANT", "1") == "1"
+# The CUTEDSL input quantization runs on the auxiliary stream up to this many tokens
+# (``async_input_quant``).
 _ASYNC_INPUT_QUANT_MAX_TOKENS = 1024
 
 #: A route: ``route(router_logits, local_expert_offset, local_num_experts)``.
@@ -420,6 +419,7 @@ class K3RoutedExperts(nn.Module):
         aux_stream: Optional[torch.cuda.Stream],
         max_chunk_tokens: int,
         fc12_die_major: bool,
+        async_input_quant: bool,
     ) -> None:
         super().__init__()
         if kernels not in KERNEL_SETS:
@@ -441,6 +441,7 @@ class K3RoutedExperts(nn.Module):
         self.moe_ep_size = mapping.moe_ep_size
         self.max_chunk_tokens = max(1, int(max_chunk_tokens))
         self.fc12_die_major = bool(fc12_die_major)
+        self.async_input_quant = bool(async_input_quant)
         self.backend = K3Nvfp4Experts(
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -581,7 +582,7 @@ class K3RoutedExperts(nn.Module):
         x_ready = None
         if (
             self.kernels == "CUTEDSL"
-            and _ASYNC_INPUT_QUANT
+            and self.async_input_quant
             and isinstance(x, torch.Tensor)
             and x.shape[0] <= _ASYNC_INPUT_QUANT_MAX_TOKENS
             and (do_multi_stream() or torch.cuda.is_current_stream_capturing())

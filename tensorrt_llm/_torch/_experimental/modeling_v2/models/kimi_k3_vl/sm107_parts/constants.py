@@ -28,6 +28,14 @@ class K3Sm107Constants:
     # FC12 die-major expert layout and schedule (the routed experts' kernel set).
     fc12_die_major: bool
     router_exact_kda: bool
+    # The MoE gate GEMM on BF16 operands with FP32 accumulation and output (else the FP32 GEMM of
+    # the upcast operands; the two can pick different top-k experts at a tie).
+    router_bf16_gate: bool
+    # The CUTEDSL routed experts quantize their input on the auxiliary stream (up to 1024 tokens).
+    moe_async_input_quant: bool
+    # The BF16 shared and latent MoE MLP weights are read as block-scaled FP8 (quantized once after
+    # loading).
+    fp8_weight_read_moe_mlp: bool
     latent_ar_own_ws: bool
     # Attention residual (attn_res.py, kernels/k3r_attn_res).
     attn_res_pdl: bool

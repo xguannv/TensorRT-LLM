@@ -229,9 +229,8 @@ def test_private_persistent_grids_take_the_shared_sm_reserve(monkeypatch):
 
 
 def test_fp8_kv_layer_selector_on_the_cache_policy():
-    """``TLLM_KIMI_K3_FP8_KV_LAYERS`` (both roles): the MLA layers take their FP8 KV-cache
-    fallback only where ``kimi_k3_cache_policy`` provides the selector the cache manager reads;
-    otherwise every layer keeps the model-wide NVFP4 dtype and a warning names the gap."""
+    """The MLA layers take their FP8 KV-cache fallback layers from the selector of
+    ``kimi_k3_cache_policy`` that the cache manager reads too."""
     from tensorrt_llm._torch import kimi_k3_cache_policy
 
     selector = getattr(kimi_k3_cache_policy, "get_kimi_k3_fp8_kv_layer_ids", None)

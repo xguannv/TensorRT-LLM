@@ -166,6 +166,7 @@ l0_cpu:
   # Kimi K3 family glue and kernels: V1 import scan, source parity with V1 / the reference,
   # and the KDA mid-chunk snapshot plan (their GPU cases are in l0_b300).
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_v1_imports.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_no_env_switches.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/common/test_k3_common.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/common/test_k3_kda_metadata.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_situ/test_k3r_situ.py

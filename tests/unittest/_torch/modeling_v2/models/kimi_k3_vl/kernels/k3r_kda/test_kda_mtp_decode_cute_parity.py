@@ -645,15 +645,19 @@ def _round2_inputs(B, H, M):
 
 @pytest.mark.parametrize("B,H,M", [(2, 12, 7), (16, 12, 7)], ids=lambda v: str(v))
 def test_round2_replay_bf16_math(B, H, M, monkeypatch):
-    """bf16 tensor-core operand path (``TRTLLM_KDA_MTP_BF16_MATH=1``) on the MTP7 replay round.
+    """bf16 tensor-core operand path (``mtp_ops._BF16_MATH``) on the MTP7 replay round.
     The conv pools and replay caches do not depend on the recurrence precision and must match
     the 3xTF32 kernel bit for bit; the committed state and the outputs are held to the tolerance
     of the bf16 tensor-core references (FLA, prefill)."""
     data2, accept = _round2_inputs(B, H, M)
     T = data2["T"]
-    monkeypatch.setenv("TRTLLM_KDA_MTP_BF16_MATH", "0")
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3r_kda import (
+        mtp_ops,
+    )
+
+    monkeypatch.setattr(mtp_ops, "_BF16_MATH", False)
     ref = cute_run(data2)
-    monkeypatch.setenv("TRTLLM_KDA_MTP_BF16_MATH", "1")
+    monkeypatch.setattr(mtp_ops, "_BF16_MATH", True)
     fast = cute_run(data2)
     cpu2 = {k: v.cuda() for k, v in cpu_reference(data2).items()}
     rows = torch.cat(

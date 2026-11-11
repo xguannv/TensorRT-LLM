@@ -72,7 +72,6 @@ module) on first use; importing it raises ``ImportError`` without CuTe DSL.
 """
 
 import contextlib
-import os
 from math import gcd
 from typing import Optional, Tuple
 
@@ -1138,17 +1137,15 @@ def _layout_key(tensor: torch.Tensor, dynamic_layout: bool = False, *, assumed_a
 _precompute_control_cache = {}
 
 
-def _bf16_math_enabled() -> bool:
-    """Recurrence precision of the verify kernel, from ``TRTLLM_KDA_MTP_BF16_MATH``.
+# Recurrence precision of the verify kernel. False: 3xTF32 on every product that feeds the state.
+# True (tests): bf16 tensor-core operands (bf16 TMEM / smem tiles, K = 16 per instruction, fp32
+# accumulation -- the prefill kernel's precision).
+_BF16_MATH = False
 
-    Unset / 0 (default): 3xTF32 on every product that feeds the state. 1: bf16 tensor-core
-    operands (bf16 TMEM / smem tiles, K = 16 per instruction, fp32 accumulation -- the
-    prefill kernel's precision).
-    """
-    value = os.environ.get("TRTLLM_KDA_MTP_BF16_MATH", "0")
-    if value not in ("0", "1"):
-        raise ValueError(f"TRTLLM_KDA_MTP_BF16_MATH must be 0 or 1, got {value!r}")
-    return value == "1"
+
+def _bf16_math_enabled() -> bool:
+    """Whether the verify kernel runs the bf16 tensor-core recurrence (``_BF16_MATH``)."""
+    return _BF16_MATH
 
 
 # Verify-kernel schedule. True: calls on the runtime contract (packed rows, fused gated RMSNorm,

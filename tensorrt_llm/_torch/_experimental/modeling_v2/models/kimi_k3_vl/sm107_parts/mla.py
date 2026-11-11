@@ -201,7 +201,6 @@ except ImportError:
     from cuda import cuda
 
 import copy
-import os
 import weakref
 
 from torch import nn
@@ -2522,42 +2521,19 @@ class K3MLAAttention(nn.Module):
             self.next_input_mxfp8 = None
 
 
-# Identity-RoPE table positions for the MLA backends. K3 is NoPE (the table
-# holds cos=1/sin=0), but the chunked-context path indexes the table by
-# absolute position, so it must cover max_position_embeddings (~512MB per
-# backend for the 1M-position checkpoint); a smaller table is read out of
-# bounds. KIMI_K3_MLA_MAX_POSITIONS overrides the size for short-context
-# deployments.
-_KIMI_K3_MLA_MAX_POSITIONS_ENV = "KIMI_K3_MLA_MAX_POSITIONS"
-
-
-_KIMI_K3_FP8_KV_LAYERS_ENV = "TLLM_KIMI_K3_FP8_KV_LAYERS"
+# Identity-RoPE table positions for the MLA backends: max_position_embeddings. K3 is NoPE (the
+# table holds cos=1/sin=0), but the chunked-context path indexes the table by absolute position,
+# so it must cover max_position_embeddings (~512MB per backend for the 1M-position checkpoint); a
+# smaller table is read out of bounds.
 
 
 def _kimi_k3_fp8_kv_layer_ids(cfg, kv_quant_algo: Optional[QuantAlgo]) -> frozenset:
-    """MLA layers whose KV cache falls back to FP8 under NVFP4 KV (``TLLM_KIMI_K3_FP8_KV_LAYERS``).
-
-    On the Rubin branch the NVFP4 default is the last two MLA layers and the FP4 MLA cache
-    manager allocates those layers as FP8 (``kimi_k3_cache_policy.get_kimi_k3_fp8_kv_layer_ids``,
-    read by the manager and here). Engine requirement: main's cache policy has no FP8 selection
-    (only ``TLLM_KIMI_K3_BF16_KV_LAYERS``) and its cache manager allocates every MLA layer in the
-    model-wide dtype, so switching a layer to FP8 here alone would mismatch the cache. The
-    override is therefore taken only when the engine's cache policy provides the selector;
-    until then every layer keeps the model-wide KV dtype and a warning names the gap.
-    """
-    selector = getattr(_kimi_k3_cache_policy, "get_kimi_k3_fp8_kv_layer_ids", None)
-    if selector is not None:
-        return selector(cfg, nvfp4_enabled=kv_quant_algo == QuantAlgo.NVFP4)
-    requested = os.environ.get(_KIMI_K3_FP8_KV_LAYERS_ENV)
-    if (requested is None and kv_quant_algo == QuantAlgo.NVFP4) or (requested or "").strip():
-        logger.warning_once(
-            f"Kimi K3: FP8 KV-cache fallback layers ({_KIMI_K3_FP8_KV_LAYERS_ENV}="
-            f"{requested if requested is not None else '<unset: last two MLA layers>'}) are not "
-            "applied: the KV cache manager has no per-layer FP8 allocation on this tree. Every "
-            "MLA layer uses the model-wide KV cache dtype.",
-            key="kimi_k3_fp8_kv_layers_unsupported",
-        )
-    return frozenset()
+    """MLA layers whose KV cache falls back to FP8 under NVFP4 KV: the engine's cache policy
+    decides (``kimi_k3_cache_policy.get_kimi_k3_fp8_kv_layer_ids``, which the FP4 MLA cache
+    manager reads too, so the layer and its cache agree; under NVFP4 the last two MLA layers)."""
+    return _kimi_k3_cache_policy.get_kimi_k3_fp8_kv_layer_ids(
+        cfg, nvfp4_enabled=kv_quant_algo == QuantAlgo.NVFP4
+    )
 
 
 def resolve_attention_quant_config(
@@ -2618,12 +2594,7 @@ class K3MLARuntime(nn.Module):
 
         from .mla import K3MLAAttention
 
-        max_positions = int(
-            os.environ.get(
-                _KIMI_K3_MLA_MAX_POSITIONS_ENV,
-                cfg.max_position_embeddings,
-            )
-        )
+        max_positions = int(cfg.max_position_embeddings)
         self.layer_idx = layer_idx
         # K3MLAAttention owns MLA projection/head sharding. Keep only the
         # final output reduction in this wrapper so the output gate remains
@@ -2664,7 +2635,8 @@ class K3MLARuntime(nn.Module):
         if layer_idx in fp8_kv_layer_ids:
             if kv_quant_algo != QuantAlgo.NVFP4:
                 raise ValueError(
-                    f"{_KIMI_K3_FP8_KV_LAYERS_ENV} requires the model-wide KV cache dtype to be NVFP4."
+                    "The Kimi K3 FP8 KV-cache fallback layers require the model-wide KV cache "
+                    "dtype to be NVFP4."
                 )
             kv_quant_algo = QuantAlgo.FP8
             logger.info_once(
