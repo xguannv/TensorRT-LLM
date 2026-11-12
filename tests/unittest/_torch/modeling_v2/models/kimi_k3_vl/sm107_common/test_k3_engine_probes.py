@@ -295,7 +295,7 @@ def test_dspark_unified_draft_cache_probes_on_the_k3_hybrid_manager():
     assert issubclass(KimiK3HybridCacheManager, KVCacheManagerV2)
     if not hasattr(KimiK3HybridCacheManager, "accepts_appended_draft_layers"):
         pytest.skip("main has no drafter layers in the target manager (unified draft KV)")
-    assert KimiK3HybridCacheManager.accepts_appended_draft_layers is True
+    assert KimiK3HybridCacheManager.accepts_appended_draft_layers() is True
     assert _is_property(KVCacheManagerV2, "draft_layer_ids")
     assert "kv_layout" in inspect.signature(KVCacheManagerV2.get_buffers).parameters
     for name in ("get_layer_kv_factor", "get_layer_page_index_scale", "get_draft_kv_cache_view"):

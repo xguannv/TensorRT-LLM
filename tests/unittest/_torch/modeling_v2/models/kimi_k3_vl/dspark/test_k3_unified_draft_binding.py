@@ -53,7 +53,7 @@ pytestmark = pytest.mark.cpu_only
 # The engine appends the drafter's layers to the target manager only on a main with the unified
 # draft KV; without it the drafter keeps its own manager and these bindings never happen.
 requires_appended_draft_layers = pytest.mark.skipif(
-    not getattr(KimiK3HybridCacheManager, "accepts_appended_draft_layers", False),
+    not getattr(KimiK3HybridCacheManager, "accepts_appended_draft_layers", lambda: False)(),
     reason="main does not append the drafter's layers to KimiK3HybridCacheManager",
 )
 
