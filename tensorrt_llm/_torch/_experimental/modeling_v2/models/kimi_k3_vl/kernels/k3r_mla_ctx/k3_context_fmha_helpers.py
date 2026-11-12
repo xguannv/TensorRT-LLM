@@ -47,16 +47,6 @@ from cutlass.cutlass_dsl import (
 )
 from cutlass.utils.hardware_info import HardwareInfo
 
-# The internal CuTe DSL build's scheduling hints (``dsl_hints``), used here and by the kernel as
-# ``fmha_utils.<hint>()``. They only shape the SASS schedule of the softmax / correction warps.
-from ..k3r_common.dsl_hints import (  # noqa: F401
-    HAS_SCHEDULING_HINTS,
-    cfence,
-    reset_sched_res_busy_xu64,
-    sched_res_busy_xu64,
-    warp_switch,
-)
-
 
 class WorkTileInfo:
     """A class to represent information about a work tile.
@@ -1134,11 +1124,9 @@ def ex2_emulation_packed_f32x2(
     # is at the rightest place
     # We want to round down here, so that the fractional part is in [0, 1)
     xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
-    warp_switch()  # {$nv-internal-release}
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
     xy_rounded_back = cute.arch.sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
-    warp_switch()  # {$nv-internal-release}
     xy_frac = cute.arch.sub_packed_f32x2(xy_clamped, xy_rounded_back)
 
     @dsl_user_op
@@ -1157,7 +1145,6 @@ def ex2_emulation_packed_f32x2(
         out = (coeff[deg], coeff[deg])
         for i in cutlass.range_constexpr(deg - 1, -1, -1):
             out = cute.arch.fma_packed_f32x2(out, (x, y), (coeff[i], coeff[i]), loc=loc, ip=ip)
-            warp_switch()  # {$nv-internal-release}
         return out
 
     xy_frac_ex2 = polynomial_deg3_packed_f32x2(*xy_frac, loc=loc, ip=ip)

@@ -225,15 +225,13 @@ def run_k3_split_k_context_partition(
     ``k_pe`` ``[T_kv, 64]``, ``output`` ``[T_q, H * 128]`` BF16, ``softmax_stats``
     ``[T_q, H, 2]`` FP32; the softmax scale is the attention backend's.
     """
-    from ..kernels.k3r_mla_ctx import k3_context_fmha_op
 
     sm_scale = 1.0 / (attn.q_scaling * (attn.qk_nope_head_dim + attn.qk_rope_head_dim) ** 0.5)
     num_heads = attn.num_heads
-    hints = "on" if k3_context_fmha_op.K3_CONTEXT_FMHA_SCHEDULING_HINTS else "off"
     logger.info_once(
         "Kimi K3 MLA context FMHA: k3_context_fmha (Rubin FP8 split-K, epilogue "
         f"merge) serves {'causal current-chunk' if is_causal else 'cached-prefix'} partitions, "
-        f"{num_heads} heads per rank, CuTe DSL scheduling hints {hints}.",
+        f"{num_heads} heads per rank.",
         key=("k3_mla_ctx_split_k_fmha", is_causal, num_heads),
     )
     k3_context_fmha(

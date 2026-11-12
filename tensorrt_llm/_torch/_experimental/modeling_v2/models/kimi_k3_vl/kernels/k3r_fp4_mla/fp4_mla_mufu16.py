@@ -20,9 +20,6 @@ layers run it with its own plan and split reduction (``ops/attention/_fp4_mla_de
   normalized FP16 split output (``SPLIT_PARTIAL_DTYPES``).
 - Optional programmatic launch: ``launch_dependents`` (the split reduction or a fused consumer
   launches early) and ``pdl_wait`` (the decode waits for the kernel that writes its query).
-
-The kernel carries the internal CuTe DSL build's scheduling hints (``dsl_hints.cfence()`` /
-``dsl_hints.warp_switch()``); under the public DSL they emit nothing.
 """
 
 import math
@@ -46,8 +43,6 @@ from cutlass.cute.arch.nvvm_wrappers import inline_ptx as cute_inline_ptx
 from cutlass.cute.runtime import make_ptr
 from cutlass.experimental import cuda as cuda_tma
 from cutlass.experimental import primitives as prims
-
-from ..k3r_common import dsl_hints
 
 
 def _compile_cutedsl(*args: object, **kwargs: object) -> Callable[..., object]:
@@ -3843,7 +3838,6 @@ def _load_p4_n256_score_half_from_tmem(
     _publish_p4_n256_atomic_rowmax(
         sAtomicRunningRowMax, tile_row_max, warp_idx, tidx, producer_warp_base
     )
-    dsl_hints.cfence()
     return (
         ctm.Vector.from_elements(tuple(score_values), dtype=ctm.Float32),
         ctm.Vector.from_elements(tuple(group_max_values), dtype=ctm.Float32),
@@ -4083,7 +4077,6 @@ def _prepack_p4_n256_score_half_before_rowmax(
         )
         group_valid = group_valid_values[local_group_idx]
         group_max = group_max_values[local_group_idx]
-        dsl_hints.warp_switch()
         if cutlass.const_expr(use_mixed_imlp):
             p_bias = ctm.Float32(LOG2_6) - group_max * softmax_scale_log2
             word0, word1, p_sum = _pack_p4_16_scores_from_group_packed_f16x2(
@@ -4263,9 +4256,7 @@ def _finalize_p4_n256_score_half_psf_source(
         bank_idx, score_half_idx, local_warp_idx, lane_idx
     )
     sPSF[psf_source_word_offset] = pv_sf_word
-    dsl_hints.cfence()
     prims.fence_proxy(kind=prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-    dsl_hints.cfence()
     return (denominator_sf_word, prequant_row_sum)
 
 
@@ -4375,9 +4366,7 @@ def _runtime_finalize_final_p4_n256_score_half_psf_source(
         bank_idx, score_half_idx, local_warp_idx, lane_idx
     )
     sPSF[psf_source_word_offset] = pv_sf_word
-    dsl_hints.cfence()
     prims.fence_proxy(kind=prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-    dsl_hints.cfence()
     return (denominator_sf_word, prequant_row_sum)
 
 
@@ -4836,7 +4825,6 @@ def _runtime_issue_pv_tile_slot(
                     p_sfa_col_offset=p_sfa_col_offset,
                 )
     if stream_li_idx > ctm.Int32(0) and stream_li_idx + ctm.Int32(1) == stream_li_total:
-        dsl_hints.cfence()
         if prims.elect_sync():
             _cross_arrive_smem_p4_cta2_mbar(
                 pair_overlap_sync_mbars.subview(SMEM_P4_PAIR_FINAL_PV_ISSUED_MBAR_OFFSET + bank_idx)
@@ -5230,7 +5218,6 @@ def _runtime_t336_prepare_p_source(
             )
         )
     if is_compute_warp:
-        dsl_hints.cfence()
         if prims.elect_sync():
             prims.mbarrier_arrive(pair_rowmax_read_done_mbar)
     _store_prepacked_p4_n256_score_half_to_direct_a(
@@ -5242,8 +5229,6 @@ def _runtime_t336_prepare_p_source(
         p_stage_base=p_stage_base,
         score_half_idx=score_half_idx,
     )
-    if is_compute_warp:
-        dsl_hints.cfence()
     owned_psf_word, prequant_row_sum = _finalize_p4_n256_score_half_psf_source(
         sPSF,
         group_max_values,
@@ -5457,7 +5442,6 @@ def _runtime_t336_producer_tile(
             sAtomicRunningRowMax, warp_idx, tidx, producer_warp_base=producer_warp_base
         )
     if is_compute_warp:
-        dsl_hints.cfence()
         if prims.elect_sync():
             prims.mbarrier_arrive(pair_rowmax_read_done_mbar)
     lane_rebase = ctm.Boolean(False)
@@ -5492,8 +5476,6 @@ def _runtime_t336_producer_tile(
     )
     if prims.elect_sync():
         prims.mbarrier_arrive(direct_p_ready_mbar)
-    if is_compute_warp:
-        dsl_hints.cfence()
     if cutlass.const_expr(not is_final_tile):
         next_running_row_anchor, lane_rebase, anchor_delta_log2 = (
             _select_smem_p4_lazy_anchor_runtime(
@@ -5698,7 +5680,6 @@ def _finish_pipelined_score_loads(
         tidx,
         producer_warp_base,
     )
-    dsl_hints.cfence()
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
     if prims.elect_sync():
         _arrive_smem_p4_mapped_leader_mbar(
@@ -5836,7 +5817,6 @@ def _finalize_pipelined_tile(
         has_previous_tile,
     )
     if is_compute_warp:
-        dsl_hints.cfence()
         if prims.elect_sync():
             prims.mbarrier_arrive(pair_rowmax_read_done_mbar)
     _store_prepacked_p4_n256_score_half_to_direct_a(
@@ -5848,8 +5828,6 @@ def _finalize_pipelined_tile(
         p_stage_base=p_stage_base,
         score_half_idx=score_half_idx,
     )
-    if is_compute_warp:
-        dsl_hints.cfence()
     owned_psf_word, row_sum = _finalize_p4_n256_score_half_psf_source(
         sPSF,
         group_max_values,
@@ -7159,7 +7137,6 @@ def _run_mla_decode_body(
                 ):
                     pass
                 stream_li_total = kv_tiles
-                dsl_hints.cfence()
                 qk0_handle = qk_smem_consumer.wait()
                 qk_smem_consumer.advance()
                 # Tile 0 sits in K slot 0; its stages go through the K scale ring

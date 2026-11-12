@@ -31,10 +31,6 @@
 The K3 path adds separate K-nope/K-pe loads and in-epilogue chunk merging.
 Only the runtime kernel class is vendored; DKG CLI and reference code are excluded.
 The launcher is ``k3_context_fmha_op.run_k3_context_fmha`` (entry ``ops/attention/k3_context_fmha``).
-
-``fmha_utils.cfence()`` / ``warp_switch()`` / ``sched_res_busy_xu64()`` /
-``reset_sched_res_busy_xu64()`` emit the internal CuTe DSL build's scheduling hints where that
-build provides them and nothing otherwise (``k3_context_fmha_helpers.HAS_SCHEDULING_HINTS``).
 """
 
 import math
@@ -2090,12 +2086,6 @@ class RubinFusedMultiHeadAttentionForward:
                 tSrK[kphase_coord],
                 tStSi,
             )
-            # {$nv-internal-release begin}
-            # This is a trick to avoid grouped ALUs which might block the issue
-            # of MUFU sequences.
-            # To apply this trick, this example hasn't changed to blocked gemm api.
-            fmha_utils.cfence()  # {$nv-internal-release}
-            # {$nv-internal-release end}
         # 4. release S0
         si_handle.commit()
         return mma_si_producer, si_corr_producer
@@ -2150,12 +2140,6 @@ class RubinFusedMultiHeadAttentionForward:
                         tOrVi[kphase_coord],
                         tOtOi,
                     )
-                    # {$nv-internal-release begin}
-                    # This is a trick to avoid grouped ALUs which might block the issue
-                    # of MUFU sequences.
-                    # To apply this trick, this example hasn't changed to blocked gemm api.
-                    fmha_utils.cfence()  # {$nv-internal-release}
-                    # {$nv-internal-release end}
         else:
             for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
                 kphase_coord = (None, None, kphase_idx)
@@ -2167,12 +2151,6 @@ class RubinFusedMultiHeadAttentionForward:
                     tOrVi[kphase_coord],
                     tOtOi,
                 )
-                # {$nv-internal-release begin}
-                # This is a trick to avoid grouped ALUs which might block the issue
-                # of MUFU sequences.
-                # To apply this trick, this example hasn't changed to blocked gemm api.
-                fmha_utils.cfence()  # {$nv-internal-release}
-                # {$nv-internal-release end}
         # 4. commit Pi
         pi_handle.release()
         # 5. commit Oi
@@ -2318,9 +2296,7 @@ class RubinFusedMultiHeadAttentionForward:
                         tTMEM_LOADrS[i - CVT_COUNT + 1],
                     ),
                 )
-            fmha_utils.cfence()  # {$nv-internal-release}
             tTMEM_LOADrS[i] = cute.math.exp2(tTMEM_LOADrS[i], fastmath=True)
-            fmha_utils.cfence()  # {$nv-internal-release}
             if cutlass.const_expr(i + FMA_COUNT < EXP2_EMULATION_OFFSET):
                 (
                     tTMEM_LOADrS[i + FMA_COUNT],
@@ -2333,17 +2309,13 @@ class RubinFusedMultiHeadAttentionForward:
                     (scale, scale),
                     (minus_row_max_scale, minus_row_max_scale),
                 )
-            fmha_utils.cfence()  # {$nv-internal-release}
             tTMEM_LOADrS[i + 1] = cute.math.exp2(tTMEM_LOADrS[i + 1], fastmath=True)
-            fmha_utils.cfence()  # {$nv-internal-release}
             if cutlass.const_expr(i == EXP2_EMULATION_OFFSET - ARV_COUNT):
                 if cutlass.const_expr(self.enable_sequence_barrier):
                     if cutlass.const_expr(stage == 0):
                         self.sequence_s1_s0_barrier.arrive()
                     else:
                         self.sequence_s0_s1_barrier.arrive()
-            fmha_utils.cfence()  # {$nv-internal-release}
-        fmha_utils.reset_sched_res_busy_xu64()  # {$nv-internal-release}
 
         # The remaining conversion steps
         for i in cutlass.range_constexpr(
@@ -2360,11 +2332,9 @@ class RubinFusedMultiHeadAttentionForward:
                 else:
                     s_vec = tTMEM_LOADrS_cvt[None, i // CVT_PER_STEP].load()
                     tTMEM_STORErS_x4_e_cvt[None, i // CVT_PER_STEP].store(s_vec.to(self.v_dtype))
-                fmha_utils.warp_switch()  # {$nv-internal-release}
             local_row_sum = cute.arch.add_packed_f32x2(
                 local_row_sum, (tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1])
             )
-            fmha_utils.warp_switch()  # {$nv-internal-release}
         for i in cutlass.range_constexpr(
             EXP2_EMULATION_OFFSET, EXP2_EMULATION_OFFSET + EXP2_EMULATION_COUNT // 2, 2
         ):
@@ -2373,7 +2343,6 @@ class RubinFusedMultiHeadAttentionForward:
                 (scale, scale),
                 (minus_row_max_scale, minus_row_max_scale),
             )
-            fmha_utils.warp_switch()  # {$nv-internal-release}
             tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1] = fmha_utils.ex2_emulation_packed_f32x2(
                 tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1]
             )
@@ -2572,31 +2541,23 @@ class RubinFusedMultiHeadAttentionForward:
                     tTMEM_LOADtS[None, 1, None, None],
                     tTMEM_LOADrS[None, 1, None, None],
                 )
-                fmha_utils.cfence()  # {$nv-internal-release}
                 tile_row_max = -cutlass.Float32.inf
                 tile_row_max_ = tile_row_max
                 for i in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS, mode=[0]), 4):
                     tile_row_max = cute.arch.fmax(tile_row_max, tTMEM_LOADrS[i, 0, 0, 0])
                     tile_row_max = cute.arch.fmax(tile_row_max, tTMEM_LOADrS[i + 1, 0, 0, 0])
-                    fmha_utils.warp_switch()  # {$nv-internal-release}
                     tile_row_max_ = cute.arch.fmax(tile_row_max_, tTMEM_LOADrS[i + 2, 0, 0, 0])
                     tile_row_max_ = cute.arch.fmax(tile_row_max_, tTMEM_LOADrS[i + 3, 0, 0, 0])
-                    fmha_utils.warp_switch()  # {$nv-internal-release}
-                fmha_utils.cfence()  # {$nv-internal-release}
                 cute.copy(
                     tiled_tmem_load,
                     tTMEM_LOADtS[None, 2, None, None],
                     tTMEM_LOADrS[None, 2, None, None],
                 )
-                fmha_utils.cfence()  # {$nv-internal-release}
                 for i in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS, mode=[0]), 4):
                     tile_row_max = cute.arch.fmax(tile_row_max, tTMEM_LOADrS[i, 1, 0, 0])
                     tile_row_max = cute.arch.fmax(tile_row_max, tTMEM_LOADrS[i + 1, 1, 0, 0])
-                    fmha_utils.warp_switch()  # {$nv-internal-release}
                     tile_row_max_ = cute.arch.fmax(tile_row_max_, tTMEM_LOADrS[i + 2, 1, 0, 0])
                     tile_row_max_ = cute.arch.fmax(tile_row_max_, tTMEM_LOADrS[i + 3, 1, 0, 0])
-                    fmha_utils.warp_switch()  # {$nv-internal-release}
-                fmha_utils.cfence()  # {$nv-internal-release}
                 cute.copy(
                     tiled_tmem_load,
                     tTMEM_LOADtS[None, 3, None, None],
@@ -2605,26 +2566,18 @@ class RubinFusedMultiHeadAttentionForward:
                 for i in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS, mode=[0]), 4):
                     tile_row_max = cute.arch.fmax(tile_row_max, tTMEM_LOADrS[i, 2, 0, 0])
                     tile_row_max = cute.arch.fmax(tile_row_max, tTMEM_LOADrS[i + 1, 2, 0, 0])
-                    fmha_utils.warp_switch()  # {$nv-internal-release}
                     tile_row_max_ = cute.arch.fmax(tile_row_max_, tTMEM_LOADrS[i + 2, 2, 0, 0])
                     tile_row_max_ = cute.arch.fmax(tile_row_max_, tTMEM_LOADrS[i + 3, 2, 0, 0])
-                    fmha_utils.warp_switch()  # {$nv-internal-release}
-                fmha_utils.cfence()  # {$nv-internal-release}
                 cute.arch.fence_view_async_tmem_store()
                 si_handle.release()
-                fmha_utils.cfence()  # {$nv-internal-release}
                 # S0 -> P1 / S1 -> P0
                 inplace_producer.commit()
                 inplace_producer.advance()
-                fmha_utils.cfence()  # {$nv-internal-release}
                 for i in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS, mode=[0]), 4):
                     tile_row_max = cute.arch.fmax(tile_row_max, tTMEM_LOADrS[i, 3, 0, 0])
                     tile_row_max = cute.arch.fmax(tile_row_max, tTMEM_LOADrS[i + 1, 3, 0, 0])
-                    fmha_utils.warp_switch()  # {$nv-internal-release}
                     tile_row_max_ = cute.arch.fmax(tile_row_max_, tTMEM_LOADrS[i + 2, 3, 0, 0])
                     tile_row_max_ = cute.arch.fmax(tile_row_max_, tTMEM_LOADrS[i + 3, 3, 0, 0])
-                    fmha_utils.warp_switch()  # {$nv-internal-release}
-                fmha_utils.cfence()  # {$nv-internal-release}
                 tile_row_max = cute.arch.fmax(tile_row_max, tile_row_max_)
                 if cutlass.const_expr(not enable_skip_softmax):
                     row_max = cute.arch.fmax(tile_row_max, row_max)
@@ -2721,18 +2674,15 @@ class RubinFusedMultiHeadAttentionForward:
         # Notify correction wg that row_max is ready
         vec_i_handle.commit()
 
-        fmha_utils.sched_res_busy_xu64()  # {$nv-internal-release}
         EXP2_EMULATION_COUNT = 20 if self.enable_ex2_emulation and not whether_apply_mask else 0
         EXP2_EMULATION_OFFSET = cute.size(tTMEM_LOADrS) - EXP2_EMULATION_COUNT
         acc_scale_ = scale * (old_row_max - row_max_safe)
         acc_scale = cute.math.exp2(acc_scale_, fastmath=True) * 0.5
-        fmha_utils.cfence()  # {$nv-internal-release}
         if cutlass.const_expr(self.enable_sequence_barrier):
             if cutlass.const_expr(stage == 0):
                 self.sequence_s0_s1_barrier.arrive_and_wait()
             else:
                 self.sequence_s1_s0_barrier.arrive_and_wait()
-        fmha_utils.cfence()  # {$nv-internal-release}
 
         if cutlass.const_expr(enable_skip_softmax):
             if not skip_softmax:
@@ -2767,7 +2717,6 @@ class RubinFusedMultiHeadAttentionForward:
                 cute.copy(tiled_tmem_store, tTMEM_STORErS_x4, tTMEM_STOREtS_x4)
                 cute.arch.fence_view_async_tmem_store()
                 pi_handle.commit()
-                fmha_utils.cfence()  # {$nv-internal-release}
                 for j in cutlass.range_constexpr(
                     EXP2_EMULATION_OFFSET,
                     EXP2_EMULATION_OFFSET + EXP2_EMULATION_COUNT,
@@ -2778,7 +2727,6 @@ class RubinFusedMultiHeadAttentionForward:
                         local_row_sum,
                     )
                 row_sum = local_row_sum[0] + local_row_sum[1]
-                fmha_utils.cfence()  # {$nv-internal-release}
                 cute.arch.fence_view_async_tmem_store()
             else:
                 if cutlass.const_expr(self.enable_sequence_barrier):
@@ -2799,7 +2747,6 @@ class RubinFusedMultiHeadAttentionForward:
                 )
                 cute.arch.fence_view_async_tmem_store()
                 pi_handle.commit()
-                fmha_utils.cfence()  # {$nv-internal-release}
         else:
             row_sum *= acc_scale
             local_row_sum = (row_sum, row_sum)
@@ -2823,7 +2770,6 @@ class RubinFusedMultiHeadAttentionForward:
             # store P
             cute.copy(tiled_tmem_store, tTMEM_STORErS_x4, tTMEM_STOREtS_x4)
             cute.arch.fence_view_async_tmem_store()
-            fmha_utils.cfence()  # {$nv-internal-release}
             for j in cutlass.range_constexpr(
                 EXP2_EMULATION_OFFSET,
                 EXP2_EMULATION_OFFSET + EXP2_EMULATION_COUNT,
@@ -2834,7 +2780,6 @@ class RubinFusedMultiHeadAttentionForward:
                     local_row_sum,
                 )
             row_sum = local_row_sum[0] + local_row_sum[1]
-            fmha_utils.cfence()  # {$nv-internal-release}
             cute.arch.fence_view_async_tmem_store()
             # Notify tensor core warp that softmax(S->P) is ready
             pi_handle.commit()

@@ -41,8 +41,6 @@ except ImportError:
 
 IS_K3_CONTEXT_FMHA_AVAILABLE = False
 K3_CONTEXT_FMHA_IMPORT_ERROR: Optional[ImportError] = None
-# Whether the compiled kernel carries the internal CuTe DSL build's scheduling hints.
-K3_CONTEXT_FMHA_SCHEDULING_HINTS = False
 
 try:
     import cutlass
@@ -61,7 +59,6 @@ try:
             False,
         )
     )
-    K3_CONTEXT_FMHA_SCHEDULING_HINTS = fmha_utils.HAS_SCHEDULING_HINTS
 except ImportError as error:
     K3_CONTEXT_FMHA_IMPORT_ERROR = error
 
@@ -118,10 +115,9 @@ if IS_K3_CONTEXT_FMHA_AVAILABLE:
             if compiled_fmha is None:
                 logger.info(
                     "Compiling Rubin K3 FP8 context FMHA: split K=(128,64), "
-                    "epilogue merge, causal=%s, heads=%d, scheduling hints=%s",
+                    "epilogue merge, causal=%s, heads=%d",
                     is_causal,
                     num_heads,
-                    K3_CONTEXT_FMHA_SCHEDULING_HINTS,
                 )
                 mask_type = (
                     fmha_utils.MaskEnum.WINDOW_MASK
@@ -314,5 +310,4 @@ if IS_K3_CONTEXT_FMHA_AVAILABLE:
 __all__ = [
     "IS_K3_CONTEXT_FMHA_AVAILABLE",
     "K3_CONTEXT_FMHA_IMPORT_ERROR",
-    "K3_CONTEXT_FMHA_SCHEDULING_HINTS",
 ]
