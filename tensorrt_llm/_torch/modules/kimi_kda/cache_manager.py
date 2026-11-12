@@ -932,8 +932,12 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     """KDA/MLA cache layout and K3-only replay lifecycle handling."""
 
     kda_context_only = False
-    # The DSpark MLA drafter keeps its context KV in this manager.
-    accepts_appended_draft_layers = True
+
+    @classmethod
+    @override
+    def accepts_appended_draft_layers(cls) -> bool:
+        # The DSpark MLA drafter keeps its context KV in this manager.
+        return True
 
     @override
     def __init__(
