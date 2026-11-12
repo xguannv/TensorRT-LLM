@@ -109,7 +109,7 @@ def combine_helix_partials(
 # 7168 x 1024, down_proj 7168 x 1792. TP4 sweep, chain of 10 sites (GEMM + site) with cold
 # weights, us per site at 7 / 14 / 28 rows: split 1 at mma_n = the row tile is best for both roles
 # (o_proj 6.92 / 7.43 / 10.03, down 7.12 / 7.21 / 10.09; split 2: 7.60 / 7.90 / 11.16; cuBLAS +
-# C++ fused all-reduce: 9.76 / 8.83 / 10.86) (scripts/draftfuse/bench_ar.py, job 2706843).
+# C++ fused all-reduce: 9.76 / 8.83 / 10.86).
 _PUSH_TACTICS = {
     "o_proj": (
         (8, (64, 8, 1, 0)),

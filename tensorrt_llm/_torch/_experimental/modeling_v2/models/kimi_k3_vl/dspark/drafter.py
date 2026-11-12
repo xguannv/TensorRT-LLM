@@ -1714,7 +1714,7 @@ class K3DSparkDrafter(_DSparkHeadMixin, _K3DFlashDrafterMixin, nn.Module):
             c_rope,
             # .t() WITHOUT .contiguous(): the kernel wants (max_blocks, B) with dim 0
             # stride-1. contiguous() gives stride (B, 1) and it raises "Expected
-            # strides[leading_dim] == 1, but got B" for B > 1 (probe job 3005553).
+            # strides[leading_dim] == 1, but got B" for B > 1.
             fixup.page_tables_i32.t(),
             fixup.seq_lens_i32,
             out.permute(2, 3, 1, 0),
@@ -2091,7 +2091,7 @@ class K3DSparkDrafter(_DSparkHeadMixin, _K3DFlashDrafterMixin, nn.Module):
             q = q.view(batch, block_size, num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim)
             # One buffer rather than cat([absorbed, rope]): q's rope half is a 64-slice
             # of a 192-wide row, so cat fell off CatArrayBatchedCopy onto the generic
-            # kernel -- 17.3 us vs 1.6 us, five launches/iter (measured job 2986420).
+            # kernel -- 17.3 us vs 1.6 us, five launches/iter.
             query = torch.empty(
                 (batch, block_size, num_heads, self.kv_lora_rank + self.qk_rope_head_dim),
                 dtype=q.dtype,
